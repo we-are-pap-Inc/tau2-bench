@@ -9,6 +9,7 @@ from loguru import logger
 from tau2.data_model.message import ToolCall, ToolMessage
 from tau2.data_model.simulation import SimulationRun
 from tau2.environment.tool import Tool
+from tau2.voice.audio_native.openai.stagegate.ledger import EntityLedger
 from tau2.voice.audio_native.openai.stagegate.orchestrator import (
     StagePacketOrchestrator,
 )
@@ -77,6 +78,8 @@ class StageGateController:
         self.task_id: Optional[str] = None
         self.sim_id: Optional[str] = None
         self.trial: Optional[int] = None
+        if self.condition == "stagegate":
+            self.ledger = EntityLedger.for_domain(domain_name)
 
     @classmethod
     def from_env(
@@ -115,6 +118,7 @@ class StageGateController:
     def set_domain_name(self, domain_name: str) -> None:
         """Attach the public domain name for trace context."""
         self.domain_name = domain_name
+        self._set_ledger_domain(domain_name)
 
     def set_trace_context(
         self,
@@ -127,6 +131,7 @@ class StageGateController:
         """Attach run context used on subsequent trace events."""
         if domain_name is not None:
             self.domain_name = domain_name
+            self._set_ledger_domain(domain_name)
         if task_id is not None:
             self.task_id = task_id
         if sim_id is not None:
@@ -188,6 +193,7 @@ class StageGateController:
             last_action=last_action,
             blocker=blocker_text,
             tools=self.session_tools(self.tools),
+            ledger=self._active_ledger(),
         )
         self._trace(
             "stage_packet_returned",
@@ -248,6 +254,21 @@ class StageGateController:
             tool_args=tool_call.arguments,
             payload={"tool_call_id": tool_call.id},
         )
+        ledger = self._active_ledger()
+        if ledger is None:
+            return
+        deltas = ledger.update_from_tool_args(
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+            event_id=tool_call.id,
+            tick_index=tick_id,
+        )
+        self._trace_ledger_updates(
+            deltas,
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            tick_id=tick_id,
+        )
 
     def trace_domain_tool_call(
         self, tool_call: ToolCall, *, tick_id: Optional[int] = None
@@ -283,6 +304,21 @@ class StageGateController:
                 "tool_result": tool_result.content,
                 "tool_error": tool_result.error,
             },
+        )
+        ledger = self._active_ledger()
+        if ledger is None or tool_result.error:
+            return
+        deltas = ledger.update_from_tool_result(
+            tool_name=tool_call.name,
+            content=tool_result.content,
+            event_id=tool_result.id,
+            tick_index=tick_id,
+        )
+        self._trace_ledger_updates(
+            deltas,
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            tick_id=tick_id,
         )
 
     def trace_final_outcome(self, simulation: SimulationRun) -> None:
@@ -324,6 +360,7 @@ class StageGateController:
         reward: Optional[float] = None,
         passed: Optional[bool] = None,
         failure_type: Optional[str] = None,
+        ledger_delta: Optional[dict[str, object]] = None,
         payload: Optional[dict] = None,
     ) -> None:
         self.trace_writer.write(
@@ -342,6 +379,7 @@ class StageGateController:
                 source=source,
                 tool_name=tool_name,
                 tool_args=tool_args,
+                ledger_delta=ledger_delta,
                 latency_ms=latency_ms,
                 leakage_risk=leakage_risk,
                 reward=reward,
@@ -353,3 +391,34 @@ class StageGateController:
 
     def _elapsed_ms(self, start: float) -> float:
         return round((time.perf_counter() - start) * 1000, 3)
+
+    def _active_ledger(self) -> Optional[EntityLedger]:
+        if self.condition != "stagegate":
+            return None
+        return getattr(self, "ledger", None)
+
+    def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
+        if self.condition != "stagegate":
+            return
+        normalized_domain = (domain_name or "").strip().lower() or None
+        ledger = getattr(self, "ledger", None)
+        if ledger is None or ledger.domain_name != normalized_domain:
+            self.ledger = EntityLedger.for_domain(normalized_domain)
+
+    def _trace_ledger_updates(
+        self,
+        deltas: list[dict[str, object]],
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        tick_id: Optional[int],
+    ) -> None:
+        for delta in deltas:
+            self._trace(
+                "ledger_update",
+                tick_index=tick_id,
+                source=str(delta.get("source", "ledger")),
+                tool_name=tool_name,
+                ledger_delta={str(delta["field"]): delta},
+                payload={"tool_call_id": tool_call_id},
+            )

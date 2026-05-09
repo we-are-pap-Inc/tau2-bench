@@ -25,6 +25,7 @@ class StagePacket(BaseModel):
     objective: str
     known_facts: dict[str, dict[str, object]] = Field(default_factory=dict)
     missing_facts: list[str] = Field(default_factory=list)
+    ambiguous_facts: list[str] = Field(default_factory=list)
     ask_next: str
     allowed_read_tools: list[str] = Field(default_factory=list)
     allowed_write_tools: list[str] = Field(default_factory=list)

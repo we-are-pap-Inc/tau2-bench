@@ -1,6 +1,7 @@
 """Stage packet generation for StageGate."""
 
 from tau2.environment.tool import Tool
+from tau2.voice.audio_native.openai.stagegate.ledger import EntityLedger
 from tau2.voice.audio_native.openai.stagegate.stage_schema import StagePacket
 
 STAGES = [
@@ -55,19 +56,33 @@ class StagePacketOrchestrator:
         last_action: str,
         blocker: str | None,
         tools: list[Tool],
+        ledger: EntityLedger | None = None,
     ) -> StagePacket:
         """Build a compact packet from visible state."""
         stage = self._choose_stage(current_stage, blocker)
         read_tools, write_tools = self._split_tools(tools)
+        known_facts = self._known_facts(observed_facts)
         missing: list[str] = []
+        ambiguous: list[str] = []
+        if ledger is not None:
+            known_facts = ledger.known_facts()
+            missing.extend(ledger.missing_facts())
+            ambiguous.extend(ledger.ambiguous_facts())
         if blocker:
-            missing.append(blocker)
-        ask_next = self._ask_next(stage, missing, observed_facts, last_action)
+            missing.insert(0, blocker)
+        ask_next = self._ask_next(
+            stage,
+            missing,
+            observed_facts,
+            last_action,
+            ambiguous,
+        )
         return StagePacket(
             stage=stage,
             objective=OBJECTIVES.get(stage, OBJECTIVES["understand_intent"]),
-            known_facts=self._known_facts(observed_facts),
+            known_facts=known_facts,
             missing_facts=missing,
+            ambiguous_facts=ambiguous,
             ask_next=ask_next,
             allowed_read_tools=read_tools,
             allowed_write_tools=write_tools if stage == "execute_write_action" else [],
@@ -109,7 +124,10 @@ class StagePacketOrchestrator:
         missing: list[str],
         observed_facts: list[str],
         last_action: str,
+        ambiguous: list[str],
     ) -> str:
+        if ambiguous:
+            return f"Clarify the exact value for: {ambiguous[0]}."
         if missing:
             return f"Ask for or verify: {missing[0]}."
         if stage == "inspect_state_with_read_tools":
