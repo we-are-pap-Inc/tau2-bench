@@ -53,6 +53,15 @@ def load_trace_data(pattern: str) -> TraceLoadResult:
                         }
                     )
                     continue
+                if not isinstance(row, dict):
+                    invalid_rows.append(
+                        {
+                            "trace_file": str(path),
+                            "line_number": line_number,
+                            "error": "invalid_json_object",
+                        }
+                    )
+                    continue
                 row["trace_file"] = str(path)
                 row["line_number"] = line_number
                 if row.get("schema_version") != SCHEMA_VERSION:

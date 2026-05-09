@@ -518,6 +518,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             domain_name=self.environment.get_domain_name(),
             task_id=self.task.id,
             sim_id=self.simulation_id,
+            trial=getattr(self, "trial", None),
         )
         if not controller.enabled and not controller.tracing_enabled:
             return None
@@ -558,6 +559,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             domain_name=self.environment.get_domain_name(),
             task_id=self.task.id,
             sim_id=self.simulation_id,
+            trial=getattr(self, "trial", None),
         )
         if not controller.tracing_enabled:
             return None
@@ -711,7 +713,17 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         if trace_controller is not None:
             trace_controller.trace_run_start()
 
-        result = super().run()
+        try:
+            result = super().run()
+        except Exception:
+            trace_controller = self._get_stagegate_trace_controller()
+            if trace_controller is not None:
+                trace_controller.trace_run_end(
+                    termination_reason="exception",
+                    duration_seconds=self._current_run_duration_seconds(),
+                )
+            raise
+
         compute_proportional_user_transcripts(self.ticks)
 
         trace_controller = self._get_stagegate_trace_controller()
@@ -721,3 +733,9 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 duration_seconds=result.duration,
             )
         return result
+
+    def _current_run_duration_seconds(self) -> Optional[float]:
+        run_start_perf = getattr(self, "_run_start_perf", None)
+        if run_start_perf is None:
+            return None
+        return time.perf_counter() - run_start_perf

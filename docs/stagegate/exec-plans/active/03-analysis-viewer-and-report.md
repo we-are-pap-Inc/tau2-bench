@@ -70,12 +70,18 @@ Acceptance: report template is ready to fill after final runs.
 
 - 2026-05-08: `scripts/stagegate_trace_viewer.py` imported Streamlit at module import time, which made loader tests depend on the viewer runtime dependency. The loader now keeps Streamlit import inside `main()` so JSONL parsing and schema validation are unit-testable without launching the app.
 - 2026-05-08: The freshly created `.venv` initially resolved `uv run pytest` to a global Python 3.13 pytest because the dev extra was not synced. `uv sync --extra voice --extra dev --extra experiments` fixed command resolution to `.venv/bin/pytest`.
+- 2026-05-09: Viewer loading needed to reject valid JSON rows that are not
+  objects, such as arrays or strings, otherwise invalid trace files could crash
+  before reaching the invalid-row table.
 
 ## Decision Log
 
 - 2026-05-08: Canonical trace rows use `schema_version="stagegate.trace.v1"` and retain nullable top-level fields for stable DataFrame columns across event types.
 - 2026-05-08: Viewer schema validation rejects unsupported trace schema rows into an invalid-row table instead of mixing them with current traces.
 - 2026-05-08: The minimal viewer remains Pandas-based for this implementation; DuckDB query examples remain in `scripts/trace_queries.sql` for later analysis work.
+- 2026-05-09: Non-object JSONL rows are treated as invalid rows with
+  `error="invalid_json_object"` so the viewer keeps loading usable trace
+  events.
 
 ## Validation Evidence
 
@@ -83,12 +89,18 @@ Acceptance: report template is ready to fill after final runs.
   result: completed successfully and installed the dev/voice/experiments environment.
 - `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
   result: `12 passed, 2 warnings in 0.04s`.
+- `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
+  after review fixes result: `15 passed, 2 warnings in 0.04s`.
 - `make test`
   result: `164 passed, 17 failed, 1 xfailed, 14 warnings`; failures are LLM-backed core tests failing with `litellm.AuthenticationError` because `OPENAI_API_KEY` is not set in this environment.
 - `make test-voice`
   result: `255 passed, 3 skipped, 83 deselected, 2 warnings in 0.72s`.
+- `make test-voice` after review fixes
+  result: `258 passed, 3 skipped, 83 deselected, 2 warnings in 0.49s`.
 - `make check-all`
   result: Ruff check passed and Ruff format reformatted 3 files.
+- `make check-all` after review fixes
+  result: Ruff check passed and Ruff format left 320 files unchanged.
 - `git diff --check`
   result: passed with no whitespace errors.
 - `uv run ruff check .`

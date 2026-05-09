@@ -54,6 +54,7 @@ def test_load_trace_data_reports_invalid_rows(tmp_path):
                         "event_type": "advance_stage_call",
                     }
                 ),
+                json.dumps(["not", "an", "object"]),
                 "{not-json",
             ]
         )
@@ -64,7 +65,8 @@ def test_load_trace_data_reports_invalid_rows(tmp_path):
     result = load_trace_data(str(trace_path))
 
     assert len(result.events) == 1
-    assert len(result.invalid_rows) == 2
+    assert len(result.invalid_rows) == 3
     errors = list(result.invalid_rows["error"])
     assert "unsupported_schema_version" in errors
+    assert "invalid_json_object" in errors
     assert any(error.startswith("invalid_json:") for error in errors)

@@ -131,6 +131,10 @@ ledger updates, validator decisions, or tool blocking.
   `final_outcome`.
 - [x] Leave normal domain tools on the existing execution path.
 - [x] Remove active V2 ledger and validator behavior from this scope.
+- [x] Preserve batch `trial` metadata on trace rows by attaching the trial to
+  the orchestrator before simulation execution.
+- [x] Emit `run_end` trace rows for full-duplex run exceptions so started trace
+  runs do not remain open-ended after retryable failures.
 
 ## Tests
 
@@ -171,14 +175,20 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   installed.
 - `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
   result: `12 passed, 2 warnings in 0.04s`.
+- `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
+  after review fixes result: `15 passed, 2 warnings in 0.04s`.
 - `make test`
   result: `164 passed, 17 failed, 1 xfailed, 14 warnings`; failures are
   LLM-backed core tests failing with `litellm.AuthenticationError` because
   `OPENAI_API_KEY` is not set in this environment.
 - `make test-voice`
   result: `255 passed, 3 skipped, 83 deselected, 2 warnings in 0.72s`.
+- `make test-voice` after review fixes
+  result: `258 passed, 3 skipped, 83 deselected, 2 warnings in 0.49s`.
 - `make check-all`
   result: Ruff check passed and Ruff format reformatted 3 files.
+- `make check-all` after review fixes
+  result: Ruff check passed and Ruff format left 320 files unchanged.
 - `git diff --check`
   result: passed with no whitespace errors.
 - `uv run ruff check .`
@@ -204,6 +214,12 @@ Warnings observed in both passing test commands:
 - `final_outcome` trace emission is done only after `run_simulation()` attaches
   evaluator `reward_info`; it is marked `visible_to_agent=false` and
   `leakage_risk=posthoc_evaluator`.
+- 2026-05-09: Batch trial context is attached to the orchestrator before
+  `run_simulation()` so runtime events and posthoc `final_outcome` rows share
+  the same trial identifier.
+- 2026-05-09: `run_end` on exception uses
+  `termination_reason="exception"` because retry infrastructure owns the final
+  failed `SimulationRun` object for exhausted attempts.
 
 ## Remaining Work
 

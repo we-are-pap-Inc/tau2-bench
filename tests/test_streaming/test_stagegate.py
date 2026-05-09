@@ -1,5 +1,9 @@
 import json
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from tau2.agent.discrete_time_audio_native_agent import DiscreteTimeAudioNativeAgent
 from tau2.data_model.message import ToolCall
@@ -8,6 +12,9 @@ from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
+from tau2.orchestrator.orchestrator import BaseOrchestrator
+from tau2.runner import batch as runner_batch
+from tau2.runner.simulation import _trace_final_outcome
 from tau2.voice.audio_native.openai.stagegate import StageGateController, TraceEvent
 from tau2.voice.audio_native.openai.stagegate.trace import JsonlTraceWriter
 
@@ -357,3 +364,109 @@ def test_final_outcome_trace_is_posthoc(monkeypatch, tmp_path):
     assert event["leakage_risk"] == "posthoc_evaluator"
     assert event["reward"] == 1.0
     assert event["passed"] is True
+
+
+def test_final_outcome_trace_uses_orchestrator_trial(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+    )
+    orchestrator = SimpleNamespace(
+        agent=SimpleNamespace(stagegate_controller=controller),
+        environment=environment,
+        task=SimpleNamespace(id="task_4"),
+        trial=2,
+    )
+    simulation = SimulationRun(
+        id="sim_4",
+        task_id="task_4",
+        start_time="2026-05-08T00:00:00",
+        end_time="2026-05-08T00:00:01",
+        duration=1.0,
+        termination_reason="agent_stop",
+        reward_info=RewardInfo(reward=0.0),
+    )
+
+    _trace_final_outcome(orchestrator, simulation)
+
+    event = json.loads(trace_path.read_text().strip())
+    assert event["event_type"] == "final_outcome"
+    assert event["trial"] == 2
+    assert event["sim_id"] == "sim_4"
+
+
+def test_run_single_task_attaches_trial_for_trace_context(monkeypatch):
+    orchestrator = SimpleNamespace()
+
+    monkeypatch.setattr(
+        runner_batch,
+        "build_orchestrator",
+        lambda *args, **kwargs: orchestrator,
+    )
+    monkeypatch.setattr(runner_batch, "_build_env_kwargs", lambda *args, **kwargs: None)
+
+    def run_simulation(orchestrator_arg, **kwargs):
+        assert orchestrator_arg is orchestrator
+        assert orchestrator_arg.trial == 4
+        return SimulationRun(
+            id="sim_6",
+            task_id="task_6",
+            start_time="2026-05-08T00:00:00",
+            end_time="2026-05-08T00:00:01",
+            duration=1.0,
+            termination_reason="agent_stop",
+            reward_info=RewardInfo(reward=1.0),
+        )
+
+    monkeypatch.setattr(runner_batch, "run_simulation", run_simulation)
+
+    result = runner_batch.run_single_task(
+        SimpleNamespace(
+            domain="mock",
+            effective_agent="agent",
+            effective_user="user",
+        ),
+        SimpleNamespace(id="task_6"),
+        trial=4,
+    )
+
+    assert result.id == "sim_6"
+
+
+def test_full_duplex_run_traces_run_end_on_exception(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = SimpleNamespace(stagegate_controller=controller)
+    orchestrator.task = SimpleNamespace(id="task_5")
+    orchestrator.simulation_id = "sim_5"
+    orchestrator.trial = 3
+    orchestrator._run_start_perf = None
+
+    def raise_from_base_run(self):
+        self._run_start_perf = time.perf_counter()
+        raise RuntimeError("sim failed")
+
+    monkeypatch.setattr(BaseOrchestrator, "run", raise_from_base_run)
+
+    with pytest.raises(RuntimeError, match="sim failed"):
+        FullDuplexOrchestrator.run(orchestrator)
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == ["run_start", "run_end"]
+    assert events[0]["trial"] == 3
+    assert events[1]["trial"] == 3
+    assert events[1]["payload"]["termination_reason"] == "exception"
+    assert events[1]["payload"]["duration_seconds"] >= 0

@@ -108,6 +108,6 @@ def _trace_final_outcome(
         domain_name=orchestrator.environment.get_domain_name(),
         task_id=orchestrator.task.id,
         sim_id=simulation.id,
-        trial=getattr(simulation, "trial", None),
+        trial=getattr(orchestrator, "trial", getattr(simulation, "trial", None)),
     )
     controller.trace_final_outcome(simulation)
