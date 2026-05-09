@@ -329,6 +329,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             incoming_chunk=incoming_for_user,
             is_agent=False,
             pending_tool_results=self.pending_user_tool_results,
+            tick_id=tick_id,
         )
         tick.user_chunk = deepcopy(user_chunk)
         tick.user_tool_calls = [deepcopy(tc) for tc in user_tool_calls]
@@ -349,6 +350,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             incoming_chunk=incoming_for_agent,
             is_agent=True,
             pending_tool_results=self.pending_agent_tool_results,
+            tick_id=tick_id,
         )
         tick.agent_chunk = deepcopy(agent_chunk)
         tick.agent_tool_calls = [deepcopy(tc) for tc in agent_tool_calls]
@@ -391,6 +393,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         incoming_chunk: Optional[Message],
         is_agent: bool,
         pending_tool_results: Optional[Message] = None,
+        tick_id: Optional[int] = None,
     ) -> tuple[Message, Any, list[ToolCall], list[ToolMessage]]:
         """
         Process a participant's turn with dual-channel input.
@@ -457,14 +460,27 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             tool_names = [tc.name for tc in tool_calls]
             logger.info(f"  [{participant_name}] Tool calls: {tool_names}")
 
-            results = self._execute_tool_calls(tool_calls)
+            stagegate_controller = self._get_stagegate_controller(
+                participant=participant,
+                is_agent=is_agent,
+            )
+            if stagegate_controller is not None:
+                results = [
+                    self._execute_stagegate_tool_call(
+                        stagegate_controller,
+                        tool_call,
+                        tick_id=tick_id,
+                    )
+                    for tool_call in tool_calls
+                ]
+            else:
+                results = self._execute_tool_calls(tool_calls)
             tool_results = list(results)
 
             for tc, result in zip(tool_calls, results):
+                content = result.content or ""
                 result_preview = (
-                    result.content[:100] + "..."
-                    if len(result.content) > 100
-                    else result.content
+                    content[:100] + "..." if len(content) > 100 else content
                 )
                 logger.debug(f"  [{participant_name}]   {tc.name}() → {result_preview}")
 
@@ -481,6 +497,38 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             )
 
         return new_chunk, new_state, tool_calls, tool_results
+
+    def _get_stagegate_controller(
+        self,
+        *,
+        participant: Union[StreamingAgentT, StreamingUserT],
+        is_agent: bool,
+    ):
+        if not is_agent:
+            return None
+        controller = getattr(participant, "stagegate_controller", None)
+        if controller is None or not controller.enabled:
+            return None
+        controller.set_domain_name(self.environment.get_domain_name())
+        return controller
+
+    def _execute_stagegate_tool_call(
+        self,
+        stagegate_controller,
+        tool_call: ToolCall,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> ToolMessage:
+        if stagegate_controller.is_advance_stage(tool_call):
+            return stagegate_controller.handle_advance_stage(
+                tool_call,
+                tick_id=tick_id,
+            )
+
+        tool_result = self.environment.get_response(tool_call)
+        if tool_result.error:
+            self.num_errors += 1
+        return tool_result
 
     def get_trajectory(self) -> list[Tick]:
         """

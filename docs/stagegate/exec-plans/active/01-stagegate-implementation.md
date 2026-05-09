@@ -1,112 +1,194 @@
-# ExecPlan 01 — StageGate Implementation
+# ExecPlan 01 - StageOnly Implementation
 
 ## Purpose
 
-Implement the StageGate scaffold for τ-Voice so that the same GPT-Realtime-2 model can be evaluated under three conditions: baseline, StageOnly, and StageGate. After this plan is complete, a human should be able to run a one-task smoke test and observe StageGate emitting stage packets, ledger updates, validator checks, and JSONL traces without changing the benchmark evaluator or tasks.
+Implement V1 StageOnly for the OpenAI audio-native scaffold without changing
+benchmark content or scoring. In this scope, both
+`TAU2_STAGEGATE_CONDITION=stage_only` and
+`TAU2_STAGEGATE_CONDITION=stagegate` enable only the `advance_stage`
+orchestration tool, deterministic stage packets, and minimal JSONL tracing.
 
-## Current State
+V2 features are explicitly out of scope for this implementation: no entity
+ledger, no pre-write validator, no corrective packet flow, no domain-tool
+blocking, no evaluator edits, no task edits, no user-simulator edits, no
+domain-policy edits, and no domain-tool edits.
 
-The repository is a fork of `sierra-research/tau2-bench`. τ³ voice evaluation lives in the existing voice/audio-native framework. Codex must inspect the actual repo before editing, especially:
+## Benchmark Validity Constraints
 
-- `src/tau2/voice/README.md`
-- `src/tau2/voice/audio_native/README.md`
-- OpenAI provider files under `src/tau2/voice/audio_native/openai/`
-- tests under `tests/`
-- `docs/leaderboard-submission.md`
+Do not modify task files, evaluator logic, user simulator prompts or hidden
+state, domain policy files, domain tools, scoring logic, or database
+final-state comparison logic.
 
-## Target State
+StageOnly may use only domain name, public domain policy and tool schemas,
+conversation-visible tool calls, official domain tool outputs, and
+server-side state derived from the agent-visible path.
 
-Add a StageGate module that can be enabled via:
+StageOnly must not read hidden task objectives, task IDs as rule selectors,
+expected final database state, evaluator output, reward or failure signals,
+user simulator private plans, or clean simulator text unavailable to the voice
+agent.
 
-    TAU2_STAGEGATE_CONDITION=baseline|stage_only|stagegate
+## Current Runtime Map
 
-Behavior:
+- OpenAI realtime session setup:
+  `src/tau2/voice/audio_native/openai/discrete_time_adapter.py`
+  `DiscreteTimeOpenAIAdapter.connect()` and
+  `DiscreteTimeOpenAIAdapter._async_connect()` call
+  `OpenAIRealtimeProvider.connect()` and
+  `OpenAIRealtimeProvider.configure_session()`.
+- OpenAI tool registration:
+  `src/tau2/voice/audio_native/openai/provider.py`
+  `OpenAIRealtimeProvider.configure_session()` includes `"tools"` in the
+  `session.update` payload, and
+  `OpenAIRealtimeProvider._format_tools_for_api()` converts
+  `Tool.openai_schema` into Realtime function schema objects.
+- Agent session insertion point:
+  `src/tau2/agent/discrete_time_audio_native_agent.py`
+  `DiscreteTimeAudioNativeAgent.__init__()` creates
+  `StageGateController.from_env()`;
+  `DiscreteTimeAudioNativeAgent._build_system_prompt()` appends the prompt
+  addendum only when enabled; and
+  `DiscreteTimeAudioNativeAgent.get_init_state()` passes
+  `StageGateController.session_tools()` to `adapter.connect()`.
+- Tool-call receipt:
+  `src/tau2/voice/audio_native/openai/discrete_time_adapter.py`
+  `DiscreteTimeOpenAIAdapter._process_event()` handles
+  `FunctionCallArgumentsDoneEvent`, parses arguments, creates `ToolCall`, and
+  appends it to `TickResult.tool_calls`.
+- Tool-call dispatch:
+  `src/tau2/orchestrator/full_duplex_orchestrator.py`
+  `FullDuplexOrchestrator._process_participant_turn()` routes agent tool
+  calls through `FullDuplexOrchestrator._execute_stagegate_tool_call()` when a
+  controller is active.
+- Domain tool execution:
+  `src/tau2/environment/environment.py` `Environment.get_response()` calls
+  `make_tool_call()`, which dispatches to
+  `src/tau2/environment/toolkit.py` `ToolKitBase.use_tool()`.
+- Tool result return:
+  `src/tau2/agent/discrete_time_audio_native_agent.py`
+  `DiscreteTimeAudioNativeAgent._handle_tool_result()` queues tool results;
+  `src/tau2/voice/audio_native/openai/discrete_time_adapter.py`
+  `DiscreteTimeOpenAIAdapter._flush_pending_tool_results()` calls
+  `src/tau2/voice/audio_native/openai/provider.py`
+  `OpenAIRealtimeProvider.send_tool_result()`.
+- Trajectory and run-output writing:
+  `src/tau2/orchestrator/full_duplex_orchestrator.py`
+  `FullDuplexOrchestrator._finalize()` builds `SimulationRun`;
+  `src/tau2/runner/batch.py` `run_single_task()` writes task logs and audio;
+  `src/tau2/runner/checkpoint.py` `create_checkpoint_fns()` writes
+  `results.json` and per-simulation JSON.
+- JSONL trace insertion point:
+  `src/tau2/voice/audio_native/openai/stagegate/controller.py`
+  `StageGateController._trace()` is the single StageOnly facade over
+  `src/tau2/voice/audio_native/openai/stagegate/trace.py`
+  `JsonlTraceWriter.write()`.
+- Relevant existing tests:
+  `tests/test_streaming/test_stagegate.py`,
+  `tests/test_streaming/test_discrete_time_audio_native_agent.py`,
+  `tests/test_streaming/test_tool_call_flow.py`,
+  `tests/test_voice/test_audio_native/test_provider_suite.py`, and
+  `tests/test_environment.py`.
 
-- `baseline`: no StageGate behavior.
-- `stage_only`: model has `advance_stage` orchestration tool and receives stage packets.
-- `stagegate`: StageOnly plus entity ledger plus pre-write validator.
+## Implemented StageOnly Design
 
-The code must emit JSONL trace events to `TAU2_TRACE_JSONL` when that environment variable is set.
+- `src/tau2/voice/audio_native/openai/stagegate/stage_schema.py`
+  defines only `StagePacket` and `TraceEvent` schemas for this scope.
+- `src/tau2/voice/audio_native/openai/stagegate/trace.py`
+  provides `JsonlTraceWriter.from_env()` controlled by `TAU2_TRACE_JSONL`.
+- `src/tau2/voice/audio_native/openai/stagegate/orchestrator.py`
+  provides `StagePacketOrchestrator`, which builds deterministic packets from
+  `advance_stage` arguments and public tool names only.
+- `src/tau2/voice/audio_native/openai/stagegate/controller.py`
+  provides `StageGateController` with env parsing, prompt addendum,
+  `session_tools()`, `is_advance_stage()`, and `handle_advance_stage()`.
+- `src/tau2/agent/discrete_time_audio_native_agent.py` wires the controller
+  into OpenAI audio-native session setup without changing baseline behavior.
+- `src/tau2/orchestrator/full_duplex_orchestrator.py` intercepts only
+  `advance_stage`; all other tool calls continue through
+  `Environment.get_response()` unchanged.
+- `src/tau2/voice/audio_native/openai/__init__.py` lazy-loads provider and
+  adapter classes so importing the StageOnly package does not make core
+  τ-bench imports require voice-only dependencies.
 
-## Non-Negotiable Constraints
+The active package intentionally does not export or import `EntityLedger`,
+`PreWriteValidator`, `ValidatorDecision`, `CorrectivePacket`, validator tests,
+ledger updates, domain-tool result observation, or tool blocking.
 
-Do not modify tasks, evaluator, user simulator, domain policies, domain tools, or scoring.
+## Implementation Progress
 
-The harness must not read hidden task objectives, expected final DB state, evaluator output, user simulator private plan, or clean simulator text not visible to the agent path.
+- [x] Keep StageOnly localized to
+  `src/tau2/voice/audio_native/openai/stagegate/` plus the existing
+  audio-native agent and full-duplex orchestrator insertion points.
+- [x] Add `advance_stage` session tool only when
+  `TAU2_STAGEGATE_CONDITION` is `stage_only` or `stagegate`.
+- [x] Treat `stagegate` as StageOnly-compatible for this step.
+- [x] Generate `stagegate.stage_packet.v1` tool results without calling
+  `Environment.get_response()`.
+- [x] Emit only `advance_stage_call` and `stage_packet_returned` JSONL events
+  when `TAU2_TRACE_JSONL` is set.
+- [x] Leave normal domain tools on the existing execution path.
+- [x] Remove active V2 ledger and validator behavior from this scope.
 
-## Implementation Milestones
+## Tests
 
-### Milestone 1 — Codebase map
+Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 
-Inspect the audio-native OpenAI provider architecture and identify the precise insertion points for:
-
-- adding `advance_stage` to the session tool list;
-- intercepting `advance_stage` function calls;
-- observing domain tool calls and results;
-- optionally blocking side-effecting domain tool calls before execution;
-- emitting trace events.
-
-Acceptance: update this plan with exact file paths and a short architecture map.
-
-### Milestone 2 — StageGate data models and trace writer
-
-Create StageGate module files. Define typed models for:
-
-- `StagePacket`
-- `LedgerSlot`
-- `EntityLedger`
-- `ValidatorDecision`
-- `TraceEvent`
-
-Implement a JSONL trace writer that is no-op unless `TAU2_TRACE_JSONL` is set.
-
-Acceptance: unit tests validate schema serialization and JSONL writing.
-
-### Milestone 3 — StageOnly orchestration
-
-Add the `advance_stage` tool and implement a simple deterministic orchestrator that returns compact stage packets from public domain/tool context and visible state.
-
-Acceptance: retail control smoke test shows at least one `advance_stage_call` and one `stage_packet_returned` event.
-
-### Milestone 4 — Entity ledger
-
-Implement typed ledger updates from visible model tool calls and official tool outputs. Include statuses: missing, hypothesized, heard_not_confirmed, repeated_back, user_confirmed, tool_verified, contradicted, stale.
-
-Acceptance: tests cover slot creation, confirmation, contradiction, tool verification, and trace emission.
-
-### Milestone 5 — Pre-write validator
-
-Identify side-effecting tools by schema/name/policy heuristics, with a conservative allowlist or denylist reviewed by the human. Intercept proposed write tools, check identity, exact identifiers, policy-state inspection, and confirmation, then allow or block.
-
-Acceptance: tests show blocked calls do not mutate domain state and return corrective packets.
-
-### Milestone 6 — Integration smoke test
-
-Run one control task in retail for `stage_only` and `stagegate`.
-
-Acceptance: `tau2 view` works, trace file exists, and the run completes or fails for benchmark reasons rather than integration errors.
-
-## Progress
-
-- [ ] Milestone 1 pending.
-- [ ] Milestone 2 pending.
-- [ ] Milestone 3 pending.
-- [ ] Milestone 4 pending.
-- [ ] Milestone 5 pending.
-- [ ] Milestone 6 pending.
-
-## Surprises & Discoveries
-
-Record discoveries here.
-
-## Decision Log
-
-Record design decisions here.
+- baseline/unset environment leaves prompt and tool list unchanged;
+- `TAU2_STAGEGATE_CONDITION=stage_only` adds exactly one `advance_stage` tool;
+- `TAU2_STAGEGATE_CONDITION=stagegate` currently enables StageOnly behavior
+  only and has no ledger or validator attributes;
+- `advance_stage` returns a `stagegate.stage_packet.v1` packet;
+- `advance_stage` does not call `Environment.get_response()` and does not
+  mutate a fake domain toolkit counter;
+- normal non-`advance_stage` domain tools still call
+  `Environment.get_response()` unchanged;
+- `TAU2_TRACE_JSONL` writes exactly `advance_stage_call` and
+  `stage_packet_returned`.
 
 ## Validation Evidence
 
-Record commands and outputs here.
+- `uv run pytest tests/test_streaming/test_stagegate.py -q` initially could
+  not collect in the freshly created core-only environment. Direct import
+  investigation showed the active package path then failed on missing voice
+  dependency `websockets`.
+- `uv sync --extra voice --extra dev` completed successfully and installed the
+  voice/dev dependencies needed for the audio-native import path.
+- `uv run python - <<'PY' ... import tau2 ... PY` with a meta-path guard that
+  raises `ModuleNotFoundError` for `websockets` succeeded and printed
+  `import tau2 ok without importing websockets`, confirming the StageOnly
+  import path does not eagerly require the voice extra.
+- `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  result: `6 passed, 2 warnings in 0.02s`.
+- `uv run pytest tests/test_streaming/test_discrete_time_audio_native_agent.py -q`
+  result: `33 passed, 2 warnings in 0.06s`.
+
+Warnings observed in both passing test commands:
+
+- `audioop` deprecation warning from
+  `src/tau2/voice/utils/audio_preprocessing.py`.
+- unknown pytest config option `asyncio_default_fixture_loop_scope`.
+
+## Decision Log
+
+- `TAU2_STAGEGATE_CONDITION=stagegate` remains accepted for CLI and
+  experiment compatibility, but it behaves identically to `stage_only` until a
+  later V2 ExecPlan implements ledger and validation.
+- `FullDuplexOrchestrator._execute_stagegate_tool_call()` is the right boundary
+  for `advance_stage` interception because it can return a normal
+  `ToolMessage` without touching domain state.
+- `JsonlTraceWriter` remains independent from τ-bench checkpointing so traces
+  can be enabled without changing `SimulationRun`, evaluator inputs, scoring,
+  or result files.
+
+## Remaining Work
+
+- Run a later one-task OpenAI audio-native smoke with credentials and runtime
+  budget available.
+- Implement V2 entity ledger and pre-write validation only under a separate
+  explicit plan and validity review.
 
 ## Outcomes & Retrospective
 
-Complete after implementation.
+StageOnly is implemented and narrowly tested. Baseline remains disabled unless
+`TAU2_STAGEGATE_CONDITION` is set to `stage_only` or `stagegate`; non-stage
+domain tools still execute through `Environment.get_response()` unchanged.
