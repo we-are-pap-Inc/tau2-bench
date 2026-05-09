@@ -6,7 +6,7 @@ from typing import Optional
 
 from loguru import logger
 
-from tau2.data_model.message import ToolCall, ToolMessage
+from tau2.data_model.message import Message, ToolCall, ToolMessage
 from tau2.data_model.simulation import SimulationRun
 from tau2.environment.tool import Tool
 from tau2.voice.audio_native.openai.stagegate.ledger import EntityLedger
@@ -20,6 +20,10 @@ from tau2.voice.audio_native.openai.stagegate.stage_schema import (
 from tau2.voice.audio_native.openai.stagegate.trace import (
     JsonlTraceWriter,
     get_trace_run_id,
+)
+from tau2.voice.audio_native.openai.stagegate.validator import (
+    PreWriteValidator,
+    ValidatorDecision,
 )
 
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
@@ -80,6 +84,11 @@ class StageGateController:
         self.trial: Optional[int] = None
         if self.condition == "stagegate":
             self.ledger = EntityLedger.for_domain(domain_name)
+            self.validator = PreWriteValidator(
+                domain_name=domain_name,
+                tools=self.tools,
+                domain_policy=domain_policy,
+            )
 
     @classmethod
     def from_env(
@@ -119,6 +128,7 @@ class StageGateController:
         """Attach the public domain name for trace context."""
         self.domain_name = domain_name
         self._set_ledger_domain(domain_name)
+        self._set_validator_domain(domain_name)
 
     def set_trace_context(
         self,
@@ -132,6 +142,7 @@ class StageGateController:
         if domain_name is not None:
             self.domain_name = domain_name
             self._set_ledger_domain(domain_name)
+            self._set_validator_domain(domain_name)
         if task_id is not None:
             self.task_id = task_id
         if sim_id is not None:
@@ -320,6 +331,98 @@ class StageGateController:
             tool_name=tool_call.name,
             tick_id=tick_id,
         )
+        validator = self._active_validator()
+        if validator is not None:
+            validator.record_tool_result(
+                tool_call=tool_call,
+                tool_result=tool_result,
+                tick_index=tick_id,
+            )
+
+    def record_visible_message(
+        self,
+        message: Message,
+        *,
+        is_agent: bool,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Record agent-visible participant text for validation state."""
+        validator = self._active_validator()
+        if validator is None:
+            return
+        content = getattr(message, "content", None)
+        validator.record_visible_message(
+            role="assistant" if is_agent else "user",
+            content=content,
+            tick_index=tick_id,
+        )
+
+    def validate_tool_call(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> ValidatorDecision:
+        """Validate a tool call and emit validator trace rows when active."""
+        validator = self._active_validator()
+        if validator is None:
+            return ValidatorDecision(
+                decision="allow",
+                reason="validator_inactive",
+                checks={},
+            )
+
+        start = time.perf_counter()
+        decision = validator.validate(tool_call, ledger=self._active_ledger())
+        payload = {
+            "tool_call_id": tool_call.id,
+            "checks": decision.checks,
+        }
+        if decision.corrective_packet is not None:
+            payload["corrective_packet"] = decision.corrective_packet.model_dump(
+                mode="json"
+            )
+
+        self._trace(
+            "validator_check",
+            tick_index=tick_id,
+            source="validator",
+            tool_name=tool_call.name,
+            tool_args=tool_call.arguments,
+            validator_decision=decision.decision,
+            validator_reason=decision.reason,
+            payload=payload,
+        )
+        self._trace(
+            "validator_allow" if decision.allowed else "validator_block",
+            tick_index=tick_id,
+            source="validator",
+            tool_name=tool_call.name,
+            tool_args=tool_call.arguments,
+            validator_decision=decision.decision,
+            validator_reason=decision.reason,
+            latency_ms=self._elapsed_ms(start),
+            payload=payload,
+        )
+        return decision
+
+    def blocked_tool_message(
+        self,
+        tool_call: ToolCall,
+        decision: ValidatorDecision,
+    ) -> ToolMessage:
+        """Convert a block decision to the tool result returned to the model."""
+        if decision.corrective_packet is None:
+            content = decision.model_dump_json()
+        else:
+            content = decision.corrective_packet.model_dump_json()
+        return ToolMessage(
+            id=tool_call.id,
+            role="tool",
+            requestor=tool_call.requestor,
+            content=content,
+            error=True,
+        )
 
     def trace_final_outcome(self, simulation: SimulationRun) -> None:
         """Emit posthoc evaluator outcome only after evaluation has completed."""
@@ -361,6 +464,8 @@ class StageGateController:
         passed: Optional[bool] = None,
         failure_type: Optional[str] = None,
         ledger_delta: Optional[dict[str, object]] = None,
+        validator_decision: Optional[str] = None,
+        validator_reason: Optional[str] = None,
         payload: Optional[dict] = None,
     ) -> None:
         self.trace_writer.write(
@@ -380,6 +485,8 @@ class StageGateController:
                 tool_name=tool_name,
                 tool_args=tool_args,
                 ledger_delta=ledger_delta,
+                validator_decision=validator_decision,
+                validator_reason=validator_reason,
                 latency_ms=latency_ms,
                 leakage_risk=leakage_risk,
                 reward=reward,
@@ -397,6 +504,11 @@ class StageGateController:
             return None
         return getattr(self, "ledger", None)
 
+    def _active_validator(self) -> Optional[PreWriteValidator]:
+        if self.condition != "stagegate":
+            return None
+        return getattr(self, "validator", None)
+
     def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
         if self.condition != "stagegate":
             return
@@ -404,6 +516,11 @@ class StageGateController:
         ledger = getattr(self, "ledger", None)
         if ledger is None or ledger.domain_name != normalized_domain:
             self.ledger = EntityLedger.for_domain(normalized_domain)
+
+    def _set_validator_domain(self, domain_name: Optional[str]) -> None:
+        validator = self._active_validator()
+        if validator is not None:
+            validator.set_domain_name(domain_name)
 
     def _trace_ledger_updates(
         self,

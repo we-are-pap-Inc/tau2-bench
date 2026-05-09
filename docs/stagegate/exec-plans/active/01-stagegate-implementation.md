@@ -7,12 +7,13 @@ benchmark content or scoring. V1 StageOnly provides the `advance_stage`
 orchestration tool, deterministic stage packets, and JSONL tracing. V2
 StageGate adds a typed entity ledger for retail, airline, and telecom that
 updates only from agent-visible function-call arguments and official domain
-tool outputs.
+tool outputs. It also adds a pre-write validator that blocks unsafe
+side-effecting domain tool calls before `Environment.get_response()` can mutate
+domain state, and returns corrective `stagegate.stage_packet.v1` packets to the
+model.
 
-Pre-write validation remains out of scope for this implementation: no
-corrective packet flow, no domain-tool blocking, no evaluator edits, no task
-edits, no user-simulator edits, no domain-policy edits, and no domain-tool
-edits.
+The implementation does not edit evaluator logic, task files, user-simulator
+state, scoring, domain policy files, or domain tool definitions.
 
 ## Benchmark Validity Constraints
 
@@ -104,23 +105,33 @@ agent.
 - `src/tau2/voice/audio_native/openai/stagegate/ledger.py`
   defines `LedgerStatus`, `LedgerEvidence`, `LedgerSlot`, and `EntityLedger`,
   with domain slots for retail, airline, and telecom.
+- `src/tau2/voice/audio_native/openai/stagegate/validator.py`
+  provides `ValidatorDecision` and `PreWriteValidator`, classifies side-effecting
+  tools from reviewed domain tool names plus public tool names/descriptions,
+  tracks visible read inspections and confirmations, validates write/action
+  tool calls, and builds corrective `StagePacket` blocks without calling domain
+  tools.
 - `src/tau2/voice/audio_native/openai/stagegate/controller.py`
   provides `StageGateController` with env parsing, prompt addendum,
   `session_tools()`, `is_advance_stage()`, `handle_advance_stage()`, ledger
   ownership when `condition="stagegate"`, ledger updates from visible events,
-  and `ledger_update` trace events.
+  validator ownership when `condition="stagegate"`, visible message recording,
+  and `ledger_update` / validator trace events.
 - `src/tau2/agent/discrete_time_audio_native_agent.py` wires the controller
   into OpenAI audio-native session setup without changing baseline behavior.
-- `src/tau2/orchestrator/full_duplex_orchestrator.py` intercepts only
-  `advance_stage`; all other tool calls continue through
-  `Environment.get_response()` unchanged.
+- `src/tau2/orchestrator/full_duplex_orchestrator.py` records visible
+  participant text for the validator, intercepts `advance_stage`, and validates
+  non-`advance_stage` domain tool calls before domain execution. Allowed calls
+  continue through `Environment.get_response()` unchanged; blocked calls return
+  an error `ToolMessage` containing a corrective stage packet and do not touch
+  domain state.
 - `src/tau2/voice/audio_native/openai/__init__.py` lazy-loads provider and
   adapter classes so importing the StageOnly package does not make core
   τ-bench imports require voice-only dependencies.
 
-The active package exports the ledger models. It intentionally does not export
-or import `PreWriteValidator`, `ValidatorDecision`, `CorrectivePacket`,
-validator tests, validator decisions, or tool blocking.
+The active package exports the ledger and validator models. `stage_only`
+remains validator-free; the pre-write validator is active only for
+`TAU2_STAGEGATE_CONDITION=stagegate`.
 
 ## Implementation Progress
 
@@ -152,6 +163,16 @@ validator tests, validator decisions, or tool blocking.
   and per-slot `ledger_delta`.
 - [x] Feed StageGate packets from ledger `known_facts`, `missing_facts`,
   `ambiguous_facts`, and `ask_next`; keep StageOnly packet behavior compatible.
+- [x] Add `PreWriteValidator` with `ValidatorDecision`, side-effecting tool
+  classification, read-tool pass-through, exact identifier checks, policy-state
+  inspection checks, action summary checks, user confirmation checks, and
+  required argument checks.
+- [x] Return corrective `stagegate.stage_packet.v1` tool messages when blocking
+  unsafe write/action calls.
+- [x] Emit `validator_check`, `validator_allow`, and `validator_block` trace
+  rows.
+- [x] Keep blocked calls from invoking `Environment.get_response()` or mutating
+  domain toolkit state.
 
 ## Tests
 
@@ -159,8 +180,8 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 
 - baseline/unset environment leaves prompt and tool list unchanged;
 - `TAU2_STAGEGATE_CONDITION=stage_only` adds exactly one `advance_stage` tool;
-- `TAU2_STAGEGATE_CONDITION=stagegate` currently enables StageOnly behavior
-  only and has no ledger or validator attributes;
+- `TAU2_STAGEGATE_CONDITION=stagegate` enables the entity ledger and
+  pre-write validator;
 - `advance_stage` returns a `stagegate.stage_packet.v1` packet;
 - `advance_stage` does not call `Environment.get_response()` and does not
   mutate a fake domain toolkit counter;
@@ -177,6 +198,12 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - `ledger_update` trace event shape and metadata.
 - regression coverage that retail product names and telecom plan names do not
   get misclassified as customer names.
+- validator blocking never mutates domain state;
+- missing user confirmation blocks a write and returns a corrective packet;
+- confirmed exact identifiers allow a read and then a policy-valid write;
+- read-only tools are not overblocked;
+- validator leakage guards show no task objective, expected final DB,
+  user-simulator private state, evaluator result, or task-ID routing inputs.
 
 ## Validation Evidence
 
@@ -243,6 +270,37 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   result: Ruff check passed and Ruff format left 321 files unchanged.
 - 2026-05-09 review pass: `make test-voice`
   result: `266 passed, 3 skipped, 83 deselected, 2 warnings in 0.45s`.
+- 2026-05-09 pre-write validator pass: initial
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  failed during collection with `ModuleNotFoundError: No module named 'tau2'`
+  in the fresh `.venv`; `uv sync --extra voice --extra dev` completed
+  successfully.
+- 2026-05-09 pre-write validator pass:
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  result before formatting: `30 passed, 2 warnings in 0.06s`.
+- 2026-05-09 pre-write validator pass:
+  `uv run ruff check src/tau2/voice/audio_native/openai/stagegate/validator.py src/tau2/voice/audio_native/openai/stagegate/controller.py src/tau2/orchestrator/full_duplex_orchestrator.py tests/test_streaming/test_stagegate.py`
+  result: `All checks passed!`.
+- 2026-05-09 pre-write validator pass: `make test-voice`
+  result before formatting: `275 passed, 3 skipped, 83 deselected, 2 warnings
+  in 0.74s`.
+- 2026-05-09 pre-write validator pass: `make check-all`
+  result: Ruff check passed and Ruff format reformatted 1 file.
+- 2026-05-09 pre-write validator pass:
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  result after formatting: `30 passed, 2 warnings in 0.04s`.
+- 2026-05-09 pre-write validator pass: `make test`
+  result: `164 passed, 17 failed, 1 xfailed, 14 warnings`; failures are
+  credential-dependent LLM tests failing with `litellm.AuthenticationError`
+  because `OPENAI_API_KEY` is not set in this environment, plus one downstream
+  assertion from an LLM-backed run producing no results.
+- 2026-05-09 pre-write validator pass:
+  `npm run format`, `npm run check`, and `npm run lint`
+  result: all failed with npm `ENOENT` because this repository has no root
+  `package.json`.
+- 2026-05-09 pre-write validator pass: `make test-voice`
+  result after formatting: `275 passed, 3 skipped, 83 deselected, 2 warnings
+  in 0.48s`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -252,9 +310,9 @@ Warnings observed in the passing focused and voice test commands:
 
 ## Decision Log
 
-- `TAU2_STAGEGATE_CONDITION=stagegate` remains accepted for CLI and
-  experiment compatibility, but it behaves identically to `stage_only` until a
-  later V2 ExecPlan implements ledger and validation.
+- `TAU2_STAGEGATE_CONDITION=stagegate` owns the entity ledger and pre-write
+  validator. `stage_only` remains a StageOnly control condition with no ledger
+  or validator.
 - `FullDuplexOrchestrator._execute_stagegate_tool_call()` is the right boundary
   for `advance_stage` interception because it can return a normal
   `ToolMessage` without touching domain state.
@@ -282,18 +340,26 @@ Warnings observed in the passing focused and voice test commands:
   names because product and plan tool outputs also expose `name`; person names
   come from structured `full_name`, `first_name`/`last_name`, or `name` objects,
   while telecom plan display names are captured only from plan-shaped payloads.
+- 2026-05-09 pre-write validator pass: The validator uses only public domain
+  name, public tool schemas/names/descriptions, visible participant text,
+  model tool-call arguments, official domain tool results, and ledger state
+  derived from those visible events.
+- 2026-05-09 pre-write validator pass: Blocked writes return an error
+  `ToolMessage` with a corrective stage packet and increment the existing
+  orchestrator tool-error counter; the domain environment is not called.
+- 2026-05-09 pre-write validator pass: Task IDs remain trace metadata only and
+  are not passed into validator decision logic.
 
 ## Remaining Work
 
 - Run a later one-task OpenAI audio-native smoke with credentials and runtime
   budget available.
-- Implement pre-write validation under a separate explicit plan and validity
-  review.
 
 ## Outcomes & Retrospective
 
-StageOnly and the V2 entity ledger are implemented and narrowly tested.
-Baseline remains disabled unless `TAU2_STAGEGATE_CONDITION` is set to
-`stage_only` or `stagegate`; non-stage domain tools still execute through
-`Environment.get_response()` unchanged, and StageGate ledger updates are
-trace-only bookkeeping with no domain-state mutation or tool blocking.
+StageOnly, the V2 entity ledger, and the pre-write validator are implemented
+and narrowly tested. Baseline remains disabled unless
+`TAU2_STAGEGATE_CONDITION` is set to `stage_only` or `stagegate`; `stage_only`
+keeps the prior orchestration-only behavior, while `stagegate` now blocks
+unsafe write/action calls before domain-state mutation and returns corrective
+stage packets to the model.
