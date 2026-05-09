@@ -112,7 +112,7 @@ agent.
 
 The active package intentionally does not export or import `EntityLedger`,
 `PreWriteValidator`, `ValidatorDecision`, `CorrectivePacket`, validator tests,
-ledger updates, domain-tool result observation, or tool blocking.
+ledger updates, validator decisions, or tool blocking.
 
 ## Implementation Progress
 
@@ -124,10 +124,17 @@ ledger updates, domain-tool result observation, or tool blocking.
 - [x] Treat `stagegate` as StageOnly-compatible for this step.
 - [x] Generate `stagegate.stage_packet.v1` tool results without calling
   `Environment.get_response()`.
-- [x] Emit only `advance_stage_call` and `stage_packet_returned` JSONL events
-  when `TAU2_TRACE_JSONL` is set.
+- [x] Emit canonical `stagegate.trace.v1` JSONL events when
+  `TAU2_TRACE_JSONL` is set: `run_start`, `run_end`,
+  `model_function_call`, `domain_tool_call`, `domain_tool_result`,
+  `advance_stage_call`, `stage_packet_returned`, and post-evaluation
+  `final_outcome`.
 - [x] Leave normal domain tools on the existing execution path.
 - [x] Remove active V2 ledger and validator behavior from this scope.
+- [x] Preserve batch `trial` metadata on trace rows by attaching the trial to
+  the orchestrator before simulation execution.
+- [x] Emit `run_end` trace rows for full-duplex run exceptions so started trace
+  runs do not remain open-ended after retryable failures.
 
 ## Tests
 
@@ -142,8 +149,9 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   mutate a fake domain toolkit counter;
 - normal non-`advance_stage` domain tools still call
   `Environment.get_response()` unchanged;
-- `TAU2_TRACE_JSONL` writes exactly `advance_stage_call` and
-  `stage_packet_returned`.
+- `TAU2_TRACE_JSONL` writes canonical `stagegate.trace.v1` rows for
+  StageOnly packets, model function calls, domain tool calls/results, and
+  posthoc final outcome rows.
 
 ## Validation Evidence
 
@@ -161,6 +169,30 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   result: `6 passed, 2 warnings in 0.02s`.
 - `uv run pytest tests/test_streaming/test_discrete_time_audio_native_agent.py -q`
   result: `33 passed, 2 warnings in 0.06s`.
+- `uv sync --extra voice --extra dev --extra experiments`
+  result: completed successfully after the fresh worktree environment resolved
+  `uv run pytest` to a global Python 3.13 pytest before the dev extra was
+  installed.
+- `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
+  result: `12 passed, 2 warnings in 0.04s`.
+- `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
+  after review fixes result: `15 passed, 2 warnings in 0.04s`.
+- `make test`
+  result: `164 passed, 17 failed, 1 xfailed, 14 warnings`; failures are
+  LLM-backed core tests failing with `litellm.AuthenticationError` because
+  `OPENAI_API_KEY` is not set in this environment.
+- `make test-voice`
+  result: `255 passed, 3 skipped, 83 deselected, 2 warnings in 0.72s`.
+- `make test-voice` after review fixes
+  result: `258 passed, 3 skipped, 83 deselected, 2 warnings in 0.49s`.
+- `make check-all`
+  result: Ruff check passed and Ruff format reformatted 3 files.
+- `make check-all` after review fixes
+  result: Ruff check passed and Ruff format left 320 files unchanged.
+- `git diff --check`
+  result: passed with no whitespace errors.
+- `uv run ruff check .`
+  result: `All checks passed!`.
 
 Warnings observed in both passing test commands:
 
@@ -179,6 +211,15 @@ Warnings observed in both passing test commands:
 - `JsonlTraceWriter` remains independent from τ-bench checkpointing so traces
   can be enabled without changing `SimulationRun`, evaluator inputs, scoring,
   or result files.
+- `final_outcome` trace emission is done only after `run_simulation()` attaches
+  evaluator `reward_info`; it is marked `visible_to_agent=false` and
+  `leakage_risk=posthoc_evaluator`.
+- 2026-05-09: Batch trial context is attached to the orchestrator before
+  `run_simulation()` so runtime events and posthoc `final_outcome` rows share
+  the same trial identifier.
+- 2026-05-09: `run_end` on exception uses
+  `termination_reason="exception"` because retry infrastructure owns the final
+  failed `SimulationRun` object for exhausted attempts.
 
 ## Remaining Work
 

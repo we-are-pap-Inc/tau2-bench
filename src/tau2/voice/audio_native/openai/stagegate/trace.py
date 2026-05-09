@@ -9,6 +9,7 @@ from loguru import logger
 from tau2.voice.audio_native.openai.stagegate.stage_schema import TraceEvent
 
 TRACE_ENV_VAR = "TAU2_TRACE_JSONL"
+TRACE_RUN_ID_ENV_VAR = "TAU2_TRACE_RUN_ID"
 
 
 class JsonlTraceWriter:
@@ -41,3 +42,8 @@ class JsonlTraceWriter:
         except OSError as exc:
             logger.error(f"Failed to write StageGate trace event: {exc}")
             raise
+
+
+def get_trace_run_id(*, sim_id: Optional[str] = None) -> Optional[str]:
+    """Resolve the trace run ID from environment or simulation context."""
+    return os.environ.get(TRACE_RUN_ID_ENV_VAR) or sim_id

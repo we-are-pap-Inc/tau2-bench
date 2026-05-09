@@ -350,6 +350,7 @@ def run_single_task(
     auto_review: bool = False,
     review_mode: str = "full",
     hallucination_feedback: Optional[str] = None,
+    trial: Optional[int] = None,
 ) -> SimulationRun:
     """Run a single task simulation with logging and optional side effects.
 
@@ -372,6 +373,7 @@ def run_single_task(
         audio_debug: Enable audio debug analysis.
         auto_review: Run LLM conversation review after simulation.
         review_mode: Review mode ("full" or "user").
+        trial: Optional batch trial index for trace metadata.
 
     Returns:
         The completed SimulationRun with reward_info attached.
@@ -408,6 +410,8 @@ def run_single_task(
             hallucination_feedback=hallucination_feedback,
             audio_taps_dir=taps_dir,
         )
+        if trial is not None:
+            orchestrator.trial = trial
 
         # Layer 1: Run the simulation
         env_kwargs = _build_env_kwargs(config, task) or None
@@ -662,6 +666,7 @@ def run_tasks(
                 auto_review=config.auto_review,
                 review_mode=config.review_mode,
                 hallucination_feedback=hallucination_feedback,
+                trial=trial,
             )
 
         try:

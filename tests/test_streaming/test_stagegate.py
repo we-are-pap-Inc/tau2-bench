@@ -1,13 +1,22 @@
 import json
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from tau2.agent.discrete_time_audio_native_agent import DiscreteTimeAudioNativeAgent
 from tau2.data_model.message import ToolCall
+from tau2.data_model.simulation import RewardInfo, SimulationRun
 from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
-from tau2.voice.audio_native.openai.stagegate import StageGateController
+from tau2.orchestrator.orchestrator import BaseOrchestrator
+from tau2.runner import batch as runner_batch
+from tau2.runner.simulation import _trace_final_outcome
+from tau2.voice.audio_native.openai.stagegate import StageGateController, TraceEvent
+from tau2.voice.audio_native.openai.stagegate.trace import JsonlTraceWriter
 
 
 def _test_tool(arg: str) -> str:
@@ -203,10 +212,42 @@ def test_stage_only_does_not_block_normal_domain_tools():
     assert orchestrator.num_errors == 0
 
 
+def test_trace_event_uses_canonical_schema():
+    event = TraceEvent(
+        event_type="model_function_call",
+        condition="stage_only",
+        run_id="run_123",
+        domain="mock",
+        task_id="task_123",
+        sim_id="sim_123",
+        tick_index=4,
+        tool_name="get_account",
+        tool_args={"account_id": "acct_123"},
+    )
+
+    data = json.loads(event.model_dump_json())
+    assert data["schema_version"] == "stagegate.trace.v1"
+    assert data["ts"].endswith("Z")
+    assert data["run_id"] == "run_123"
+    assert data["tick_index"] == 4
+    assert data["leakage_risk"] == "none"
+
+
+def test_trace_writer_is_noop_without_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("TAU2_TRACE_JSONL", raising=False)
+    trace_path = tmp_path / "trace_events.jsonl"
+    writer = JsonlTraceWriter.from_env()
+
+    writer.write(TraceEvent(event_type="run_start", condition="baseline"))
+
+    assert not trace_path.exists()
+
+
 def test_trace_writer_records_stagegate_jsonl(monkeypatch, tmp_path):
     trace_path = tmp_path / "stagegate.jsonl"
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stage_only")
     monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    monkeypatch.setenv("TAU2_TRACE_RUN_ID", "run_stagegate")
 
     environment = _environment()
     controller = StageGateController.from_env(
@@ -214,7 +255,11 @@ def test_trace_writer_records_stagegate_jsonl(monkeypatch, tmp_path):
         domain_policy=environment.get_policy(),
         tools=environment.get_tools(),
     )
-    controller.set_domain_name(environment.get_domain_name())
+    controller.set_trace_context(
+        domain_name=environment.get_domain_name(),
+        task_id="task_1",
+        sim_id="sim_1",
+    )
 
     controller.handle_advance_stage(
         ToolCall(
@@ -234,6 +279,194 @@ def test_trace_writer_records_stagegate_jsonl(monkeypatch, tmp_path):
         "advance_stage_call",
         "stage_packet_returned",
     ]
-    assert all(
-        event["schema_version"] == "stagegate.trace_event.v1" for event in events
+    assert all(event["schema_version"] == "stagegate.trace.v1" for event in events)
+    assert all(event["run_id"] == "run_stagegate" for event in events)
+    assert all(event["domain"] == "mock" for event in events)
+    assert events[0]["tool_name"] == "advance_stage"
+    assert events[0]["tick_index"] == 1
+    assert events[1]["stage"] == "identify_or_authenticate"
+    assert events[1]["latency_ms"] >= 0
+
+
+def test_domain_tool_trace_events_are_emitted(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
     )
+    controller.set_trace_context(
+        domain_name=environment.get_domain_name(),
+        task_id="task_2",
+        sim_id="sim_2",
+    )
+    orchestrator = _orchestrator_shell(environment)
+    tool_call = ToolCall(
+        id="call_read",
+        name="get_account",
+        arguments={"account_id": "acct_123"},
+    )
+
+    controller.trace_model_function_call(tool_call, tick_id=7)
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        tool_call,
+        tick_id=7,
+    )
+
+    assert json.loads(result.content)["status"] == "active"
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == [
+        "model_function_call",
+        "domain_tool_call",
+        "domain_tool_result",
+    ]
+    assert all(event["task_id"] == "task_2" for event in events)
+    assert all(event["sim_id"] == "sim_2" for event in events)
+    assert events[0]["tool_args"] == {"account_id": "acct_123"}
+    assert events[2]["latency_ms"] >= 0
+    assert events[2]["payload"]["tool_error"] is False
+
+
+def test_final_outcome_trace_is_posthoc(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+    )
+    controller.set_trace_context(
+        domain_name=environment.get_domain_name(),
+        task_id="task_3",
+        sim_id="sim_3",
+    )
+    simulation = SimulationRun(
+        id="sim_3",
+        task_id="task_3",
+        start_time="2026-05-08T00:00:00",
+        end_time="2026-05-08T00:00:01",
+        duration=1.0,
+        termination_reason="agent_stop",
+        reward_info=RewardInfo(reward=1.0),
+    )
+
+    controller.trace_final_outcome(simulation)
+
+    event = json.loads(trace_path.read_text().strip())
+    assert event["event_type"] == "final_outcome"
+    assert event["visible_to_agent"] is False
+    assert event["leakage_risk"] == "posthoc_evaluator"
+    assert event["reward"] == 1.0
+    assert event["passed"] is True
+
+
+def test_final_outcome_trace_uses_orchestrator_trial(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+    )
+    orchestrator = SimpleNamespace(
+        agent=SimpleNamespace(stagegate_controller=controller),
+        environment=environment,
+        task=SimpleNamespace(id="task_4"),
+        trial=2,
+    )
+    simulation = SimulationRun(
+        id="sim_4",
+        task_id="task_4",
+        start_time="2026-05-08T00:00:00",
+        end_time="2026-05-08T00:00:01",
+        duration=1.0,
+        termination_reason="agent_stop",
+        reward_info=RewardInfo(reward=0.0),
+    )
+
+    _trace_final_outcome(orchestrator, simulation)
+
+    event = json.loads(trace_path.read_text().strip())
+    assert event["event_type"] == "final_outcome"
+    assert event["trial"] == 2
+    assert event["sim_id"] == "sim_4"
+
+
+def test_run_single_task_attaches_trial_for_trace_context(monkeypatch):
+    orchestrator = SimpleNamespace()
+
+    monkeypatch.setattr(
+        runner_batch,
+        "build_orchestrator",
+        lambda *args, **kwargs: orchestrator,
+    )
+    monkeypatch.setattr(runner_batch, "_build_env_kwargs", lambda *args, **kwargs: None)
+
+    def run_simulation(orchestrator_arg, **kwargs):
+        assert orchestrator_arg is orchestrator
+        assert orchestrator_arg.trial == 4
+        return SimulationRun(
+            id="sim_6",
+            task_id="task_6",
+            start_time="2026-05-08T00:00:00",
+            end_time="2026-05-08T00:00:01",
+            duration=1.0,
+            termination_reason="agent_stop",
+            reward_info=RewardInfo(reward=1.0),
+        )
+
+    monkeypatch.setattr(runner_batch, "run_simulation", run_simulation)
+
+    result = runner_batch.run_single_task(
+        SimpleNamespace(
+            domain="mock",
+            effective_agent="agent",
+            effective_user="user",
+        ),
+        SimpleNamespace(id="task_6"),
+        trial=4,
+    )
+
+    assert result.id == "sim_6"
+
+
+def test_full_duplex_run_traces_run_end_on_exception(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = SimpleNamespace(stagegate_controller=controller)
+    orchestrator.task = SimpleNamespace(id="task_5")
+    orchestrator.simulation_id = "sim_5"
+    orchestrator.trial = 3
+    orchestrator._run_start_perf = None
+
+    def raise_from_base_run(self):
+        self._run_start_perf = time.perf_counter()
+        raise RuntimeError("sim failed")
+
+    monkeypatch.setattr(BaseOrchestrator, "run", raise_from_base_run)
+
+    with pytest.raises(RuntimeError, match="sim failed"):
+        FullDuplexOrchestrator.run(orchestrator)
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == ["run_start", "run_end"]
+    assert events[0]["trial"] == 3
+    assert events[1]["trial"] == 3
+    assert events[1]["payload"]["termination_reason"] == "exception"
+    assert events[1]["payload"]["duration_seconds"] >= 0
