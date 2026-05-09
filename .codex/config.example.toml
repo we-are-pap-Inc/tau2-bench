@@ -1,0 +1,13 @@
+# Copy relevant parts into .codex/config.toml or ~/.codex/config.toml.
+# Use the strongest available Codex model in your account for long implementation tasks.
+
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+
+[agents]
+max_threads = 4
+max_depth = 1
+job_max_runtime_seconds = 3600
+
+# Keep sandboxing/approvals conservative until the repo is trusted and tests are stable.
+# Adjust these through Codex UI/CLI according to your environment.
