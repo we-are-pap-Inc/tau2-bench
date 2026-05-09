@@ -316,7 +316,7 @@ FIELD_ALIASES = {
     "telecom": {
         "account_id": {"account_id", "customer_id"},
         "phone_line": {"phone_line", "line_id", "phone_number", "phone"},
-        "plan_name": {"plan_name", "plan"},
+        "plan_name": {"plan_name", "plan", "plan_id"},
         "device_id": {"device_id"},
         "issue_type": {"issue_type", "issue", "problem", "reason"},
         "confirmation": {"confirmation", "confirmed", "user_confirmation"},
@@ -406,6 +406,9 @@ def extract_domain_facts(
         names = unique_values(extract_names(payload))
         if names:
             facts["customer_name"] = names[0] if len(names) == 1 else names
+        plan_names = unique_values(extract_plan_names(payload))
+        if plan_names:
+            facts["plan_name"] = plan_names[0] if len(plan_names) == 1 else plan_names
         address = first_value(
             [
                 *values_by_key(payload, {"service_address"}),
@@ -446,8 +449,6 @@ def extract_names(payload: Any) -> list[str]:
         if isinstance(full_name, str) and full_name.strip():
             names.append(full_name)
         name = payload.get("name")
-        if isinstance(name, str) and name.strip():
-            names.append(name)
         if isinstance(name, dict):
             composed = compose_name(name)
             if composed:
@@ -461,6 +462,21 @@ def extract_names(payload: Any) -> list[str]:
         for item in payload:
             names.extend(extract_names(item))
     return names
+
+
+def extract_plan_names(payload: Any) -> list[str]:
+    """Recursively collect telecom plan display names."""
+    plan_names: list[str] = []
+    if isinstance(payload, dict):
+        name = payload.get("name")
+        if "plan_id" in payload and isinstance(name, str) and name.strip():
+            plan_names.append(name)
+        for value in payload.values():
+            plan_names.extend(extract_plan_names(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            plan_names.extend(extract_plan_names(item))
+    return plan_names
 
 
 def compose_name(payload: dict[str, Any]) -> Optional[str]:

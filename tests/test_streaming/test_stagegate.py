@@ -276,6 +276,42 @@ def test_ledger_updates_from_successful_official_tool_results():
     )
 
 
+def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
+    retail_ledger = EntityLedger.for_domain("retail")
+    retail_ledger.update_from_tool_result(
+        tool_name="get_product_details",
+        content=json.dumps(
+            {
+                "product_id": "prod_123",
+                "name": "Everyday Backpack",
+                "variants": {"v_1": {"item_id": "item_1"}},
+            }
+        ),
+        event_id="call_product",
+        tick_index=1,
+    )
+
+    assert retail_ledger.slots["customer_name"].status is LedgerStatus.MISSING
+    assert retail_ledger.slots["item_id"].value == "item_1"
+
+    telecom_ledger = EntityLedger.for_domain("telecom")
+    telecom_ledger.update_from_tool_result(
+        tool_name="get_details_by_id",
+        content=json.dumps(
+            {
+                "plan_id": "plan_unlimited",
+                "name": "Unlimited Plus",
+                "data_limit_gb": 100,
+            }
+        ),
+        event_id="call_plan",
+        tick_index=1,
+    )
+
+    assert telecom_ledger.slots["customer_name"].status is LedgerStatus.MISSING
+    assert telecom_ledger.slots["plan_name"].value == "Unlimited Plus"
+
+
 def test_errored_tool_results_do_not_update_ledger():
     environment = _environment(domain_name="telecom")
     controller = StageGateController(

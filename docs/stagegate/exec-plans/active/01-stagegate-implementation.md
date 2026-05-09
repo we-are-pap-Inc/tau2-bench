@@ -175,6 +175,8 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - errored tool-result no-op behavior;
 - contradiction handling and `ambiguous_facts` in StageGate packets;
 - `ledger_update` trace event shape and metadata.
+- regression coverage that retail product names and telecom plan names do not
+  get misclassified as customer names.
 
 ## Validation Evidence
 
@@ -235,6 +237,12 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - 2026-05-09: `npm run format`, `npm run check`, and `npm run lint`
   result: all failed with npm `ENOENT` because this repository has no root
   `package.json`.
+- 2026-05-09 review pass: `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py -q`
+  result after tightening name extraction: `23 passed, 2 warnings in 0.05s`.
+- 2026-05-09 review pass: `make check-all`
+  result: Ruff check passed and Ruff format left 321 files unchanged.
+- 2026-05-09 review pass: `make test-voice`
+  result: `266 passed, 3 skipped, 83 deselected, 2 warnings in 0.45s`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -270,6 +278,10 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-09: The first ledger implementation uses deterministic structured
   extraction from visible tool arguments/results. It does not attempt
   free-text parsing of simulator speech or `advance_stage.observed_facts`.
+- 2026-05-09 review pass: String fields named `name` are not treated as person
+  names because product and plan tool outputs also expose `name`; person names
+  come from structured `full_name`, `first_name`/`last_name`, or `name` objects,
+  while telecom plan display names are captured only from plan-shaped payloads.
 
 ## Remaining Work
 
