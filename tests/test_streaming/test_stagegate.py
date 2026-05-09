@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tau2.agent.discrete_time_audio_native_agent import DiscreteTimeAudioNativeAgent
-from tau2.data_model.message import ToolCall
+from tau2.data_model.message import ToolCall, ToolMessage
 from tau2.data_model.simulation import RewardInfo, SimulationRun
 from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool
@@ -15,7 +15,12 @@ from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
 from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
 from tau2.runner.simulation import _trace_final_outcome
-from tau2.voice.audio_native.openai.stagegate import StageGateController, TraceEvent
+from tau2.voice.audio_native.openai.stagegate import (
+    EntityLedger,
+    LedgerStatus,
+    StageGateController,
+    TraceEvent,
+)
 from tau2.voice.audio_native.openai.stagegate.trace import JsonlTraceWriter
 
 
@@ -62,9 +67,9 @@ class StageGateToolkit(ToolKitBase):
         return {"account_id": account_id, "plan_name": plan_name}
 
 
-def _environment() -> Environment:
+def _environment(domain_name: str = "mock") -> Environment:
     return Environment(
-        domain_name="mock",
+        domain_name=domain_name,
         policy="Public policy.",
         tools=StageGateToolkit(),
     )
@@ -134,7 +139,27 @@ def test_stagegate_agent_leaves_baseline_tools_unchanged(monkeypatch):
     )
 
 
-def test_stagegate_condition_currently_enables_stage_only(monkeypatch):
+def test_stage_only_condition_has_no_ledger(monkeypatch):
+    monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stage_only")
+    adapter = MagicMock()
+    adapter.is_connected = False
+    adapter.connect.side_effect = lambda *args, **kwargs: setattr(
+        adapter, "is_connected", True
+    )
+
+    agent = DiscreteTimeAudioNativeAgent(
+        tools=[Tool(_test_tool)],
+        domain_policy="Policy.",
+        adapter=adapter,
+        provider="openai",
+    )
+    agent.get_init_state()
+
+    assert not hasattr(agent.stagegate_controller, "ledger")
+    assert not hasattr(agent.stagegate_controller, "validator")
+
+
+def test_stagegate_condition_enables_entity_ledger(monkeypatch):
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stagegate")
     adapter = MagicMock()
     adapter.is_connected = False
@@ -155,8 +180,251 @@ def test_stagegate_condition_currently_enables_stage_only(monkeypatch):
     assert (
         "StageGate operating rules" in adapter.connect.call_args.kwargs["system_prompt"]
     )
-    assert not hasattr(agent.stagegate_controller, "ledger")
+    assert hasattr(agent.stagegate_controller, "ledger")
     assert not hasattr(agent.stagegate_controller, "validator")
+
+
+def test_entity_ledger_initializes_domain_slots_and_serializes():
+    ledger = EntityLedger.for_domain("retail")
+
+    assert list(ledger.slots) == [
+        "customer_name",
+        "email",
+        "phone",
+        "order_id",
+        "item_id",
+        "return_reason",
+        "refund_or_exchange_intent",
+        "address",
+        "payment_method",
+        "confirmation",
+    ]
+    data = json.loads(ledger.model_dump_json())
+    assert data["domain_name"] == "retail"
+    assert data["slots"]["order_id"]["status"] == "missing"
+    assert data["slots"]["order_id"]["evidence"] == []
+
+
+def test_ledger_updates_from_visible_model_tool_arguments():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_cancel",
+            name="cancel_pending_order",
+            arguments={"order_id": "O-12345", "reason": "ordered by mistake"},
+        ),
+        tick_id=9,
+    )
+
+    order_slot = controller.ledger.slots["order_id"]
+    assert order_slot.status is LedgerStatus.HEARD_NOT_CONFIRMED
+    assert order_slot.value == "O-12345"
+    assert order_slot.evidence[-1].source == "model_tool_args"
+    assert order_slot.evidence[-1].event_id == "call_cancel"
+    assert order_slot.evidence[-1].tick_index == 9
+    assert controller.ledger.slots["return_reason"].value == "ordered by mistake"
+    assert controller.ledger.slots["refund_or_exchange_intent"].value == "cancel"
+
+
+def test_ledger_updates_from_successful_official_tool_results():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    tool_call = ToolCall(
+        id="call_customer",
+        name="get_customer_by_id",
+        arguments={"customer_id": "cust_123"},
+    )
+    tool_result = ToolMessage(
+        id="call_customer",
+        role="tool",
+        content=json.dumps(
+            {
+                "customer_id": "cust_123",
+                "full_name": "Ada Lovelace",
+                "phone_number": "+1-555-0100",
+                "address": {
+                    "street": "1 Algorithm Way",
+                    "city": "London",
+                    "state": "CA",
+                    "zip_code": "90001",
+                },
+            }
+        ),
+        error=False,
+    )
+
+    controller.trace_domain_tool_result(tool_call, tool_result, tick_id=4)
+
+    assert controller.ledger.slots["account_id"].status is LedgerStatus.TOOL_VERIFIED
+    assert controller.ledger.slots["account_id"].value == "cust_123"
+    assert controller.ledger.slots["customer_name"].value == "Ada Lovelace"
+    assert controller.ledger.slots["phone_line"].value == "+1-555-0100"
+    assert controller.ledger.slots["service_address"].value["street"] == (
+        "1 Algorithm Way"
+    )
+
+
+def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
+    retail_ledger = EntityLedger.for_domain("retail")
+    retail_ledger.update_from_tool_result(
+        tool_name="get_product_details",
+        content=json.dumps(
+            {
+                "product_id": "prod_123",
+                "name": "Everyday Backpack",
+                "variants": {"v_1": {"item_id": "item_1"}},
+            }
+        ),
+        event_id="call_product",
+        tick_index=1,
+    )
+
+    assert retail_ledger.slots["customer_name"].status is LedgerStatus.MISSING
+    assert retail_ledger.slots["item_id"].value == "item_1"
+
+    telecom_ledger = EntityLedger.for_domain("telecom")
+    telecom_ledger.update_from_tool_result(
+        tool_name="get_details_by_id",
+        content=json.dumps(
+            {
+                "plan_id": "plan_unlimited",
+                "name": "Unlimited Plus",
+                "data_limit_gb": 100,
+            }
+        ),
+        event_id="call_plan",
+        tick_index=1,
+    )
+
+    assert telecom_ledger.slots["customer_name"].status is LedgerStatus.MISSING
+    assert telecom_ledger.slots["plan_name"].value == "Unlimited Plus"
+
+
+def test_errored_tool_results_do_not_update_ledger():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_domain_tool_result(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        ToolMessage(
+            id="call_customer",
+            role="tool",
+            content=json.dumps({"customer_id": "cust_123"}),
+            error=True,
+        ),
+        tick_id=4,
+    )
+
+    assert controller.ledger.slots["account_id"].status is LedgerStatus.MISSING
+
+
+def test_ledger_contradiction_surfaces_as_ambiguous_stage_fact():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_first",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        tick_id=1,
+    )
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_second",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_999"},
+        ),
+        tick_id=2,
+    )
+
+    slot = controller.ledger.slots["account_id"]
+    assert slot.status is LedgerStatus.CONTRADICTED
+    assert slot.alternatives == ["cust_999"]
+
+    packet_result = controller.handle_advance_stage(
+        ToolCall(
+            id="call_stage",
+            name="advance_stage",
+            arguments={
+                "current_stage": "collect_required_exact_entities",
+                "observed_facts": [],
+                "last_action": "customer lookup argument changed",
+            },
+        ),
+        tick_id=3,
+    )
+    packet = json.loads(packet_result.content)
+    assert "account_id: cust_123, cust_999" in packet["ambiguous_facts"]
+    assert (
+        packet["ask_next"]
+        == "Clarify the exact value for: account_id: cust_123, cust_999."
+    )
+
+
+def test_ledger_update_trace_events_are_emitted(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    controller.set_trace_context(task_id="task_ledger", sim_id="sim_ledger")
+
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        tick_id=7,
+    )
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event_type"] for event in events] == [
+        "model_function_call",
+        "ledger_update",
+    ]
+    ledger_event = events[1]
+    assert ledger_event["source"] == "model_tool_args"
+    assert ledger_event["visible_to_agent"] is True
+    assert ledger_event["tick_index"] == 7
+    assert ledger_event["ledger_delta"]["account_id"]["status"] == (
+        "heard_not_confirmed"
+    )
+    assert ledger_event["ledger_delta"]["account_id"]["evidence"]["event_id"] == (
+        "call_customer"
+    )
 
 
 def test_advance_stage_returns_packet_without_domain_tool_execution():
