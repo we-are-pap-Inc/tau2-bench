@@ -19,7 +19,6 @@ from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
-from tau2.voice.audio_native.openai.tick_runner import TickResult
 
 from tau2.agent.discrete_time_audio_native_agent import (
     DiscreteTimeAgentState,
@@ -33,6 +32,7 @@ from tau2.data_model.message import (
     UserMessage,
 )
 from tau2.environment.tool import Tool
+from tau2.voice.audio_native.tick_result import TickResult
 
 # =============================================================================
 # Mock TickResult Helper

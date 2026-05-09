@@ -77,6 +77,7 @@ from tau2.data_model.message import (
 from tau2.environment.tool import Tool
 from tau2.utils.utils import get_now
 from tau2.voice.audio_native.adapter import DiscreteTimeAdapter, create_adapter
+from tau2.voice.audio_native.openai.stagegate import StageGateController
 from tau2.voice.audio_native.tick_result import TickResult
 
 # Provider type alias
@@ -254,6 +255,11 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         self.reasoning_effort = reasoning_effort
         self.max_inactive_seconds = max_inactive_seconds
         self.cascaded_config = cascaded_config
+        self.stagegate_controller = StageGateController.from_env(
+            provider=provider,
+            domain_policy=domain_policy,
+            tools=tools,
+        )
 
         # Audio format (defaults to telephony)
         self.audio_format = audio_format or TELEPHONY_AUDIO_FORMAT
@@ -350,10 +356,13 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         else:
             agent_instruction = AUDIO_NATIVE_VOICE_INSTRUCTION
 
-        return template.format(
+        prompt = template.format(
             agent_instruction=agent_instruction,
             domain_policy=self.domain_policy,
         )
+        if self.stagegate_controller.enabled:
+            prompt = f"{prompt}\n\n{self.stagegate_controller.prompt_addendum()}"
+        return prompt
 
     @property
     def adapter(self) -> DiscreteTimeAdapter:
@@ -387,9 +396,10 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
 
         # Connect adapter if not connected
         if not self.adapter.is_connected:
+            session_tools = self.stagegate_controller.session_tools(self.tools)
             self.adapter.connect(
                 system_prompt=self.system_prompt,
-                tools=self.tools,
+                tools=session_tools,
                 vad_config=self.vad_config,
                 modality=self.modality,
             )
