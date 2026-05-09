@@ -1,12 +1,20 @@
 """Typed StageGate schemas."""
 
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from tau2.utils.utils import get_now
-
 StageGateCondition = Literal["baseline", "stage_only", "stagegate"]
+
+
+def get_trace_ts() -> str:
+    """Return an RFC 3339 UTC timestamp for JSONL trace events."""
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 class StagePacket(BaseModel):
@@ -28,10 +36,30 @@ class StagePacket(BaseModel):
 class TraceEvent(BaseModel):
     """One JSONL trace event."""
 
-    schema_version: str = "stagegate.trace_event.v1"
+    schema_version: str = "stagegate.trace.v1"
+    ts: str = Field(default_factory=get_trace_ts)
     event_type: str
-    timestamp: str = Field(default_factory=get_now)
     condition: StageGateCondition
+    run_id: Optional[str] = None
     domain: Optional[str] = None
-    tick_id: Optional[int] = None
+    task_id: Optional[str] = None
+    sim_id: Optional[str] = None
+    trial: Optional[int] = None
+    stage: Optional[str] = None
+    turn_index: Optional[int] = None
+    tick_index: Optional[int] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    visible_to_agent: bool = True
+    source: Optional[str] = None
+    tool_name: Optional[str] = None
+    tool_args: Optional[dict[str, object]] = None
+    ledger_delta: Optional[dict[str, object]] = None
+    validator_decision: Optional[str] = None
+    validator_reason: Optional[str] = None
+    latency_ms: Optional[float] = None
+    leakage_risk: str = "none"
+    passed: Optional[bool] = None
+    failure_type: Optional[str] = None
+    reward: Optional[float] = None
     payload: dict[str, object] = Field(default_factory=dict)

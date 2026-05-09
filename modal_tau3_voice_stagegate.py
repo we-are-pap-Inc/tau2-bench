@@ -13,7 +13,9 @@ from pathlib import Path
 import modal
 
 APP_NAME = "tau3-voice-stagegate"
-REPO_URL = os.environ.get("STAGEGATE_REPO_URL", "https://github.com/YOUR_ORG/tau2-bench.git")
+REPO_URL = os.environ.get(
+    "STAGEGATE_REPO_URL", "https://github.com/YOUR_ORG/tau2-bench.git"
+)
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name("tau3-voice-runs", create_if_missing=True)
@@ -33,7 +35,11 @@ image = (
         "jq",
     )
     .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
-    .env({"PATH": "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"})
+    .env(
+        {
+            "PATH": "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        }
+    )
 )
 
 
@@ -45,7 +51,9 @@ image = (
     cpu=4,
     memory=16_384,
 )
-def run_domain(condition: str, domain: str, repo_ref: str, batch_id: str) -> dict[str, str]:
+def run_domain(
+    condition: str, domain: str, repo_ref: str, batch_id: str
+) -> dict[str, str]:
     """Run one condition/domain pair.
 
     condition: baseline | stage_only | stagegate
@@ -68,7 +76,9 @@ def run_domain(condition: str, domain: str, repo_ref: str, batch_id: str) -> dic
     subprocess.run(["git", "checkout", repo_ref], cwd=workdir, check=True)
     subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir, check=True)
 
-    subprocess.run(["uv", "sync", "--extra", "voice", "--extra", "dev"], cwd=workdir, check=True)
+    subprocess.run(
+        ["uv", "sync", "--extra", "voice", "--extra", "dev"], cwd=workdir, check=True
+    )
     subprocess.run(["uv", "run", "tau2", "check-data"], cwd=workdir, check=True)
 
     env = os.environ.copy()
@@ -109,7 +119,9 @@ def run_domain(condition: str, domain: str, repo_ref: str, batch_id: str) -> dic
 
     simulation_dir = workdir / "data" / "simulations" / save_name
     if simulation_dir.exists():
-        subprocess.run(["bash", "-lc", f"cp -R {simulation_dir} {artifact_root}/"], check=True)
+        subprocess.run(
+            ["bash", "-lc", f"cp -R {simulation_dir} {artifact_root}/"], check=True
+        )
     else:
         raise FileNotFoundError(f"Expected simulation dir not found: {simulation_dir}")
 
@@ -143,6 +155,12 @@ def launch(batch_id: str, repo_ref: str = "main", smoke: bool = False):
     for condition, domain in jobs:
         call = run_domain.spawn(condition, domain, repo_ref, batch_id)
         calls.append(call)
-        print({"condition": condition, "domain": domain, "function_call_id": call.object_id})
+        print(
+            {
+                "condition": condition,
+                "domain": domain,
+                "function_call_id": call.object_id,
+            }
+        )
 
     print(f"Launched {len(calls)} jobs")

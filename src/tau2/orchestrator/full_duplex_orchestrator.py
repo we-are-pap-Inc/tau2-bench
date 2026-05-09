@@ -465,6 +465,11 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 is_agent=is_agent,
             )
             if stagegate_controller is not None:
+                for tool_call in tool_calls:
+                    stagegate_controller.trace_model_function_call(
+                        tool_call,
+                        tick_id=tick_id,
+                    )
                 results = [
                     self._execute_stagegate_tool_call(
                         stagegate_controller,
@@ -507,9 +512,15 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         if not is_agent:
             return None
         controller = getattr(participant, "stagegate_controller", None)
-        if controller is None or not controller.enabled:
+        if controller is None:
             return None
-        controller.set_domain_name(self.environment.get_domain_name())
+        controller.set_trace_context(
+            domain_name=self.environment.get_domain_name(),
+            task_id=self.task.id,
+            sim_id=self.simulation_id,
+        )
+        if not controller.enabled and not controller.tracing_enabled:
+            return None
         return controller
 
     def _execute_stagegate_tool_call(
@@ -525,10 +536,32 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 tick_id=tick_id,
             )
 
+        stagegate_controller.trace_domain_tool_call(tool_call, tick_id=tick_id)
+        tool_start = time.perf_counter()
         tool_result = self.environment.get_response(tool_call)
+        latency_ms = round((time.perf_counter() - tool_start) * 1000, 3)
+        stagegate_controller.trace_domain_tool_result(
+            tool_call,
+            tool_result,
+            tick_id=tick_id,
+            latency_ms=latency_ms,
+        )
         if tool_result.error:
             self.num_errors += 1
         return tool_result
+
+    def _get_stagegate_trace_controller(self):
+        controller = getattr(self.agent, "stagegate_controller", None)
+        if controller is None:
+            return None
+        controller.set_trace_context(
+            domain_name=self.environment.get_domain_name(),
+            task_id=self.task.id,
+            sim_id=self.simulation_id,
+        )
+        if not controller.tracing_enabled:
+            return None
+        return controller
 
     def get_trajectory(self) -> list[Tick]:
         """
@@ -674,6 +707,17 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         Returns:
             SimulationRun: The simulation run.
         """
+        trace_controller = self._get_stagegate_trace_controller()
+        if trace_controller is not None:
+            trace_controller.trace_run_start()
+
         result = super().run()
         compute_proportional_user_transcripts(self.ticks)
+
+        trace_controller = self._get_stagegate_trace_controller()
+        if trace_controller is not None:
+            trace_controller.trace_run_end(
+                termination_reason=result.termination_reason,
+                duration_seconds=result.duration,
+            )
         return result
