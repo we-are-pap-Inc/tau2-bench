@@ -201,6 +201,9 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - validator blocking never mutates domain state;
 - missing user confirmation blocks a write and returns a corrective packet;
 - confirmed exact identifiers allow a read and then a policy-valid write;
+- action summaries must mention the exact mutable identifier as a distinct
+  value before the user confirmation can satisfy the write gate;
+- action summaries must state a consequence, not only an intended action;
 - read-only tools are not overblocked;
 - validator leakage guards show no task objective, expected final DB,
   user-simulator private state, evaluator result, or task-ID routing inputs.
@@ -301,6 +304,28 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - 2026-05-09 pre-write validator pass: `make test-voice`
   result after formatting: `275 passed, 3 skipped, 83 deselected, 2 warnings
   in 0.48s`.
+- 2026-05-09 cleanup review pass:
+  `uv run ruff check src/tau2/voice/audio_native/openai/stagegate/validator.py tests/test_streaming/test_stagegate.py`
+  result: `All checks passed!`.
+- 2026-05-09 cleanup review pass:
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  result after tightening exact identifier and consequence checks and final
+  formatting: `33 passed, 2 warnings in 0.05s`.
+- 2026-05-09 cleanup review pass: `make test-voice`
+  result after final formatting: `278 passed, 3 skipped, 83 deselected,
+  2 warnings in 0.53s`.
+- 2026-05-09 cleanup review pass: `make check-all`
+  result after final formatting: Ruff check passed and Ruff format left
+  322 files unchanged.
+- 2026-05-09 cleanup review pass: `make test`
+  result: `164 passed, 17 failed, 1 xfailed, 14 warnings`; failures are
+  credential-dependent LLM tests failing with `litellm.AuthenticationError`
+  because `OPENAI_API_KEY` is not set in this environment, plus one downstream
+  assertion from an LLM-backed run producing no results.
+- 2026-05-09 cleanup review pass:
+  `npm run format`, `npm run check`, and `npm run lint`
+  result: all failed with npm `ENOENT` because this repository has no root
+  `package.json`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -349,6 +374,17 @@ Warnings observed in the passing focused and voice test commands:
   orchestrator tool-error counter; the domain environment is not called.
 - 2026-05-09 pre-write validator pass: Task IDs remain trace metadata only and
   are not passed into validator decision logic.
+- 2026-05-09 cleanup review pass: Policy preconditions now require every
+  required visible field for the relevant read inspection, avoiding underblocks
+  where one field such as bill status was present but another such as amount
+  due was missing.
+- 2026-05-09 cleanup review pass: Nested list identifiers from read-tool
+  payloads, such as `bill_ids`, are recorded under equivalent singular names
+  such as `bill_id` so successful official lookups can verify exact write
+  arguments without using hidden state.
+- 2026-05-09 cleanup review pass: Exact identifier mentions in the assistant's
+  visible action summary use token-boundary matching so a neighboring ID cannot
+  satisfy confirmation for the requested mutable record.
 
 ## Remaining Work
 

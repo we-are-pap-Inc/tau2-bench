@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -16,7 +15,6 @@ from tau2.voice.audio_native.openai.stagegate.ledger import (
     LedgerStatus,
     normalize_value,
     parse_tool_result,
-    values_by_key,
 )
 from tau2.voice.audio_native.openai.stagegate.stage_schema import StagePacket
 
@@ -156,7 +154,6 @@ CONSEQUENCE_WORDS = {
     "refund",
     "request",
     "status",
-    "will",
 }
 
 CONFIRMATION_PATTERNS = (
@@ -229,7 +226,6 @@ class PreWriteValidator:
     ) -> None:
         self.domain_name = normalize_domain(domain_name)
         self.tools_by_name = {tool.name: tool for tool in tools}
-        self.domain_policy = domain_policy
         self.state = VisibleConversationState()
 
     def set_domain_name(self, domain_name: Optional[str]) -> None:
@@ -471,8 +467,9 @@ class PreWriteValidator:
             return True
         return any(
             self._inspection_matches_tool_call(inspection, tool_call, requirement)
-            and any(
-                field in inspection.keys for field in requirement.precondition_fields
+            and all(
+                precondition_field_present(inspection.keys, field)
+                for field in requirement.precondition_fields
             )
             for inspection in self.state.read_inspections
         )
@@ -546,7 +543,7 @@ class PreWriteValidator:
         statement = normalize_value(self.state.last_action_statement)
         if statement is None:
             return False
-        return normalized_value in statement
+        return normalized_text_mentions_value(statement, normalized_value)
 
     def _action_statement_mentions_exact_args(
         self,
@@ -592,6 +589,8 @@ class PreWriteValidator:
         if isinstance(payload, dict):
             for key, value in payload.items():
                 if isinstance(value, (dict, list)):
+                    for item in iter_values(value):
+                        self._record_verified_identifier(key, item)
                     self._record_verified_payload(value)
                 else:
                     self._record_verified_identifier(key, value)
@@ -702,13 +701,17 @@ def precondition_fields_for_tool(tool_name: str) -> tuple[str, ...]:
     if tool_name in {
         "disable_roaming",
         "enable_roaming",
-        "refuel_data",
+    }:
+        return ("roaming_enabled",)
+    if tool_name in {
         "resume_line",
         "suspend_line",
     }:
-        return ("status", "plan_id", "data_usage")
+        return ("status", "contract_end_date")
+    if tool_name == "refuel_data":
+        return ("data_used_gb", "data_limit_gb")
     if tool_name == "send_payment_request":
-        return ("status", "total_amount_due")
+        return ("status", "total_due")
     if tool_name == "update_account":
         return ("status",)
     return ()
@@ -732,12 +735,43 @@ def equivalent_identifier_names(name: str) -> set[str]:
     """Return equivalent identifier keys seen across args and tool payloads."""
     equivalents = {name}
     if name == "id":
-        equivalents.update({"account_id", "bill_id", "customer_id", "line_id"})
+        equivalents.update(
+            {"account_id", "bill_id", "customer_id", "line_id", "plan_id"}
+        )
+    if name.endswith("_ids"):
+        equivalents.add(name.removesuffix("s"))
+    if name == "orders":
+        equivalents.add("order_id")
+    if name == "reservations":
+        equivalents.add("reservation_id")
     if name == "customer_id":
         equivalents.add("account_id")
     if name == "account_id":
         equivalents.add("customer_id")
     return equivalents
+
+
+def precondition_field_present(keys: set[str], field: str) -> bool:
+    """Return whether any accepted alias for a precondition field is visible."""
+    aliases = {
+        "data_usage": {"data_usage", "data_used_gb"},
+        "total_amount_due": {"total_amount_due", "total_due"},
+    }.get(field, {field})
+    return bool(keys & aliases)
+
+
+def normalized_text_mentions_value(text: str, value: str) -> bool:
+    """Return whether normalized text contains value as a distinct token."""
+    if not value:
+        return False
+    return (
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])",
+            text,
+            flags=re.I,
+        )
+        is not None
+    )
 
 
 def build_corrective_packet(
@@ -895,13 +929,3 @@ def payload_values(payload: Any) -> set[str]:
         if normalized is not None:
             values.add(normalized)
     return values
-
-
-def tool_result_values_for_key(payload: Any, key: str) -> list[Any]:
-    """Return values for a key from a visible tool-result payload."""
-    return values_by_key(payload, {key})
-
-
-def canonical_json(data: Any) -> str:
-    """Return stable JSON for tests and trace payloads."""
-    return json.dumps(data, sort_keys=True, default=str, separators=(",", ":"))

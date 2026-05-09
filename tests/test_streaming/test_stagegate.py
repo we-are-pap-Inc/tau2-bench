@@ -38,6 +38,43 @@ def _test_tool(arg: str) -> str:
     return f"result:{arg}"
 
 
+def get_customer_by_id(customer_id: str) -> dict:
+    """Get customer details.
+
+    Args:
+        customer_id: The customer ID.
+
+    Returns:
+        Customer details.
+    """
+    return {"customer_id": customer_id}
+
+
+def get_details_by_id(id: str) -> dict:
+    """Get details for a telecom object.
+
+    Args:
+        id: The object ID.
+
+    Returns:
+        Object details.
+    """
+    return {"id": id}
+
+
+def send_payment_request(customer_id: str, bill_id: str) -> str:
+    """Send a payment request.
+
+    Args:
+        customer_id: The customer ID.
+        bill_id: The bill ID.
+
+    Returns:
+        Request status.
+    """
+    return "sent"
+
+
 class StageGateToolkit(ToolKitBase):
     def __init__(self):
         self.write_count = 0
@@ -613,6 +650,101 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     assert orchestrator.num_errors == 0
 
 
+def test_confirmation_requires_exact_identifier_mention():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tick_id=1,
+    )
+    controller.record_visible_message(
+        AssistantMessage.text(
+            "I will update account acct_1234 to premium. "
+            "This will change the account plan status."
+        ),
+        is_agent=True,
+        tick_id=2,
+    )
+    controller.record_visible_message(
+        UserMessage.text("Yes, I confirm."),
+        is_agent=False,
+        tick_id=3,
+    )
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_write",
+            name="update_account",
+            arguments={"account_id": "acct_123", "plan_name": "premium"},
+        ),
+        tick_id=4,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert environment.tools.write_count == 0
+
+
+def test_action_statement_requires_consequence():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tick_id=1,
+    )
+    controller.record_visible_message(
+        AssistantMessage.text("I will update account acct_123 to premium."),
+        is_agent=True,
+        tick_id=2,
+    )
+    controller.record_visible_message(
+        UserMessage.text("Yes, I confirm."),
+        is_agent=False,
+        tick_id=3,
+    )
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_write",
+            name="update_account",
+            arguments={"account_id": "acct_123", "plan_name": "premium"},
+        ),
+        tick_id=4,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["missing_action_summary"]
+    assert environment.tools.write_count == 0
+
+
 def test_read_only_tools_not_overblocked():
     environment = _environment()
     controller = StageGateController(
@@ -679,6 +811,84 @@ def test_stagegate_does_not_route_by_task_id():
     assert decisions[0]["decision"] == decisions[1]["decision"]
     assert decisions[0]["reason"] == decisions[1]["reason"]
     assert decisions[0]["checks"] == decisions[1]["checks"]
+
+
+def test_policy_preconditions_require_all_required_visible_fields():
+    validator = PreWriteValidator(
+        domain_name="telecom",
+        domain_policy="Public policy.",
+        tools=[
+            Tool(get_customer_by_id),
+            Tool(get_details_by_id),
+            Tool(send_payment_request),
+        ],
+    )
+    validator.record_tool_result(
+        tool_call=ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "C1"},
+        ),
+        tool_result=ToolMessage(
+            id="call_customer",
+            role="tool",
+            content=json.dumps(
+                {"customer_id": "C1", "full_name": "Ada", "bill_ids": ["B1"]}
+            ),
+            error=False,
+        ),
+        tick_index=1,
+    )
+    validator.record_visible_message(
+        role="assistant",
+        content=(
+            "I will send payment request for customer C1 and bill B1. "
+            "This will change the bill status to awaiting payment."
+        ),
+        tick_index=2,
+    )
+    validator.record_visible_message(
+        role="user",
+        content="Yes, I confirm.",
+        tick_index=3,
+    )
+    write_call = ToolCall(
+        id="call_payment",
+        name="send_payment_request",
+        arguments={"customer_id": "C1", "bill_id": "B1"},
+    )
+
+    missing_bill_state = validator.validate(write_call)
+
+    assert missing_bill_state.decision == "block"
+    assert missing_bill_state.reason == "missing_policy_precondition_state"
+
+    validator.record_tool_result(
+        tool_call=ToolCall(
+            id="call_bill",
+            name="get_details_by_id",
+            arguments={"id": "B1"},
+        ),
+        tool_result=ToolMessage(
+            id="call_bill",
+            role="tool",
+            content=json.dumps(
+                {
+                    "bill_id": "B1",
+                    "customer_id": "C1",
+                    "status": "Overdue",
+                    "total_due": 42.5,
+                }
+            ),
+            error=False,
+        ),
+        tick_index=4,
+    )
+
+    allowed = validator.validate(write_call)
+
+    assert allowed.decision == "allow"
+    assert allowed.reason == "validated"
 
 
 def test_trace_event_uses_canonical_schema():
