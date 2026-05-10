@@ -182,6 +182,11 @@ remains validator-free; the pre-write validator is active only for
 - [x] Add `scripts/stagegate_prohibited_diff_guard.py` to prevent StageGate
   branches from modifying benchmark-controlled task, domain, evaluator, user,
   metrics, or scoring files.
+- [x] Reserve `benchmark_task_id` for trace/posthoc metadata and rename the
+  validator's mock-domain task identifier to `service_task_ref`.
+- [x] Add `scripts/stagegate_final_run_hygiene.py` to reject final-run manifests
+  with task filters, non-regular speech, missing condition/domain coverage, or
+  inconsistent settings across conditions.
 
 ## Tests
 
@@ -217,10 +222,21 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   `incoming_for_agent`;
 - StageGate runtime package code does not read evaluator-derived reward fields;
 - prohibited-path guard classification for benchmark-controlled files.
+- static control-code coverage that StageGate validator/ledger/packet logic does
+  not use `task_id` as a domain identifier;
 - action summaries must state a consequence, not only an intended action;
 - read-only tools are not overblocked;
 - validator leakage guards show no task objective, expected final DB,
   user-simulator private state, evaluator result, or task-ID routing inputs.
+
+Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
+
+- accepting the required baseline/stage_only/stagegate matrix across retail,
+  airline, and telecom;
+- rejecting `--num-tasks`, `--task-ids`, and manifest task filters;
+- rejecting non-regular speech complexity;
+- rejecting inconsistent model, timeout, seed, or concurrency across conditions;
+- rejecting missing required domain/condition cells.
 
 ## Validation Evidence
 
@@ -368,6 +384,21 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   `npm run format`, `npm run check`, and `npm run lint`
   result: all failed with npm `ENOENT` because this repository has no root
   `package.json`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `43 passed, 2 warnings in 0.11s`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run pytest tests/test_stagegate_final_run_hygiene.py -q`
+  result: `5 passed, 2 warnings in 0.01s`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run ruff check .`
+  result: `All checks passed!`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `make check-all`
+  result: Ruff check passed and Ruff format left 327 files unchanged.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: passed.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -414,8 +445,10 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-09 pre-write validator pass: Blocked writes return an error
   `ToolMessage` with a corrective stage packet and increment the existing
   orchestrator tool-error counter; the domain environment is not called.
-- 2026-05-09 pre-write validator pass: Task IDs remain trace metadata only and
-  are not passed into validator decision logic.
+- 2026-05-09 pre-write validator pass: Benchmark task IDs remain trace/posthoc
+  metadata only and are represented as `benchmark_task_id` in StageGate traces.
+  Domain-control identifiers must use domain-specific names; the mock service
+  task identifier is represented internally as `service_task_ref`, not `task_id`.
 - 2026-05-09 cleanup review pass: Policy preconditions now require every
   required visible field for the relevant read inspection, avoiding underblocks
   where one field such as bill status was present but another such as amount

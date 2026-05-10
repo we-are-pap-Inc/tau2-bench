@@ -78,7 +78,7 @@ class StageGateController:
         self.advance_stage_tool = Tool(advance_stage)
         self.packet_orchestrator = StagePacketOrchestrator()
         self.trace_writer = trace_writer or JsonlTraceWriter.from_env()
-        self.task_id: Optional[str] = None
+        self.benchmark_task_id: Optional[str] = None
         self.sim_id: Optional[str] = None
         self.trial: Optional[int] = None
         if self.condition == "stagegate":
@@ -133,7 +133,7 @@ class StageGateController:
         self,
         *,
         domain_name: Optional[str] = None,
-        task_id: Optional[str] = None,
+        benchmark_task_id: Optional[str] = None,
         sim_id: Optional[str] = None,
         trial: Optional[int] = None,
     ) -> None:
@@ -142,8 +142,8 @@ class StageGateController:
             self.domain_name = domain_name
             self._set_ledger_domain(domain_name)
             self._set_validator_domain(domain_name)
-        if task_id is not None:
-            self.task_id = task_id
+        if benchmark_task_id is not None:
+            self.benchmark_task_id = benchmark_task_id
         if sim_id is not None:
             self.sim_id = sim_id
         if trial is not None:
@@ -447,7 +447,7 @@ class StageGateController:
                 condition=self.condition,
                 run_id=get_trace_run_id(sim_id=self.sim_id),
                 domain=self.domain_name,
-                task_id=self.task_id,
+                benchmark_task_id=self.benchmark_task_id,
                 sim_id=self.sim_id,
                 trial=self.trial,
                 stage=stage,

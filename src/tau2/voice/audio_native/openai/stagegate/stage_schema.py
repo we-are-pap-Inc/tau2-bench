@@ -43,7 +43,7 @@ class TraceEvent(BaseModel):
     condition: StageGateCondition
     run_id: Optional[str] = None
     domain: Optional[str] = None
-    task_id: Optional[str] = None
+    benchmark_task_id: Optional[str] = None
     sim_id: Optional[str] = None
     trial: Optional[int] = None
     stage: Optional[str] = None

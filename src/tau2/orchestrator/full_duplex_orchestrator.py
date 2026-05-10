@@ -562,7 +562,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         task = getattr(self, "task", None)
         controller.set_trace_context(
             domain_name=self.environment.get_domain_name(),
-            task_id=getattr(task, "id", None),
+            benchmark_task_id=getattr(task, "id", None),
             sim_id=getattr(self, "simulation_id", None),
             trial=getattr(self, "trial", None),
         )
@@ -611,7 +611,7 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             return None
         controller.set_trace_context(
             domain_name=self.environment.get_domain_name(),
-            task_id=self.task.id,
+            benchmark_task_id=self.task.id,
             sim_id=self.simulation_id,
             trial=getattr(self, "trial", None),
         )

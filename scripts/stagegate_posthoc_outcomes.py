@@ -43,7 +43,7 @@ def outcome_row(simulation: dict[str, Any], *, source_file: Path) -> dict[str, A
         "source_file": str(source_file),
         "run_id": simulation.get("id"),
         "sim_id": simulation.get("id"),
-        "task_id": simulation.get("task_id"),
+        "benchmark_task_id": simulation.get("task_id"),
         "trial": simulation.get("trial"),
         "domain": simulation.get("domain"),
         "termination_reason": simulation.get("termination_reason"),

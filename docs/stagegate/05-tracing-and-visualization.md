@@ -24,7 +24,7 @@ Each event must include:
       "run_id": "tau3voice_2026_05_08_gptrt2",
       "condition": "stagegate",
       "domain": "retail",
-      "task_id": "retail_001",
+      "benchmark_task_id": "retail_001",
       "sim_id": "sim_abc123",
       "trial": 1,
       "event_type": "validator_block",
@@ -82,7 +82,7 @@ Build `scripts/stagegate_trace_viewer.py` with filters:
 - run_id
 - condition
 - domain
-- task_id
+- benchmark_task_id
 - pass/fail
 - failure_type
 - stage

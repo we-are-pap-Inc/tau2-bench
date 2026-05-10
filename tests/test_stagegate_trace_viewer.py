@@ -20,7 +20,7 @@ def test_load_traces_accepts_valid_schema(tmp_path):
                 "run_id": "run_1",
                 "condition": "stage_only",
                 "domain": "mock",
-                "task_id": "task_1",
+                "benchmark_task_id": "task_1",
                 "sim_id": "sim_1",
                 "event_type": "domain_tool_call",
                 "stage": "inspect_state_with_read_tools",
@@ -110,6 +110,7 @@ def test_posthoc_outcome_writer_uses_oracle_analysis_schema(tmp_path):
     assert row["schema_version"] == ORACLE_SCHEMA_VERSION
     assert row["event_type"] == "final_outcome"
     assert row["source"] == "posthoc_oracle_analysis"
+    assert row["benchmark_task_id"] == "task_1"
     assert row["sim_id"] == "sim_1"
     assert row["reward"] == 1.0
     assert row["passed"] is True
