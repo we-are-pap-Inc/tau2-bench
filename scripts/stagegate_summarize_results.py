@@ -9,8 +9,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -51,8 +54,9 @@ def main() -> None:
         )
         writer.writeheader()
 
-    print(f"Wrote scaffold summary to {summary_path}")
-    print("TODO: implement parsing for the actual tau2-bench output format.")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger.info("Wrote scaffold summary to %s", summary_path)
+    logger.info("TODO: implement parsing for the actual tau2-bench output format.")
 
 
 if __name__ == "__main__":

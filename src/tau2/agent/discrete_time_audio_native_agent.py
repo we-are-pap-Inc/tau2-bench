@@ -466,6 +466,10 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             raise
 
         state.last_tick_result = tick_result
+        self._record_agent_visible_user_transcripts(
+            tick_result,
+            tick_id=state.tick_count,
+        )
 
         # Check for provider inactivity (warning only, does not raise)
         if tick_result.has_provider_activity:
@@ -616,6 +620,19 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             List of ToolCall objects (may be empty).
         """
         return tick_result.tool_calls
+
+    def _record_agent_visible_user_transcripts(
+        self,
+        tick_result: TickResult,
+        *,
+        tick_id: int,
+    ) -> None:
+        """Record provider user transcripts without reading simulator text."""
+        for transcript in getattr(tick_result, "user_transcripts", []):
+            self.stagegate_controller.record_agent_visible_user_transcript(
+                transcript,
+                tick_id=tick_id,
+            )
 
     def _create_response(
         self,

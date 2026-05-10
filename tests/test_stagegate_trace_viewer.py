@@ -1,4 +1,6 @@
 import json
+import re
+from pathlib import Path
 
 from scripts.stagegate_posthoc_outcomes import (
     SCHEMA_VERSION as ORACLE_SCHEMA_VERSION,
@@ -115,3 +117,11 @@ def test_posthoc_outcome_writer_uses_oracle_analysis_schema(tmp_path):
     assert row["reward"] == 1.0
     assert row["passed"] is True
     assert row["reward_breakdown"] == {"db": 1.0}
+
+
+def test_trace_queries_use_benchmark_task_id():
+    repo_root = Path(__file__).resolve().parents[1]
+    query_text = (repo_root / "scripts/trace_queries.sql").read_text(encoding="utf-8")
+
+    assert "benchmark_task_id" in query_text
+    assert re.search(r"\btask_id\b", query_text) is None

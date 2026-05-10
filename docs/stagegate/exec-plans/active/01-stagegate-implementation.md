@@ -96,6 +96,10 @@ agent.
 - `src/tau2/voice/audio_native/openai/stagegate/stage_schema.py`
   defines `StagePacket` and `TraceEvent` schemas. `StagePacket` now includes
   `ambiguous_facts` alongside `known_facts`, `missing_facts`, and `ask_next`.
+  It also defines the StageGate runtime evidence model:
+  `AGENT_VISIBLE_TRANSCRIPT`, `MODEL_TOOL_ARGUMENT`, `DOMAIN_TOOL_OUTPUT`,
+  `ASSISTANT_UTTERANCE`, and the runtime-forbidden
+  `SIMULATOR_GOLD_TEXT` / `POSTHOC_ORACLE` sources.
 - `src/tau2/voice/audio_native/openai/stagegate/trace.py`
   provides `JsonlTraceWriter.from_env()` controlled by `TAU2_TRACE_JSONL`.
 - `src/tau2/voice/audio_native/openai/stagegate/orchestrator.py`
@@ -115,16 +119,20 @@ agent.
   provides `StageGateController` with env parsing, prompt addendum,
   `session_tools()`, `is_advance_stage()`, `handle_advance_stage()`, ledger
   ownership when `condition="stagegate"`, ledger updates from visible events,
-  validator ownership when `condition="stagegate"`, visible message recording,
-  and `ledger_update` / validator trace events.
+  validator ownership when `condition="stagegate"`, explicit assistant
+  utterance and agent-visible user transcript recording, and `ledger_update` /
+  validator trace events.
 - `src/tau2/agent/discrete_time_audio_native_agent.py` wires the controller
   into OpenAI audio-native session setup without changing baseline behavior.
-- `src/tau2/orchestrator/full_duplex_orchestrator.py` records visible
-  participant text for the validator, intercepts `advance_stage`, and validates
-  non-`advance_stage` domain tool calls before domain execution. Allowed calls
+- `src/tau2/orchestrator/full_duplex_orchestrator.py` records assistant
+  utterances for the validator, does not pass audio-native user chunk
+  `UserMessage.content` into StageGate runtime state, intercepts
+  `advance_stage`, and validates non-`advance_stage` domain tool calls before
+  domain execution only when StageOnly or StageGate is enabled. Allowed calls
   continue through `Environment.get_response()` unchanged; blocked calls return
   an error `ToolMessage` containing a corrective stage packet and do not touch
-  domain state.
+  domain state. Baseline plus passive JSONL tracing stays on the normal domain
+  tool execution path.
 - `src/tau2/voice/audio_native/openai/__init__.py` lazy-loads provider and
   adapter classes so importing the StageOnly package does not make core
   τ-bench imports require voice-only dependencies.
@@ -173,9 +181,29 @@ remains validator-free; the pre-write validator is active only for
   rows.
 - [x] Keep blocked calls from invoking `Environment.get_response()` or mutating
   domain toolkit state.
-- [x] Restore the full-duplex visibility boundary: newly emitted user chunks are
-  not recorded into StageGate validator state until the next agent turn receives
-  them as `incoming_for_agent`.
+- [x] Fix the audio-native clean-text leak: full-duplex user chunks are no
+  longer recorded into StageGate validator or ledger state from
+  `UserMessage.content`, because the OpenAI audio-native agent receives only
+  `user_audio`.
+- [x] Add explicit runtime evidence-source admission. User confirmation can be
+  recorded only from `AGENT_VISIBLE_TRANSCRIPT`; model tool arguments remain
+  unconfirmed model belief, official domain-tool outputs remain verified facts,
+  and simulator gold text / posthoc oracle sources are rejected at runtime.
+- [x] Keep baseline tracing passive: `TAU2_TRACE_JSONL` with
+  `condition="baseline"` may emit run-level traces, but baseline domain tools
+  do not route through `_execute_stagegate_tool_call()`.
+- [x] Preserve trace-only per-tick visibility without enforcement: baseline
+  trace-only runs now record assistant utterance, model function call, domain
+  tool call, and domain tool result trace rows while executing domain tools
+  through direct `Environment.get_response()` calls outside the validator
+  wrapper.
+- [x] Wire OpenAI input-audio transcription events into the explicit
+  `AGENT_VISIBLE_TRANSCRIPT` evidence path. These provider transcripts can
+  satisfy confirmation; clean audio-native `UserMessage.content` remains
+  rejected and unused.
+- [x] Avoid logging raw provider user transcript text. OpenAI adapter debug
+  logs now include only input-transcription metadata, while the transcript
+  remains available inside the runtime evidence object.
 - [x] Move evaluator-derived final outcome rows out of StageGate runtime and
   into `scripts/stagegate_posthoc_outcomes.py`, which writes
   `oracle_analysis.jsonl` after result files exist.
@@ -216,11 +244,21 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - confirmed exact identifiers allow a read and then a policy-valid write;
 - action summaries must mention the exact mutable identifier as a distinct
   value before the user confirmation can satisfy the write gate;
-- same-tick user confirmations do not satisfy validator checks before delivery
-  to the agent;
-- next-tick user confirmations become usable only after delivery as
-  `incoming_for_agent`;
+- clean audio-native user chunk `UserMessage.content` does not satisfy
+  validator confirmation at the same tick or later ticks;
+- clean `UserMessage.content` is rejected as StageGate runtime evidence and
+  cannot create user-confirmed ledger state;
+- explicit `record_agent_visible_user_transcript()` evidence can satisfy
+  confirmation after an assistant action summary and required read-tool
+  inspection;
+- model tool argument text cannot satisfy user confirmation;
+- forbidden simulator-gold-text and posthoc-oracle evidence sources are rejected
+  at runtime;
+- baseline with `TAU2_TRACE_JSONL` does not route domain tools through
+  `_execute_stagegate_tool_call()`;
 - StageGate runtime package code does not read evaluator-derived reward fields;
+- StageGate runtime package code does not import or call the posthoc oracle
+  outcome script;
 - prohibited-path guard classification for benchmark-controlled files.
 - static control-code coverage that StageGate validator/ledger/packet logic does
   not use `task_id` as a domain identifier;
@@ -228,6 +266,13 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - read-only tools are not overblocked;
 - validator leakage guards show no task objective, expected final DB,
   user-simulator private state, evaluator result, or task-ID routing inputs.
+
+Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
+
+- posthoc oracle analysis may read `reward_info` and source task IDs only in the
+  separate `scripts/stagegate_posthoc_outcomes.py` path;
+- `scripts/trace_queries.sql` uses `benchmark_task_id` consistently and does
+  not query the runtime trace field as `task_id`.
 
 Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 
@@ -239,6 +284,74 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - rejecting missing required domain/condition cells.
 
 ## Validation Evidence
+
+- 2026-05-10 audio-text leak fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  initially failed at collection in the fresh worktree because `tau2` was not
+  importable from the unsynced `.venv`; `uv sync --extra voice --extra dev
+  --extra experiments` completed successfully.
+- 2026-05-10 audio-text leak fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py -q`
+  result after sync: `42 passed, 2 warnings in 0.12s`.
+- 2026-05-10 audio-text leak fix:
+  `uv run pytest tests/test_stagegate_trace_viewer.py -q`
+  result: `4 passed, 2 warnings in 0.01s`.
+- 2026-05-10 audio-text leak fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py
+  tests/test_stagegate_trace_viewer.py
+  tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `49 passed, 2 warnings in 0.08s`.
+- 2026-05-10 audio-text leak fix:
+  `uv run pytest tests/test_stagegate_final_run_hygiene.py
+  tests/test_stagegate_modal_runner_config.py -q`
+  result: `23 passed, 2 warnings in 0.11s`.
+- 2026-05-10 audio-text leak fix:
+  `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 audio-text leak fix:
+  `make check-all` result after Ruff formatting pass: `All checks passed!`;
+  final rerun result: `All checks passed!` and `329 files left unchanged`.
+- 2026-05-10 audio-text leak fix:
+  `make test-voice` first hit sandbox denial on `/Users/.../.cache/uv`;
+  rerun with approved uv-cache access passed:
+  `287 passed, 3 skipped, 83 deselected, 2 warnings in 0.80s`.
+- 2026-05-10 audio-text leak fix:
+  `make test` first hit the same uv-cache sandbox denial; rerun with approved
+  uv-cache access reached the suite and failed because `OPENAI_API_KEY` is not
+  set for credential-dependent LiteLLM/OpenAI tests:
+  `17 failed, 192 passed, 1 xfailed, 14 warnings in 22.13s`.
+- 2026-05-10 audio-text leak fix:
+  `npm run format`, `npm run check`, and `npm run lint` each failed with
+  `ENOENT` because this Python repository has no root `package.json`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py::test_baseline_trace_jsonl_does_not_route_tools_through_stagegate
+  tests/test_streaming/test_stagegate.py::test_baseline_trace_jsonl_records_assistant_utterance_without_stagegate
+  tests/test_streaming/test_stagegate.py::test_openai_adapter_records_input_transcription_event
+  tests/test_streaming/test_stagegate.py::test_agent_wires_provider_user_transcript_to_stagegate_confirmation
+  tests/test_streaming/test_stagegate.py::test_next_tick_clean_user_content_does_not_satisfy_validator -q`
+  result: `5 passed, 2 warnings in 0.02s`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py
+  tests/test_stagegate_trace_viewer.py
+  tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `52 passed, 2 warnings in 0.12s`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_discrete_time_audio_native_agent.py -q`
+  result: `33 passed, 2 warnings in 0.06s`.
+- 2026-05-10 review follow-up:
+  `make check-all` result: `All checks passed!` and
+  `329 files left unchanged`.
+- 2026-05-10 sensitive logging follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py::test_openai_adapter_records_input_transcription_event -q`
+  result: `1 passed, 2 warnings in 0.04s`.
+- 2026-05-10 sensitive logging follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py
+  tests/test_stagegate_trace_viewer.py
+  tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `52 passed, 2 warnings in 0.10s`.
+- 2026-05-10 sensitive logging follow-up:
+  `make check-all` result: `All checks passed!` and
+  `329 files left unchanged`.
 
 - `uv run pytest tests/test_streaming/test_stagegate.py -q` initially could
   not collect in the freshly created core-only environment. Direct import

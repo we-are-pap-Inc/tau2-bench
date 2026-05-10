@@ -8,6 +8,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from tau2.voice.audio_native.openai.stagegate.stage_schema import EvidenceSource
+
 
 class LedgerStatus(str, Enum):
     """Confirmation state for a ledger slot."""
@@ -138,7 +140,7 @@ class EntityLedger(BaseModel):
         return self._update_from_payload(
             payload=arguments,
             tool_name=tool_name,
-            source="model_tool_args",
+            source=EvidenceSource.MODEL_TOOL_ARGUMENT.value,
             status=LedgerStatus.HEARD_NOT_CONFIRMED,
             confidence=0.7,
             event_id=event_id,
@@ -162,7 +164,7 @@ class EntityLedger(BaseModel):
         return self._update_from_payload(
             payload=payload,
             tool_name=tool_name,
-            source="domain_tool_result",
+            source=EvidenceSource.DOMAIN_TOOL_OUTPUT.value,
             status=LedgerStatus.TOOL_VERIFIED,
             confidence=1.0,
             event_id=event_id,

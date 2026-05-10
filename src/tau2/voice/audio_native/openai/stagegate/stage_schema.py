@@ -1,11 +1,39 @@
 """Typed StageGate schemas."""
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 StageGateCondition = Literal["baseline", "stage_only", "stagegate"]
+
+
+class EvidenceSource(str, Enum):
+    """Source class for evidence admitted into StageGate runtime state."""
+
+    AGENT_VISIBLE_TRANSCRIPT = "agent_visible_transcript"
+    MODEL_TOOL_ARGUMENT = "model_tool_argument"
+    DOMAIN_TOOL_OUTPUT = "domain_tool_output"
+    ASSISTANT_UTTERANCE = "assistant_utterance"
+    SIMULATOR_GOLD_TEXT = "simulator_gold_text"
+    POSTHOC_ORACLE = "posthoc_oracle"
+
+
+RUNTIME_FORBIDDEN_EVIDENCE_SOURCES = {
+    EvidenceSource.SIMULATOR_GOLD_TEXT,
+    EvidenceSource.POSTHOC_ORACLE,
+}
+
+
+def ensure_runtime_evidence_source(source: EvidenceSource | str) -> EvidenceSource:
+    """Return a typed runtime evidence source or reject forbidden oracle sources."""
+    typed_source = EvidenceSource(source)
+    if typed_source in RUNTIME_FORBIDDEN_EVIDENCE_SOURCES:
+        raise ValueError(
+            f"{typed_source.value} is not an allowed StageGate runtime evidence source"
+        )
+    return typed_source
 
 
 def get_trace_ts() -> str:
