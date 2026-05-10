@@ -451,6 +451,14 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             self.done = True
             self.termination_reason = termination_reason
 
+        stagegate_recorder = self._get_agent_stagegate_controller()
+        if stagegate_recorder is not None:
+            stagegate_recorder.record_visible_message(
+                new_chunk,
+                is_agent=is_agent,
+                tick_id=tick_id,
+            )
+
         # Handle tool calls: execute now, deliver results next tick
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolMessage] = []
@@ -514,15 +522,28 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         controller = getattr(participant, "stagegate_controller", None)
         if controller is None:
             return None
-        controller.set_trace_context(
-            domain_name=self.environment.get_domain_name(),
-            task_id=self.task.id,
-            sim_id=self.simulation_id,
-            trial=getattr(self, "trial", None),
-        )
+        self._attach_stagegate_trace_context(controller)
         if not controller.enabled and not controller.tracing_enabled:
             return None
         return controller
+
+    def _get_agent_stagegate_controller(self):
+        controller = getattr(self.agent, "stagegate_controller", None)
+        if controller is None:
+            return None
+        self._attach_stagegate_trace_context(controller)
+        if not controller.enabled and not controller.tracing_enabled:
+            return None
+        return controller
+
+    def _attach_stagegate_trace_context(self, controller) -> None:
+        task = getattr(self, "task", None)
+        controller.set_trace_context(
+            domain_name=self.environment.get_domain_name(),
+            task_id=getattr(task, "id", None),
+            sim_id=getattr(self, "simulation_id", None),
+            trial=getattr(self, "trial", None),
+        )
 
     def _execute_stagegate_tool_call(
         self,
@@ -535,6 +556,17 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             return stagegate_controller.handle_advance_stage(
                 tool_call,
                 tick_id=tick_id,
+            )
+
+        validator_decision = stagegate_controller.validate_tool_call(
+            tool_call,
+            tick_id=tick_id,
+        )
+        if not validator_decision.allowed:
+            self.num_errors += 1
+            return stagegate_controller.blocked_tool_message(
+                tool_call,
+                validator_decision,
             )
 
         stagegate_controller.trace_domain_tool_call(tool_call, tick_id=tick_id)
