@@ -326,7 +326,10 @@ class DiscreteTimeOpenAIAdapter(DiscreteTimeAdapter):
             transcript = event.transcript.strip()
             if transcript:
                 result.user_transcripts.append(transcript)
-                logger.debug(f"Input transcription completed: {transcript}")
+                logger.debug(
+                    "Input transcription completed "
+                    f"(item_id={event.item_id}, chars={len(transcript)})"
+                )
 
         elif isinstance(event, AudioDoneEvent):
             logger.debug(f"Audio done for item {event.item_id}")

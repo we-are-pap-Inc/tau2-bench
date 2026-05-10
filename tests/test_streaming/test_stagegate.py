@@ -1073,7 +1073,7 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
     assert environment.tools.write_count == 1
 
 
-def test_openai_adapter_records_input_transcription_event():
+def test_openai_adapter_records_input_transcription_event(monkeypatch):
     adapter = DiscreteTimeOpenAIAdapter(
         tick_duration_ms=200,
         provider=MagicMock(),
@@ -1084,6 +1084,11 @@ def test_openai_adapter_records_input_transcription_event():
         audio_sent_duration_ms=0,
         bytes_per_tick=1600,
         bytes_per_second=8000,
+    )
+    debug_messages: list[str] = []
+    monkeypatch.setattr(
+        "tau2.voice.audio_native.openai.discrete_time_adapter.logger.debug",
+        debug_messages.append,
     )
 
     asyncio.run(
@@ -1099,6 +1104,10 @@ def test_openai_adapter_records_input_transcription_event():
     )
 
     assert tick_result.user_transcripts == ["Yes, I confirm."]
+    assert debug_messages == [
+        "Input transcription completed (item_id=item_user, chars=15)"
+    ]
+    assert "Yes, I confirm." not in "\n".join(debug_messages)
 
 
 def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypatch):

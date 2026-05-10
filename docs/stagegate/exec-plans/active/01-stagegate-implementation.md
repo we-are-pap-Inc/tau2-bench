@@ -201,6 +201,9 @@ remains validator-free; the pre-write validator is active only for
   `AGENT_VISIBLE_TRANSCRIPT` evidence path. These provider transcripts can
   satisfy confirmation; clean audio-native `UserMessage.content` remains
   rejected and unused.
+- [x] Avoid logging raw provider user transcript text. OpenAI adapter debug
+  logs now include only input-transcription metadata, while the transcript
+  remains available inside the runtime evidence object.
 - [x] Move evaluator-derived final outcome rows out of StageGate runtime and
   into `scripts/stagegate_posthoc_outcomes.py`, which writes
   `oracle_analysis.jsonl` after result files exist.
@@ -336,6 +339,17 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
   `uv run pytest tests/test_streaming/test_discrete_time_audio_native_agent.py -q`
   result: `33 passed, 2 warnings in 0.06s`.
 - 2026-05-10 review follow-up:
+  `make check-all` result: `All checks passed!` and
+  `329 files left unchanged`.
+- 2026-05-10 sensitive logging follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py::test_openai_adapter_records_input_transcription_event -q`
+  result: `1 passed, 2 warnings in 0.04s`.
+- 2026-05-10 sensitive logging follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py
+  tests/test_stagegate_trace_viewer.py
+  tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `52 passed, 2 warnings in 0.10s`.
+- 2026-05-10 sensitive logging follow-up:
   `make check-all` result: `All checks passed!` and
   `329 files left unchanged`.
 
