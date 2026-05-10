@@ -2,16 +2,22 @@ from scripts.stagegate_final_run_hygiene import validate_final_run_manifest
 
 
 def _run(domain: str, condition: str, **overrides):
+    repo_ref = "1910fe2998f230bda6f6ad1b69edef4124275d63"
     run = {
         "domain": domain,
         "condition": condition,
+        "mode": "final",
+        "requested_repo_ref": repo_ref,
         "speech_complexity": "regular",
         "model": "gpt-realtime-2",
         "provider": "openai",
-        "reasoning_effort": "medium",
-        "timeout": 900,
-        "seed": 123,
-        "concurrency": 4,
+        "reasoning_effort": "high",
+        "tick_duration": "0.2",
+        "timeout": "1200",
+        "max_steps_seconds": "1200",
+        "seed": "300",
+        "concurrency": "1",
+        "max_concurrency": "1",
     }
     run.update(overrides)
     return run
@@ -51,8 +57,10 @@ def test_stagegate_final_run_hygiene_rejects_non_regular_speech():
 def test_stagegate_final_run_hygiene_rejects_inconsistent_settings():
     manifest = _valid_manifest()
     manifest[1]["model"] = "different-model"
-    manifest[4]["timeout"] = 1200
+    manifest[4]["timeout"] = "900"
+    manifest[4]["max_steps_seconds"] = "900"
     manifest[8]["concurrency"] = 8
+    manifest[8]["max_concurrency"] = 8
 
     errors = validate_final_run_manifest(manifest)
 
@@ -71,3 +79,14 @@ def test_stagegate_final_run_hygiene_requires_domains_and_conditions():
     errors = validate_final_run_manifest(manifest)
 
     assert any("telecom: missing required conditions" in error for error in errors)
+
+
+def test_stagegate_final_run_hygiene_rejects_smoke_and_non_sha_refs():
+    manifest = _valid_manifest()
+    manifest[0]["mode"] = "smoke"
+    manifest[1]["requested_repo_ref"] = "stagegate"
+
+    errors = validate_final_run_manifest(manifest)
+
+    assert any("mode='final'" in error for error in errors)
+    assert any("40-character repo SHA" in error for error in errors)

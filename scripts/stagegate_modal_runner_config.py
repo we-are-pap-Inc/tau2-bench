@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""Pure configuration helpers for the StageGate Modal runner."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from argparse import ArgumentParser, Namespace
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from subprocess import CompletedProcess
+from typing import Any, Literal
+
+Condition = Literal["baseline", "stage_only", "stagegate"]
+Domain = Literal["retail", "airline", "telecom"]
+RunMode = Literal["final", "smoke"]
+
+CONDITIONS: tuple[Condition, ...] = ("baseline", "stage_only", "stagegate")
+DOMAINS: tuple[Domain, ...] = ("retail", "airline", "telecom")
+DEFAULT_REPO_URL = "https://github.com/we-are-pap-Inc/tau2-bench.git"
+DEFAULT_SECRET_NAME = "tau3-voice-secrets"
+REQUIRED_API_SECRET_KEYS = ("OPENAI_API_KEY", "ELEVENLABS_API_KEY", "DEEPGRAM_API_KEY")
+REQUIRED_REGULAR_VOICE_ID_KEYS = (
+    "TAU2_VOICE_ID_MILDRED_KAPLAN",
+    "TAU2_VOICE_ID_ARJUN_ROY",
+    "TAU2_VOICE_ID_WEI_LIN",
+    "TAU2_VOICE_ID_MAMADOU_DIALLO",
+    "TAU2_VOICE_ID_PRIYA_PATIL",
+)
+OPTIONAL_CONTROL_VOICE_ID_KEYS = (
+    "TAU2_VOICE_ID_MATT_DELANEY",
+    "TAU2_VOICE_ID_LISA_BRENNER",
+)
+REQUIRED_PROVIDER_SECRET_KEYS = (
+    *REQUIRED_API_SECRET_KEYS,
+    *REQUIRED_REGULAR_VOICE_ID_KEYS,
+)
+SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+logger = logging.getLogger(__name__)
+
+FINAL_CONSTANTS: dict[str, str | int | float] = {
+    "model": "gpt-realtime-2",
+    "provider": "openai",
+    "reasoning_effort": "high",
+    "speech_complexity": "regular",
+    "tick_duration": "0.2",
+    "max_steps_seconds": "1200",
+    "max_concurrency": "1",
+    "seed": "300",
+}
+
+FORBIDDEN_TASK_FILTER_FLAGS = ("--num-tasks", "--task-ids")
+
+
+@dataclass(frozen=True)
+class StageGateJob:
+    """One StageGate condition/domain run."""
+
+    condition: Condition
+    domain: Domain
+    mode: RunMode
+
+
+def utc_now_iso() -> str:
+    """Return a UTC ISO timestamp with second precision."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def is_full_commit_sha(repo_ref: str) -> bool:
+    """Return whether repo_ref is a full 40-character git SHA."""
+    return bool(SHA_PATTERN.fullmatch(repo_ref.strip()))
+
+
+def require_full_commit_sha(repo_ref: str, *, mode: RunMode) -> None:
+    """Require a full commit SHA unless this is an explicit smoke run."""
+    if mode == "final" and not is_full_commit_sha(repo_ref):
+        raise ValueError("final mode requires repo_ref to be a full 40-character SHA")
+
+
+def validate_condition(condition: str) -> Condition:
+    """Validate and return a StageGate condition token."""
+    if condition not in CONDITIONS:
+        raise ValueError(f"unsupported condition {condition!r}")
+    return condition  # type: ignore[return-value]
+
+
+def validate_domain(domain: str) -> Domain:
+    """Validate and return a StageGate domain token."""
+    if domain not in DOMAINS:
+        raise ValueError(f"unsupported domain {domain!r}")
+    return domain  # type: ignore[return-value]
+
+
+def final_matrix() -> list[StageGateJob]:
+    """Return the exact final 9-job matrix."""
+    return [
+        StageGateJob(condition=condition, domain=domain, mode="final")
+        for condition in CONDITIONS
+        for domain in DOMAINS
+    ]
+
+
+def smoke_jobs(condition: str | None, domain: str | None) -> list[StageGateJob]:
+    """Return smoke jobs, defaulting to baseline/retail."""
+    return [
+        StageGateJob(
+            condition=validate_condition(condition or "baseline"),
+            domain=validate_domain(domain or "retail"),
+            mode="smoke",
+        )
+    ]
+
+
+def planned_jobs(
+    *,
+    mode: RunMode,
+    condition: str | None = None,
+    domain: str | None = None,
+) -> list[StageGateJob]:
+    """Return jobs for the requested mode."""
+    if mode == "final":
+        if condition is not None or domain is not None:
+            raise ValueError("final mode does not accept condition/domain subsets")
+        return final_matrix()
+    return smoke_jobs(condition, domain)
+
+
+def save_name(batch_id: str, job: StageGateJob) -> str:
+    """Return the tau2 save name for a job."""
+    return f"{batch_id}_{job.condition}_{job.domain}"
+
+
+def trace_jsonl_path(batch_id: str, job: StageGateJob) -> str:
+    """Return the StageGate trace JSONL path inside the Modal Volume."""
+    return f"/runs/{batch_id}/{job.condition}/{job.domain}/trace_events.jsonl"
+
+
+def artifact_dir(batch_id: str, job: StageGateJob) -> str:
+    """Return the per-job artifact directory inside the Modal Volume."""
+    return f"/runs/{batch_id}/{job.condition}/{job.domain}"
+
+
+def simulation_output_dir(batch_id: str, job: StageGateJob) -> str:
+    """Return the copied simulation output path inside the artifact directory."""
+    return f"{artifact_dir(batch_id, job)}/simulation_output"
+
+
+def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
+    """Build the fixed, sanitized tau2 command for a job."""
+    return [
+        "uv",
+        "run",
+        "tau2",
+        "run",
+        "--domain",
+        job.domain,
+        "--audio-native",
+        "--audio-native-provider",
+        str(FINAL_CONSTANTS["provider"]),
+        "--audio-native-model",
+        str(FINAL_CONSTANTS["model"]),
+        "--reasoning-effort",
+        str(FINAL_CONSTANTS["reasoning_effort"]),
+        "--speech-complexity",
+        str(FINAL_CONSTANTS["speech_complexity"]),
+        "--tick-duration",
+        str(FINAL_CONSTANTS["tick_duration"]),
+        "--max-steps-seconds",
+        str(FINAL_CONSTANTS["max_steps_seconds"]),
+        "--max-concurrency",
+        str(FINAL_CONSTANTS["max_concurrency"]),
+        "--seed",
+        str(FINAL_CONSTANTS["seed"]),
+        "--verbose-logs",
+        "--auto-resume",
+        "--save-to",
+        save_name(batch_id, job),
+    ]
+
+
+def command_to_log(argv: list[str]) -> str:
+    """Return shell-quoted command text for logs without secrets."""
+    return shlex.join(argv)
+
+
+def validate_no_task_filters(argv: list[str]) -> None:
+    """Reject task filtering flags."""
+    for flag in FORBIDDEN_TASK_FILTER_FLAGS:
+        if flag in argv or any(arg.startswith(f"{flag}=") for arg in argv):
+            raise ValueError(f"task filter {flag} is not allowed")
+
+
+def validate_final_command(argv: list[str]) -> None:
+    """Validate constants and absence of task filters on a tau2 command."""
+    validate_no_task_filters(argv)
+    expected = {
+        "--audio-native-provider": str(FINAL_CONSTANTS["provider"]),
+        "--audio-native-model": str(FINAL_CONSTANTS["model"]),
+        "--reasoning-effort": str(FINAL_CONSTANTS["reasoning_effort"]),
+        "--speech-complexity": str(FINAL_CONSTANTS["speech_complexity"]),
+        "--tick-duration": str(FINAL_CONSTANTS["tick_duration"]),
+        "--max-steps-seconds": str(FINAL_CONSTANTS["max_steps_seconds"]),
+        "--max-concurrency": str(FINAL_CONSTANTS["max_concurrency"]),
+        "--seed": str(FINAL_CONSTANTS["seed"]),
+    }
+    for flag, value in expected.items():
+        if _flag_value(argv, flag) != value:
+            raise ValueError(f"{flag} must be {value!r}")
+
+
+def planned_manifest(
+    *,
+    batch_id: str,
+    repo_url: str,
+    repo_ref: str,
+    mode: RunMode,
+    jobs: list[StageGateJob],
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the local pre-spawn batch manifest."""
+    return {
+        "schema_version": "stagegate.modal.batch_manifest.planned.v1",
+        "batch_id": batch_id,
+        "repo_url": repo_url,
+        "requested_repo_ref": repo_ref,
+        "mode": mode,
+        "created_at": created_at or utc_now_iso(),
+        "final_constants": dict(FINAL_CONSTANTS),
+        "runs": [
+            job_manifest_base(
+                batch_id=batch_id,
+                repo_url=repo_url,
+                repo_ref=repo_ref,
+                resolved_commit_sha=None,
+                job=job,
+                start_timestamp=None,
+                end_timestamp=None,
+                status="planned",
+            )
+            for job in jobs
+        ],
+    }
+
+
+def write_planned_manifest(
+    *,
+    batch_id: str,
+    repo_url: str,
+    repo_ref: str,
+    mode: RunMode,
+    condition: str | None = None,
+    domain: str | None = None,
+    output_path: Path = Path("batch_manifest_planned.json"),
+) -> dict[str, Any]:
+    """Create a plan-only manifest without importing or contacting Modal."""
+    require_full_commit_sha(repo_ref, mode=mode)
+    jobs = planned_jobs(mode=mode, condition=condition, domain=domain)
+    manifest = planned_manifest(
+        batch_id=batch_id,
+        repo_url=repo_url,
+        repo_ref=repo_ref,
+        mode=mode,
+        jobs=jobs,
+    )
+    write_json(output_path, manifest)
+    return manifest
+
+
+def run_final_hygiene_guard(manifest_path: Path) -> CompletedProcess[str]:
+    """Run the final hygiene guard against a generated manifest."""
+    repo_root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/stagegate_final_run_hygiene.py",
+            "--manifest",
+            str(manifest_path),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        cwd=repo_root,
+    )
+
+
+def job_manifest_base(
+    *,
+    batch_id: str,
+    repo_url: str,
+    repo_ref: str,
+    resolved_commit_sha: str | None,
+    job: StageGateJob,
+    start_timestamp: str | None,
+    end_timestamp: str | None,
+    status: str,
+    modal_function_call_id: str | None = None,
+    modal_container_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the common job manifest shape."""
+    argv = build_tau2_command(batch_id, job)
+    validate_final_command(argv)
+    return {
+        "schema_version": "stagegate.modal.job_manifest.v1",
+        "batch_id": batch_id,
+        "condition": job.condition,
+        "domain": job.domain,
+        "repo_url": repo_url,
+        "requested_repo_ref": repo_ref,
+        "resolved_commit_sha": resolved_commit_sha,
+        "final_constants": dict(FINAL_CONSTANTS),
+        "args": argv,
+        "command": argv,
+        "sanitized_command_argv": argv,
+        "save_name": save_name(batch_id, job),
+        "artifact_dir": artifact_dir(batch_id, job),
+        "trace_jsonl": trace_jsonl_path(batch_id, job),
+        "simulation_output_dir": simulation_output_dir(batch_id, job),
+        "start_timestamp": start_timestamp,
+        "end_timestamp": end_timestamp,
+        "status": status,
+        "modal_function_call_id": modal_function_call_id,
+        "modal_container_id": modal_container_id,
+        "mode": job.mode,
+        "model": FINAL_CONSTANTS["model"],
+        "provider": FINAL_CONSTANTS["provider"],
+        "reasoning_effort": FINAL_CONSTANTS["reasoning_effort"],
+        "speech_complexity": FINAL_CONSTANTS["speech_complexity"],
+        "tick_duration": FINAL_CONSTANTS["tick_duration"],
+        "max_steps_seconds": FINAL_CONSTANTS["max_steps_seconds"],
+        "timeout": FINAL_CONSTANTS["max_steps_seconds"],
+        "seed": FINAL_CONSTANTS["seed"],
+        "concurrency": FINAL_CONSTANTS["max_concurrency"],
+        "max_concurrency": FINAL_CONSTANTS["max_concurrency"],
+        "num_tasks": None,
+        "task_ids": None,
+    }
+
+
+def command_metadata(
+    *,
+    batch_id: str,
+    repo_url: str,
+    repo_ref: str,
+    resolved_commit_sha: str | None,
+    job: StageGateJob,
+) -> dict[str, Any]:
+    """Build command metadata for a job."""
+    argv = build_tau2_command(batch_id, job)
+    return {
+        "schema_version": "stagegate.modal.command_metadata.v1",
+        "batch_id": batch_id,
+        "condition": job.condition,
+        "domain": job.domain,
+        "repo_url": repo_url,
+        "requested_repo_ref": repo_ref,
+        "resolved_commit_sha": resolved_commit_sha,
+        "mode": job.mode,
+        "sanitized_command_argv": argv,
+        "sanitized_command": command_to_log(argv),
+        "final_constants": dict(FINAL_CONSTANTS),
+        "trace_jsonl": trace_jsonl_path(batch_id, job),
+    }
+
+
+def collect_completed_manifest(batch_dir: Path) -> dict[str, Any]:
+    """Build a completed batch manifest from per-job manifests under batch_dir."""
+    job_manifests = sorted(batch_dir.glob("*/*/job_manifest.json"))
+    runs: list[dict[str, Any]] = []
+    for manifest_path in job_manifests:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            runs.append(json.load(f))
+    return {
+        "schema_version": "stagegate.modal.batch_manifest.completed.v1",
+        "batch_id": batch_dir.name,
+        "created_at": utc_now_iso(),
+        "runs": runs,
+    }
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON with stable formatting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def jobs_as_dicts(jobs: list[StageGateJob]) -> list[dict[str, str]]:
+    """Serialize jobs for assertions and logging."""
+    return [asdict(job) for job in jobs]
+
+
+def check_modal_preflight(
+    *,
+    secret_name: str = DEFAULT_SECRET_NAME,
+    modal_cmd: str = "modal",
+    command_runner=subprocess.run,
+) -> dict[str, Any]:
+    """Check Modal CLI availability, auth, and Secret existence without secrets."""
+    if shutil.which(modal_cmd) is None:
+        return {
+            "ok": False,
+            "modal_version": None,
+            "secret_name": secret_name,
+            "required_keys": list(REQUIRED_PROVIDER_SECRET_KEYS),
+            "secret_exists": False,
+            "error": f"Modal CLI {modal_cmd!r} was not found on PATH",
+        }
+
+    version_result = command_runner(
+        [modal_cmd, "--version"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if version_result.returncode != 0:
+        return {
+            "ok": False,
+            "modal_version": None,
+            "secret_name": secret_name,
+            "required_keys": list(REQUIRED_PROVIDER_SECRET_KEYS),
+            "secret_exists": False,
+            "error": "Modal CLI version check failed",
+        }
+
+    secret_result = command_runner(
+        [modal_cmd, "secret", "list", "--json"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if secret_result.returncode != 0:
+        return {
+            "ok": False,
+            "modal_version": version_result.stdout.strip(),
+            "secret_name": secret_name,
+            "required_keys": list(REQUIRED_PROVIDER_SECRET_KEYS),
+            "secret_exists": False,
+            "error": "Modal secret list failed; check Modal auth/config",
+        }
+
+    secrets = json.loads(secret_result.stdout or "[]")
+    secret_exists = any(secret.get("Name") == secret_name for secret in secrets)
+    return {
+        "ok": secret_exists,
+        "modal_version": version_result.stdout.strip(),
+        "secret_name": secret_name,
+        "required_keys": list(REQUIRED_PROVIDER_SECRET_KEYS),
+        "secret_exists": secret_exists,
+        "error": None
+        if secret_exists
+        else f"Modal Secret {secret_name!r} was not found",
+    }
+
+
+def build_arg_parser() -> ArgumentParser:
+    """Build the plan/preflight CLI parser."""
+    parser = ArgumentParser(
+        description="Plan and preflight StageGate Modal final/smoke runs."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    plan = subparsers.add_parser(
+        "plan",
+        help="Generate a plan-only manifest without importing Modal.",
+    )
+    plan.add_argument("--batch-id", required=True)
+    plan.add_argument("--repo-url", default=DEFAULT_REPO_URL)
+    plan.add_argument("--repo-ref", required=True)
+    plan.add_argument("--mode", choices=("final", "smoke"), default="final")
+    plan.add_argument("--condition")
+    plan.add_argument("--domain")
+    plan.add_argument(
+        "--output",
+        type=Path,
+        default=Path("batch_manifest_planned.json"),
+    )
+    plan.add_argument("--print-matrix", action="store_true")
+    plan.add_argument(
+        "--skip-hygiene",
+        action="store_true",
+        help="Do not run final hygiene after writing a final-mode plan.",
+    )
+
+    preflight = subparsers.add_parser(
+        "preflight",
+        help="Check Modal CLI/auth and required Secret existence.",
+    )
+    preflight.add_argument("--secret-name", default=DEFAULT_SECRET_NAME)
+    preflight.add_argument("--modal-cmd", default="modal")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI for plan-only dry-run and Modal preflight."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    args = build_arg_parser().parse_args(argv)
+    if args.command == "plan":
+        return _run_plan_command(args)
+    if args.command == "preflight":
+        return _run_preflight_command(args)
+    raise AssertionError(f"Unhandled command {args.command!r}")
+
+
+def _run_plan_command(args: Namespace) -> int:
+    manifest = write_planned_manifest(
+        batch_id=args.batch_id,
+        repo_url=args.repo_url,
+        repo_ref=args.repo_ref,
+        mode=args.mode,
+        condition=args.condition,
+        domain=args.domain,
+        output_path=args.output,
+    )
+    logger.info("Wrote planned manifest to %s", args.output)
+    if args.print_matrix:
+        for run in manifest["runs"]:
+            logger.info(
+                "Planned %s/%s mode=%s command=%s",
+                run["condition"],
+                run["domain"],
+                run["mode"],
+                command_to_log(run["sanitized_command_argv"]),
+            )
+    if args.mode == "final" and not args.skip_hygiene:
+        result = run_final_hygiene_guard(args.output)
+        if result.stdout:
+            logger.info(result.stdout.strip())
+        if result.stderr:
+            logger.info(result.stderr.strip())
+    return 0
+
+
+def _run_preflight_command(args: Namespace) -> int:
+    result = check_modal_preflight(
+        secret_name=args.secret_name,
+        modal_cmd=args.modal_cmd,
+    )
+    logger.info("Modal version: %s", result["modal_version"] or "unavailable")
+    logger.info(
+        "Required Secret %s exists: %s", args.secret_name, result["secret_exists"]
+    )
+    logger.info("Required Secret keys: %s", ", ".join(result["required_keys"]))
+    if not result["ok"]:
+        logger.error(result["error"])
+        return 1
+    return 0
+
+
+def _flag_value(argv: list[str], flag: str) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

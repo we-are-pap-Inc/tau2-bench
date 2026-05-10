@@ -11,6 +11,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.stagegate_modal_runner_config import (
+    FINAL_CONSTANTS,
+    is_full_commit_sha,
+)
+
 REQUIRED_CONDITIONS = ("baseline", "stage_only", "stagegate")
 REQUIRED_DOMAINS = ("retail", "airline", "telecom")
 INVARIANT_FIELDS = {
@@ -26,6 +34,7 @@ INVARIANT_FIELDS = {
         ("concurrency", "max_concurrency"),
         ("--concurrency", "--max-concurrency"),
     ),
+    "repo_ref": (("requested_repo_ref", "repo_ref"), ("--repo-ref",)),
 }
 
 logger = logging.getLogger(__name__)
@@ -68,6 +77,16 @@ def validate_final_run_manifest(runs: list[dict[str, Any]]) -> list[str]:
         if condition in REQUIRED_CONDITIONS and domain in REQUIRED_DOMAINS:
             by_domain_condition.setdefault((domain, condition), []).append(run)
 
+        mode = normalize_token(metadata_value(run, ("mode",), ("--mode",)))
+        if mode != "final":
+            errors.append(f"{label}: final manifest entries must have mode='final'")
+
+        repo_ref = metadata_value(
+            run, ("requested_repo_ref", "repo_ref"), ("--repo-ref",)
+        )
+        if not isinstance(repo_ref, str) or not is_full_commit_sha(repo_ref):
+            errors.append(f"{label}: final runs require a full 40-character repo SHA")
+
         if uses_forbidden_task_filter(run):
             errors.append(f"{label}: final runs must not use task filters")
 
@@ -83,6 +102,15 @@ def validate_final_run_manifest(runs: list[dict[str, Any]]) -> list[str]:
                 f"{label}: speech_complexity must be 'regular', "
                 f"got {speech_complexity!r}"
             )
+
+        for field, expected in FINAL_CONSTANTS.items():
+            value = metadata_value(
+                run,
+                manifest_keys_for_constant(field),
+                cli_flags_for_constant(field),
+            )
+            if normalize_for_compare(value) != normalize_for_compare(expected):
+                errors.append(f"{label}: {field} must be {expected!r}")
 
         for field, (keys, flags) in INVARIANT_FIELDS.items():
             if metadata_value(run, keys, flags) is None:
@@ -127,6 +155,29 @@ def uses_forbidden_task_filter(run: dict[str, Any]) -> bool:
         return True
     args = run_args(run)
     return has_flag(args, "--num-tasks") or has_flag(args, "--task-ids")
+
+
+def manifest_keys_for_constant(field: str) -> tuple[str, ...]:
+    """Return manifest keys that may carry a final constant."""
+    if field == "max_concurrency":
+        return ("max_concurrency", "concurrency")
+    if field == "max_steps_seconds":
+        return ("max_steps_seconds", "timeout")
+    return (field,)
+
+
+def cli_flags_for_constant(field: str) -> tuple[str, ...]:
+    """Return CLI flags that may carry a final constant."""
+    return {
+        "model": ("--audio-native-model", "--model", "--agent-llm"),
+        "provider": ("--audio-native-provider", "--provider", "--audio-provider"),
+        "reasoning_effort": ("--reasoning-effort", "--agent-reasoning-effort"),
+        "speech_complexity": ("--speech-complexity", "--complexity"),
+        "tick_duration": ("--tick-duration",),
+        "max_steps_seconds": ("--max-steps-seconds", "--timeout", "--task-timeout"),
+        "max_concurrency": ("--max-concurrency", "--concurrency"),
+        "seed": ("--seed",),
+    }[field]
 
 
 def metadata_value(
