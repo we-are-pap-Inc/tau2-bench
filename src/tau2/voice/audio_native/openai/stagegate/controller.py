@@ -7,7 +7,6 @@ from typing import Optional
 from loguru import logger
 
 from tau2.data_model.message import Message, ToolCall, ToolMessage
-from tau2.data_model.simulation import SimulationRun
 from tau2.environment.tool import Tool
 from tau2.voice.audio_native.openai.stagegate.ledger import EntityLedger
 from tau2.voice.audio_native.openai.stagegate.orchestrator import (
@@ -424,29 +423,6 @@ class StageGateController:
             error=True,
         )
 
-    def trace_final_outcome(self, simulation: SimulationRun) -> None:
-        """Emit posthoc evaluator outcome only after evaluation has completed."""
-        if simulation.reward_info is None:
-            reward = None
-            passed = None
-            reward_breakdown = None
-        else:
-            reward = simulation.reward_info.reward
-            passed = reward == 1.0
-            reward_breakdown = simulation.reward_info.reward_breakdown
-        self._trace(
-            "final_outcome",
-            visible_to_agent=False,
-            source="evaluator",
-            leakage_risk="posthoc_evaluator",
-            reward=reward,
-            passed=passed,
-            payload={
-                "termination_reason": simulation.termination_reason,
-                "reward_breakdown": reward_breakdown,
-            },
-        )
-
     def _trace(
         self,
         event_type: str,
@@ -460,9 +436,6 @@ class StageGateController:
         tool_args: Optional[dict] = None,
         latency_ms: Optional[float] = None,
         leakage_risk: str = "none",
-        reward: Optional[float] = None,
-        passed: Optional[bool] = None,
-        failure_type: Optional[str] = None,
         ledger_delta: Optional[dict[str, object]] = None,
         validator_decision: Optional[str] = None,
         validator_reason: Optional[str] = None,
@@ -489,9 +462,6 @@ class StageGateController:
                 validator_reason=validator_reason,
                 latency_ms=latency_ms,
                 leakage_risk=leakage_risk,
-                reward=reward,
-                passed=passed,
-                failure_type=failure_type,
                 payload=payload or {},
             )
         )

@@ -60,7 +60,4 @@ class TraceEvent(BaseModel):
     validator_reason: Optional[str] = None
     latency_ms: Optional[float] = None
     leakage_risk: str = "none"
-    passed: Optional[bool] = None
-    failure_type: Optional[str] = None
-    reward: Optional[float] = None
     payload: dict[str, object] = Field(default_factory=dict)

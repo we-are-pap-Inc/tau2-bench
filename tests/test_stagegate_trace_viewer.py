@@ -1,5 +1,12 @@
 import json
 
+from scripts.stagegate_posthoc_outcomes import (
+    SCHEMA_VERSION as ORACLE_SCHEMA_VERSION,
+)
+from scripts.stagegate_posthoc_outcomes import (
+    build_outcome_rows,
+    write_jsonl,
+)
 from scripts.stagegate_trace_viewer import SCHEMA_VERSION, load_trace_data, load_traces
 
 
@@ -70,3 +77,40 @@ def test_load_trace_data_reports_invalid_rows(tmp_path):
     assert "unsupported_schema_version" in errors
     assert "invalid_json_object" in errors
     assert any(error.startswith("invalid_json:") for error in errors)
+
+
+def test_posthoc_outcome_writer_uses_oracle_analysis_schema(tmp_path):
+    results_path = tmp_path / "results.json"
+    output_path = tmp_path / "oracle_analysis.jsonl"
+    results_path.write_text(
+        json.dumps(
+            {
+                "simulations": [
+                    {
+                        "id": "sim_1",
+                        "task_id": "task_1",
+                        "trial": 2,
+                        "domain": "mock",
+                        "termination_reason": "agent_stop",
+                        "reward_info": {
+                            "reward": 1.0,
+                            "reward_breakdown": {"db": 1.0},
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = build_outcome_rows([results_path])
+    write_jsonl(rows, output_path)
+
+    row = json.loads(output_path.read_text(encoding="utf-8").strip())
+    assert row["schema_version"] == ORACLE_SCHEMA_VERSION
+    assert row["event_type"] == "final_outcome"
+    assert row["source"] == "posthoc_oracle_analysis"
+    assert row["sim_id"] == "sim_1"
+    assert row["reward"] == 1.0
+    assert row["passed"] is True
+    assert row["reward_breakdown"] == {"db": 1.0}

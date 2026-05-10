@@ -61,7 +61,9 @@ Each event must include:
 - `validator_check`
 - `validator_allow`
 - `validator_block`
-- `final_outcome`
+
+Runtime trace events must not include evaluator-derived outcomes, reward
+signals, reward breakdowns, or pass/fail labels.
 
 ## Separate posthoc analysis file
 
@@ -70,6 +72,8 @@ Use a separate file for labels that rely on evaluator output:
     oracle_analysis.jsonl
 
 The harness must never read this file during a run.
+Generate it only after completed result files exist, for example with
+`scripts/stagegate_posthoc_outcomes.py`.
 
 ## Streamlit viewer requirements
 

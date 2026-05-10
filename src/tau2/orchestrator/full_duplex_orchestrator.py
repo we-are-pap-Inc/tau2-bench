@@ -339,6 +339,10 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         )
 
         # --- 2. Process agent turn ---
+        self._record_stagegate_delivered_user_message(
+            incoming_for_agent,
+            tick_id=tick_id,
+        )
         (
             agent_chunk,
             self.agent_state,
@@ -451,13 +455,14 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             self.done = True
             self.termination_reason = termination_reason
 
-        stagegate_recorder = self._get_agent_stagegate_controller()
-        if stagegate_recorder is not None:
-            stagegate_recorder.record_visible_message(
-                new_chunk,
-                is_agent=is_agent,
-                tick_id=tick_id,
-            )
+        if is_agent:
+            stagegate_recorder = self._get_agent_stagegate_controller()
+            if stagegate_recorder is not None:
+                stagegate_recorder.record_visible_message(
+                    new_chunk,
+                    is_agent=True,
+                    tick_id=tick_id,
+                )
 
         # Handle tool calls: execute now, deliver results next tick
         tool_calls: list[ToolCall] = []
@@ -510,6 +515,23 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             )
 
         return new_chunk, new_state, tool_calls, tool_results
+
+    def _record_stagegate_delivered_user_message(
+        self,
+        incoming_chunk: Optional[Message],
+        *,
+        tick_id: Optional[int],
+    ) -> None:
+        """Record only user text that is being delivered to the agent this tick."""
+        if incoming_chunk is None:
+            return
+        stagegate_recorder = self._get_agent_stagegate_controller()
+        if stagegate_recorder is not None:
+            stagegate_recorder.record_visible_message(
+                incoming_chunk,
+                is_agent=False,
+                tick_id=tick_id,
+            )
 
     def _get_stagegate_controller(
         self,
