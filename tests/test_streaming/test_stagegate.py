@@ -1,6 +1,8 @@
 import json
+import re
 import time
 from inspect import signature
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,7 +17,6 @@ from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
 from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
-from tau2.runner.simulation import _trace_final_outcome
 from tau2.voice.audio_native.openai.stagegate import (
     EntityLedger,
     LedgerStatus,
@@ -78,6 +79,12 @@ def send_payment_request(customer_id: str, bill_id: str) -> str:
 class StageGateToolkit(ToolKitBase):
     def __init__(self):
         self.write_count = 0
+        self.service_tasks = {
+            "service_task_1": {
+                "task_id": "service_task_1",
+                "status": "pending",
+            }
+        }
 
     @is_tool(ToolType.READ)
     def get_account(self, account_id: str) -> dict:
@@ -105,6 +112,39 @@ class StageGateToolkit(ToolKitBase):
         self.write_count += 1
         return {"account_id": account_id, "plan_name": plan_name}
 
+    @is_tool(ToolType.READ)
+    def get_users(self) -> list[dict]:
+        """Get users.
+
+        Returns:
+            User records.
+        """
+        return [{"user_id": "user_1", "name": "Test User"}]
+
+    @is_tool(ToolType.READ)
+    def get_tasks(self) -> list[dict]:
+        """Get service tasks.
+
+        Returns:
+            Service task records.
+        """
+        return list(self.service_tasks.values())
+
+    @is_tool(ToolType.WRITE)
+    def update_task_status(self, task_id: str, status: str) -> dict:
+        """Update service task status.
+
+        Args:
+            task_id: The domain service task reference.
+            status: The new service task status.
+
+        Returns:
+            Updated service task details.
+        """
+        self.write_count += 1
+        self.service_tasks[task_id]["status"] = status
+        return dict(self.service_tasks[task_id])
+
 
 def _environment(domain_name: str = "mock") -> Environment:
     return Environment(
@@ -129,6 +169,104 @@ def _orchestrator_shell(environment: Environment) -> FullDuplexOrchestrator:
     orchestrator.environment = environment
     orchestrator.num_errors = 0
     return orchestrator
+
+
+class ScriptedStageGateAgent:
+    def __init__(self, controller: StageGateController, tool_call: ToolCall):
+        self.stagegate_controller = controller
+        self.tool_call = tool_call
+        self.received_chunks = []
+
+    @classmethod
+    def is_stop(cls, message):
+        return False
+
+    def get_next_chunk(
+        self,
+        state,
+        participant_chunk=None,
+        tool_results=None,
+    ):
+        self.received_chunks.append(participant_chunk)
+        return (
+            AssistantMessage(
+                role="assistant",
+                content=None,
+                contains_speech=False,
+                tool_calls=[self.tool_call],
+            ),
+            state,
+        )
+
+
+class ScriptedUser:
+    def __init__(self, chunks: list[UserMessage]):
+        self.chunks = list(chunks)
+
+    def get_next_chunk(
+        self,
+        state,
+        participant_chunk=None,
+        tool_results=None,
+    ):
+        if self.chunks:
+            return self.chunks.pop(0), state
+        return UserMessage(role="user", content=None, contains_speech=False), state
+
+
+def _visibility_orchestrator(
+    environment: Environment,
+    controller: StageGateController,
+    *,
+    user_chunks: list[UserMessage],
+) -> FullDuplexOrchestrator:
+    orchestrator = _orchestrator_shell(environment)
+    write_call = ToolCall(
+        id="call_write",
+        name="update_account",
+        arguments={"account_id": "acct_123", "plan_name": "premium"},
+    )
+    orchestrator.agent = ScriptedStageGateAgent(controller, write_call)
+    orchestrator.user = ScriptedUser(user_chunks)
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text(
+        "Please confirm the account change."
+    )
+    orchestrator.current_user_chunk = UserMessage.text("I want the premium plan.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_visibility")
+    orchestrator.simulation_id = "sim_visibility"
+    return orchestrator
+
+
+def _prepare_validated_account_change(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+) -> None:
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tick_id=1,
+    )
+    controller.record_visible_message(
+        AssistantMessage.text(
+            "I will update account acct_123 to premium. "
+            "This will change the account plan status."
+        ),
+        is_agent=True,
+        tick_id=0,
+    )
 
 
 def test_stagegate_agent_adds_advance_stage_only_when_enabled(monkeypatch):
@@ -438,7 +576,10 @@ def test_ledger_update_trace_events_are_emitted(monkeypatch, tmp_path):
         tools=environment.get_tools(),
         domain_name=environment.get_domain_name(),
     )
-    controller.set_trace_context(task_id="task_ledger", sim_id="sim_ledger")
+    controller.set_trace_context(
+        benchmark_task_id="task_ledger",
+        sim_id="sim_ledger",
+    )
 
     controller.trace_model_function_call(
         ToolCall(
@@ -650,6 +791,165 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     assert orchestrator.num_errors == 0
 
 
+def test_service_task_ref_preserves_mock_task_write_validation():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    user_result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(id="call_users", name="get_users", arguments={}),
+        tick_id=1,
+    )
+    task_result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(id="call_tasks", name="get_tasks", arguments={}),
+        tick_id=2,
+    )
+    assert user_result.error is False
+    assert task_result.error is False
+
+    controller.record_visible_message(
+        AssistantMessage.text(
+            "I will update service task service_task_1 to completed. "
+            "This will change the service task status."
+        ),
+        is_agent=True,
+        tick_id=3,
+    )
+    controller.record_visible_message(
+        UserMessage.text("Yes, I confirm."),
+        is_agent=False,
+        tick_id=4,
+    )
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_update_task",
+            name="update_task_status",
+            arguments={"task_id": "service_task_1", "status": "completed"},
+        ),
+        tick_id=5,
+    )
+
+    content = json.loads(result.content)
+    assert result.error is False
+    assert content["status"] == "completed"
+    assert environment.tools.write_count == 1
+    assert controller.validator.state.verified_identifiers["service_task_ref"] == {
+        "service_task_1"
+    }
+
+
+def test_same_tick_user_confirmation_cannot_satisfy_validator():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _visibility_orchestrator(
+        environment,
+        controller,
+        user_chunks=[UserMessage.text("Yes, I confirm.")],
+    )
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+
+    tick = orchestrator.ticks[-1]
+    packet = json.loads(tick.agent_tool_results[0].content)
+    assert tick.user_chunk.content == "Yes, I confirm."
+    assert orchestrator.agent.received_chunks[-1].content == "I want the premium plan."
+    assert tick.agent_tool_results[0].error is True
+    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert environment.tools.write_count == 0
+
+
+def test_next_tick_user_confirmation_becomes_visible_to_validator():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _visibility_orchestrator(
+        environment,
+        controller,
+        user_chunks=[UserMessage.text("Yes, I confirm.")],
+    )
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+    first_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    assert first_tick_result.error is True
+    assert environment.tools.write_count == 0
+
+    orchestrator.step()
+
+    second_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    assert orchestrator.agent.received_chunks[-1].content == "Yes, I confirm."
+    assert second_tick_result.error is False
+    assert json.loads(second_tick_result.content)["plan_name"] == "premium"
+    assert environment.tools.write_count == 1
+
+
+def test_validator_uses_confirmation_only_after_visible_recording():
+    environment = _environment()
+    validator = PreWriteValidator(
+        domain_name="mock",
+        domain_policy="Public policy.",
+        tools=environment.get_tools(),
+    )
+    write_call = ToolCall(
+        id="call_write",
+        name="update_account",
+        arguments={"account_id": "acct_123", "plan_name": "premium"},
+    )
+    validator.record_tool_result(
+        tool_call=ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tool_result=ToolMessage(
+            id="call_read",
+            role="tool",
+            content=json.dumps({"account_id": "acct_123", "status": "active"}),
+            error=False,
+        ),
+        tick_index=1,
+    )
+    validator.record_visible_message(
+        role="assistant",
+        content=(
+            "I will update account acct_123 to premium. "
+            "This will change the account plan status."
+        ),
+        tick_index=2,
+    )
+
+    before_delivery = validator.validate(write_call)
+    validator.record_visible_message(
+        role="user",
+        content="Yes, I confirm.",
+        tick_index=3,
+    )
+    after_delivery = validator.validate(write_call)
+
+    assert before_delivery.decision == "block"
+    assert before_delivery.reason == "missing_confirmation"
+    assert after_delivery.decision == "allow"
+
+
 def test_confirmation_requires_exact_identifier_mention():
     environment = _environment()
     controller = StageGateController(
@@ -798,19 +1098,69 @@ def test_stagegate_does_not_route_by_task_id():
     )
 
     decisions = []
-    for task_id in ("task_a", "task_b"):
+    for benchmark_task_id in ("task_a", "task_b"):
         controller = StageGateController(
             condition="stagegate",
             domain_policy=environment.get_policy(),
             tools=environment.get_tools(),
             domain_name=environment.get_domain_name(),
         )
-        controller.set_trace_context(task_id=task_id, sim_id=f"sim_{task_id}")
+        controller.set_trace_context(
+            benchmark_task_id=benchmark_task_id,
+            sim_id=f"sim_{benchmark_task_id}",
+        )
         decisions.append(controller.validate_tool_call(tool_call).model_dump())
 
     assert decisions[0]["decision"] == decisions[1]["decision"]
     assert decisions[0]["reason"] == decisions[1]["reason"]
     assert decisions[0]["checks"] == decisions[1]["checks"]
+
+
+def test_stagegate_control_code_does_not_use_task_id_identifier_name():
+    repo_root = Path(__file__).resolve().parents[2]
+    runtime_root = repo_root / "src/tau2/voice/audio_native/openai/stagegate"
+    control_files = [
+        runtime_root / "validator.py",
+        runtime_root / "ledger.py",
+        runtime_root / "orchestrator.py",
+    ]
+    forbidden = re.compile(r"\btask_id\b")
+
+    matches = []
+    for path in control_files:
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if forbidden.search(line):
+                matches.append(f"{path.name}:{line_number}:{line.strip()}")
+
+    assert matches == []
+
+
+def test_stagegate_runtime_does_not_read_oracle_outcome_fields():
+    repo_root = Path(__file__).resolve().parents[2]
+    runtime_root = repo_root / "src/tau2/voice/audio_native/openai/stagegate"
+    forbidden = {
+        "reward_info",
+        "reward_breakdown",
+        "reward",
+        "evaluator_result",
+        "trace_final_outcome",
+    }
+
+    matches = []
+    for path in runtime_root.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                matches.append(f"{path.name}:{token}")
+
+    runner_text = (repo_root / "src/tau2/runner/simulation.py").read_text(
+        encoding="utf-8"
+    )
+    assert matches == []
+    assert "trace_final_outcome" not in runner_text
+    assert "_trace_final_outcome" not in runner_text
 
 
 def test_policy_preconditions_require_all_required_visible_fields():
@@ -897,7 +1247,7 @@ def test_trace_event_uses_canonical_schema():
         condition="stage_only",
         run_id="run_123",
         domain="mock",
-        task_id="task_123",
+        benchmark_task_id="task_123",
         sim_id="sim_123",
         tick_index=4,
         tool_name="get_account",
@@ -936,7 +1286,7 @@ def test_trace_writer_records_stagegate_jsonl(monkeypatch, tmp_path):
     )
     controller.set_trace_context(
         domain_name=environment.get_domain_name(),
-        task_id="task_1",
+        benchmark_task_id="task_1",
         sim_id="sim_1",
     )
 
@@ -979,7 +1329,7 @@ def test_domain_tool_trace_events_are_emitted(monkeypatch, tmp_path):
     )
     controller.set_trace_context(
         domain_name=environment.get_domain_name(),
-        task_id="task_2",
+        benchmark_task_id="task_2",
         sim_id="sim_2",
     )
     orchestrator = _orchestrator_shell(environment)
@@ -1005,81 +1355,12 @@ def test_domain_tool_trace_events_are_emitted(monkeypatch, tmp_path):
         "domain_tool_call",
         "domain_tool_result",
     ]
-    assert all(event["task_id"] == "task_2" for event in events)
+    assert all(event["benchmark_task_id"] == "task_2" for event in events)
     assert all(event["sim_id"] == "sim_2" for event in events)
     assert events[0]["tool_args"] == {"account_id": "acct_123"}
     assert events[2]["validator_reason"] == "read_only_tool"
     assert events[4]["latency_ms"] >= 0
     assert events[4]["payload"]["tool_error"] is False
-
-
-def test_final_outcome_trace_is_posthoc(monkeypatch, tmp_path):
-    trace_path = tmp_path / "trace_events.jsonl"
-    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
-
-    environment = _environment()
-    controller = StageGateController(
-        condition="stage_only",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-    )
-    controller.set_trace_context(
-        domain_name=environment.get_domain_name(),
-        task_id="task_3",
-        sim_id="sim_3",
-    )
-    simulation = SimulationRun(
-        id="sim_3",
-        task_id="task_3",
-        start_time="2026-05-08T00:00:00",
-        end_time="2026-05-08T00:00:01",
-        duration=1.0,
-        termination_reason="agent_stop",
-        reward_info=RewardInfo(reward=1.0),
-    )
-
-    controller.trace_final_outcome(simulation)
-
-    event = json.loads(trace_path.read_text().strip())
-    assert event["event_type"] == "final_outcome"
-    assert event["visible_to_agent"] is False
-    assert event["leakage_risk"] == "posthoc_evaluator"
-    assert event["reward"] == 1.0
-    assert event["passed"] is True
-
-
-def test_final_outcome_trace_uses_orchestrator_trial(monkeypatch, tmp_path):
-    trace_path = tmp_path / "trace_events.jsonl"
-    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
-
-    environment = _environment()
-    controller = StageGateController(
-        condition="stage_only",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-    )
-    orchestrator = SimpleNamespace(
-        agent=SimpleNamespace(stagegate_controller=controller),
-        environment=environment,
-        task=SimpleNamespace(id="task_4"),
-        trial=2,
-    )
-    simulation = SimulationRun(
-        id="sim_4",
-        task_id="task_4",
-        start_time="2026-05-08T00:00:00",
-        end_time="2026-05-08T00:00:01",
-        duration=1.0,
-        termination_reason="agent_stop",
-        reward_info=RewardInfo(reward=0.0),
-    )
-
-    _trace_final_outcome(orchestrator, simulation)
-
-    event = json.loads(trace_path.read_text().strip())
-    assert event["event_type"] == "final_outcome"
-    assert event["trial"] == 2
-    assert event["sim_id"] == "sim_4"
 
 
 def test_run_single_task_attaches_trial_for_trace_context(monkeypatch):

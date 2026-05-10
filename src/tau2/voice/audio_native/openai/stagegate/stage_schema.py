@@ -43,7 +43,7 @@ class TraceEvent(BaseModel):
     condition: StageGateCondition
     run_id: Optional[str] = None
     domain: Optional[str] = None
-    task_id: Optional[str] = None
+    benchmark_task_id: Optional[str] = None
     sim_id: Optional[str] = None
     trial: Optional[int] = None
     stage: Optional[str] = None
@@ -60,7 +60,4 @@ class TraceEvent(BaseModel):
     validator_reason: Optional[str] = None
     latency_ms: Optional[float] = None
     leakage_risk: str = "none"
-    passed: Optional[bool] = None
-    failure_type: Optional[str] = None
-    reward: Optional[float] = None
     payload: dict[str, object] = Field(default_factory=dict)

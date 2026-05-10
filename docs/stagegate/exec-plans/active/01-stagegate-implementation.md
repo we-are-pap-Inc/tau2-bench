@@ -146,8 +146,8 @@ remains validator-free; the pre-write validator is active only for
 - [x] Emit canonical `stagegate.trace.v1` JSONL events when
   `TAU2_TRACE_JSONL` is set: `run_start`, `run_end`,
   `model_function_call`, `domain_tool_call`, `domain_tool_result`,
-  `advance_stage_call`, `stage_packet_returned`, and post-evaluation
-  `final_outcome`.
+  `advance_stage_call`, and `stage_packet_returned`. Runtime StageGate traces
+  do not include evaluator-derived outcome, reward, or pass/fail fields.
 - [x] Leave normal domain tools on the existing execution path.
 - [x] Remove active V2 ledger and validator behavior from this scope.
 - [x] Preserve batch `trial` metadata on trace rows by attaching the trial to
@@ -173,6 +173,20 @@ remains validator-free; the pre-write validator is active only for
   rows.
 - [x] Keep blocked calls from invoking `Environment.get_response()` or mutating
   domain toolkit state.
+- [x] Restore the full-duplex visibility boundary: newly emitted user chunks are
+  not recorded into StageGate validator state until the next agent turn receives
+  them as `incoming_for_agent`.
+- [x] Move evaluator-derived final outcome rows out of StageGate runtime and
+  into `scripts/stagegate_posthoc_outcomes.py`, which writes
+  `oracle_analysis.jsonl` after result files exist.
+- [x] Add `scripts/stagegate_prohibited_diff_guard.py` to prevent StageGate
+  branches from modifying benchmark-controlled task, domain, evaluator, user,
+  metrics, or scoring files.
+- [x] Reserve `benchmark_task_id` for trace/posthoc metadata and rename the
+  validator's mock-domain task identifier to `service_task_ref`.
+- [x] Add `scripts/stagegate_final_run_hygiene.py` to reject final-run manifests
+  with task filters, non-regular speech, missing condition/domain coverage, or
+  inconsistent settings across conditions.
 
 ## Tests
 
@@ -187,9 +201,8 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   mutate a fake domain toolkit counter;
 - normal non-`advance_stage` domain tools still call
   `Environment.get_response()` unchanged;
-- `TAU2_TRACE_JSONL` writes canonical `stagegate.trace.v1` rows for
-  StageOnly packets, model function calls, domain tool calls/results, and
-  posthoc final outcome rows.
+- `TAU2_TRACE_JSONL` writes canonical runtime `stagegate.trace.v1` rows for
+  StageOnly packets, model function calls, and domain tool calls/results;
 - entity ledger domain-slot initialization and JSON serialization;
 - model tool-argument updates with source/event/tick evidence;
 - successful official tool-result verification;
@@ -203,10 +216,27 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - confirmed exact identifiers allow a read and then a policy-valid write;
 - action summaries must mention the exact mutable identifier as a distinct
   value before the user confirmation can satisfy the write gate;
+- same-tick user confirmations do not satisfy validator checks before delivery
+  to the agent;
+- next-tick user confirmations become usable only after delivery as
+  `incoming_for_agent`;
+- StageGate runtime package code does not read evaluator-derived reward fields;
+- prohibited-path guard classification for benchmark-controlled files.
+- static control-code coverage that StageGate validator/ledger/packet logic does
+  not use `task_id` as a domain identifier;
 - action summaries must state a consequence, not only an intended action;
 - read-only tools are not overblocked;
 - validator leakage guards show no task objective, expected final DB,
   user-simulator private state, evaluator result, or task-ID routing inputs.
+
+Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
+
+- accepting the required baseline/stage_only/stagegate matrix across retail,
+  airline, and telecom;
+- rejecting `--num-tasks`, `--task-ids`, and manifest task filters;
+- rejecting non-regular speech complexity;
+- rejecting inconsistent model, timeout, seed, or concurrency across conditions;
+- rejecting missing required domain/condition cells.
 
 ## Validation Evidence
 
@@ -326,6 +356,49 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   `npm run format`, `npm run check`, and `npm run lint`
   result: all failed with npm `ENOENT` because this repository has no root
   `package.json`.
+- 2026-05-09 visibility-boundary fix:
+  `uv sync --extra voice --extra dev`
+  result: completed successfully after the first focused pytest run failed
+  during collection with `ModuleNotFoundError: No module named 'tau2'` in the
+  fresh `.venv`.
+- 2026-05-09 visibility-boundary fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py -q`
+  result after fixing test chronology and formatting: `41 passed, 2 warnings
+  in 0.07s`.
+- 2026-05-09 visibility-boundary fix:
+  `uv run ruff check .`
+  result: `All checks passed!`.
+- 2026-05-09 visibility-boundary fix:
+  `make check-all`
+  result: Ruff check passed and Ruff format left 325 files unchanged.
+- 2026-05-09 visibility-boundary fix: `git diff --check`
+  result: passed with no whitespace errors.
+- 2026-05-09 visibility-boundary fix:
+  `python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: failed because no `python` executable exists on this shell's `PATH`.
+  Equivalent project-Python command
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  passed; `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  also passed after the guard script was kept stdlib-only.
+- 2026-05-09 visibility-boundary fix:
+  `npm run format`, `npm run check`, and `npm run lint`
+  result: all failed with npm `ENOENT` because this repository has no root
+  `package.json`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run pytest tests/test_streaming/test_stagegate.py tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `43 passed, 2 warnings in 0.11s`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run pytest tests/test_stagegate_final_run_hygiene.py -q`
+  result: `5 passed, 2 warnings in 0.01s`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `uv run ruff check .`
+  result: `All checks passed!`.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `make check-all`
+  result: Ruff check passed and Ruff format left 327 files unchanged.
+- 2026-05-09 task-ID isolation and final-run hygiene fix:
+  `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: passed.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -344,12 +417,12 @@ Warnings observed in the passing focused and voice test commands:
 - `JsonlTraceWriter` remains independent from τ-bench checkpointing so traces
   can be enabled without changing `SimulationRun`, evaluator inputs, scoring,
   or result files.
-- `final_outcome` trace emission is done only after `run_simulation()` attaches
-  evaluator `reward_info`; it is marked `visible_to_agent=false` and
-  `leakage_risk=posthoc_evaluator`.
-- 2026-05-09: Batch trial context is attached to the orchestrator before
-  `run_simulation()` so runtime events and posthoc `final_outcome` rows share
-  the same trial identifier.
+- 2026-05-09 visibility-boundary fix: StageGate records user text only when it
+  is delivered to the agent as `incoming_for_agent`; newly emitted simulator
+  chunks are not validator-visible in the same tick.
+- 2026-05-09 visibility-boundary fix: Evaluator-derived final outcome rows are
+  produced only by posthoc analysis scripts outside
+  `src/tau2/voice/audio_native/openai/stagegate/`.
 - 2026-05-09: `run_end` on exception uses
   `termination_reason="exception"` because retry infrastructure owns the final
   failed `SimulationRun` object for exhausted attempts.
@@ -372,8 +445,10 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-09 pre-write validator pass: Blocked writes return an error
   `ToolMessage` with a corrective stage packet and increment the existing
   orchestrator tool-error counter; the domain environment is not called.
-- 2026-05-09 pre-write validator pass: Task IDs remain trace metadata only and
-  are not passed into validator decision logic.
+- 2026-05-09 pre-write validator pass: Benchmark task IDs remain trace/posthoc
+  metadata only and are represented as `benchmark_task_id` in StageGate traces.
+  Domain-control identifiers must use domain-specific names; the mock service
+  task identifier is represented internally as `service_task_ref`, not `task_id`.
 - 2026-05-09 cleanup review pass: Policy preconditions now require every
   required visible field for the relevant read inspection, avoiding underblocks
   where one field such as bill status was present but another such as amount

@@ -16,6 +16,7 @@ StageOnly and StageGate are custom submissions because they add orchestration to
 - official domain tool outputs
 - agent-visible transcript/audio events
 - server state derived from the above
+- `benchmark_task_id` as trace/posthoc metadata only
 
 ## Forbidden harness inputs
 
@@ -56,6 +57,15 @@ The validator must not:
 - infer the expected answer from hidden task data;
 - use task ID to choose special-case logic.
 
+## Identifier naming
+
+Use `benchmark_task_id` only for trace and posthoc metadata that identifies the
+benchmark task being run. StageGate validator, ledger, and stage-packet control
+logic must never use `task_id` as a domain identifier or rule selector. Domain
+identifiers must use unambiguous domain-specific names such as `account_id`,
+`reservation_id`, `order_id`, or the mock-domain internal alias
+`service_task_ref`.
+
 ## Required leakage tests
 
 Add tests with names like:
@@ -79,6 +89,11 @@ A final result is invalid if it used:
 - different concurrency by condition
 - different code commits by condition
 - reruns of only failed tasks
+
+Final reported runs must pass `scripts/stagegate_final_run_hygiene.py` against a
+manifest covering baseline, stage_only, and stagegate for retail, airline, and
+telecom. The manifest must prove regular speech complexity and matching model,
+provider, reasoning effort, timeout, seed, and concurrency across conditions.
 
 ## Reporting language
 

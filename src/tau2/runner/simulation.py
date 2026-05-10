@@ -89,25 +89,4 @@ def run_simulation(
         f"reward={reward_info.reward}"
     )
 
-    _trace_final_outcome(orchestrator, simulation)
-
     return simulation
-
-
-def _trace_final_outcome(
-    orchestrator: Union[Orchestrator, FullDuplexOrchestrator],
-    simulation: SimulationRun,
-) -> None:
-    """Emit posthoc trace outcome after evaluator output is attached."""
-    controller = getattr(
-        getattr(orchestrator, "agent", None), "stagegate_controller", None
-    )
-    if controller is None or not controller.tracing_enabled:
-        return
-    controller.set_trace_context(
-        domain_name=orchestrator.environment.get_domain_name(),
-        task_id=orchestrator.task.id,
-        sim_id=simulation.id,
-        trial=getattr(orchestrator, "trial", getattr(simulation, "trial", None)),
-    )
-    controller.trace_final_outcome(simulation)

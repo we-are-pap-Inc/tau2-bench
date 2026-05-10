@@ -24,7 +24,7 @@ Each event must include:
       "run_id": "tau3voice_2026_05_08_gptrt2",
       "condition": "stagegate",
       "domain": "retail",
-      "task_id": "retail_001",
+      "benchmark_task_id": "retail_001",
       "sim_id": "sim_abc123",
       "trial": 1,
       "event_type": "validator_block",
@@ -61,7 +61,9 @@ Each event must include:
 - `validator_check`
 - `validator_allow`
 - `validator_block`
-- `final_outcome`
+
+Runtime trace events must not include evaluator-derived outcomes, reward
+signals, reward breakdowns, or pass/fail labels.
 
 ## Separate posthoc analysis file
 
@@ -70,6 +72,8 @@ Use a separate file for labels that rely on evaluator output:
     oracle_analysis.jsonl
 
 The harness must never read this file during a run.
+Generate it only after completed result files exist, for example with
+`scripts/stagegate_posthoc_outcomes.py`.
 
 ## Streamlit viewer requirements
 
@@ -78,7 +82,7 @@ Build `scripts/stagegate_trace_viewer.py` with filters:
 - run_id
 - condition
 - domain
-- task_id
+- benchmark_task_id
 - pass/fail
 - failure_type
 - stage

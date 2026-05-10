@@ -19,6 +19,9 @@ from tau2.voice.audio_native.openai.stagegate.ledger import (
 from tau2.voice.audio_native.openai.stagegate.stage_schema import StagePacket
 
 ValidatorOutcome = Literal["allow", "block"]
+SERVICE_TASK_REF = "service_task_ref"
+SERVICE_TASK_READ_TOOL = "get_tasks"
+SERVICE_TASK_WRITE_TOOL = "update_task_status"
 
 READ_TOOL_PREFIXES = (
     "calculate",
@@ -124,7 +127,7 @@ INSPECTION_TOOLS_BY_EXACT_ARG = {
     "line_id": {"get_data_usage", "get_details_by_id"},
     "order_id": {"get_order_details"},
     "reservation_id": {"get_reservation_details"},
-    "task_id": {"get_tasks"},
+    SERVICE_TASK_REF: {SERVICE_TASK_READ_TOOL},
     "user_id": {"get_user_details"},
 }
 
@@ -331,7 +334,7 @@ class PreWriteValidator:
                 record.normalized_values.add(normalized)
         self.state.read_inspections.append(record)
         self._record_verified_arguments(tool_call.arguments)
-        self._record_verified_payload(payload)
+        self._record_verified_payload(payload, tool_name=tool_call.name)
 
     def requirement_for_tool(self, tool_name: str) -> ActionRequirement:
         """Return policy-facing requirements for a side-effecting tool."""
@@ -436,9 +439,7 @@ class PreWriteValidator:
         ledger: Optional[EntityLedger],
     ) -> bool:
         for arg_name in requirement.exact_args:
-            if arg_name not in tool_call.arguments:
-                return False
-            values = list(iter_values(tool_call.arguments[arg_name]))
+            values = list(self._tool_argument_values(tool_call, arg_name))
             if not values:
                 return False
             for value in values:
@@ -551,9 +552,10 @@ class PreWriteValidator:
         requirement: ActionRequirement,
     ) -> bool:
         for arg_name in requirement.exact_args:
-            if arg_name not in tool_call.arguments:
+            values = list(self._tool_argument_values(tool_call, arg_name))
+            if not values:
                 return False
-            for value in iter_values(tool_call.arguments[arg_name]):
+            for value in values:
                 normalized = normalize_value(value)
                 if normalized is not None and not self._last_confirmed_action_mentions(
                     normalized
@@ -572,8 +574,7 @@ class PreWriteValidator:
         exact_values = {
             normalize_value(value)
             for arg_name in requirement.exact_args
-            if arg_name in tool_call.arguments
-            for value in iter_values(tool_call.arguments[arg_name])
+            for value in self._tool_argument_values(tool_call, arg_name)
         }
         exact_values.discard(None)
         if not exact_values:
@@ -582,21 +583,45 @@ class PreWriteValidator:
 
     def _record_verified_arguments(self, arguments: dict[str, Any]) -> None:
         for arg_name, value in arguments.items():
+            identifier_name = canonical_identifier_name(
+                tool_name=None,
+                raw_name=arg_name,
+            )
             for item in iter_values(value):
-                self._record_verified_identifier(arg_name, item)
+                self._record_verified_identifier(identifier_name, item)
 
-    def _record_verified_payload(self, payload: Any) -> None:
+    def _record_verified_payload(self, payload: Any, *, tool_name: str) -> None:
         if isinstance(payload, dict):
             for key, value in payload.items():
+                identifier_name = canonical_identifier_name(
+                    tool_name=tool_name,
+                    raw_name=key,
+                )
                 if isinstance(value, (dict, list)):
                     for item in iter_values(value):
-                        self._record_verified_identifier(key, item)
-                    self._record_verified_payload(value)
+                        self._record_verified_identifier(identifier_name, item)
+                    self._record_verified_payload(value, tool_name=tool_name)
                 else:
-                    self._record_verified_identifier(key, value)
+                    self._record_verified_identifier(identifier_name, value)
         elif isinstance(payload, list):
             for item in payload:
-                self._record_verified_payload(item)
+                self._record_verified_payload(item, tool_name=tool_name)
+
+    def _tool_argument_values(
+        self,
+        tool_call: ToolCall,
+        identifier_name: str,
+    ) -> list[Any]:
+        return [
+            value
+            for arg_name in argument_names_for_identifier(
+                identifier_name,
+                tool_call=tool_call,
+                tools_by_name=self.tools_by_name,
+            )
+            if arg_name in tool_call.arguments
+            for value in iter_values(tool_call.arguments[arg_name])
+        ]
 
     def _record_verified_identifier(self, name: str, value: Any) -> None:
         normalized = normalize_value(value)
@@ -628,7 +653,6 @@ def exact_identifier_args_for_tool(tool_name: str) -> tuple[str, ...]:
         "order_id",
         "payment_method_id",
         "reservation_id",
-        "task_id",
         "user_id",
     ):
         if candidate in tool_name:
@@ -667,8 +691,8 @@ def exact_identifier_args_for_tool(tool_name: str) -> tuple[str, ...]:
         return ("customer_id", "bill_id")
     if tool_name == "update_account":
         return ("account_id",)
-    if tool_name == "update_task_status":
-        return ("task_id",)
+    if tool_name == SERVICE_TASK_WRITE_TOOL:
+        return (SERVICE_TASK_REF,)
     return tuple(arg_names)
 
 
@@ -729,6 +753,51 @@ def ledger_slots_for_arg(arg_name: str) -> tuple[str, ...]:
         "reservation_id": ("reservation_id",),
         "user_id": ("customer_name", "passenger_name"),
     }.get(arg_name, (arg_name,))
+
+
+def argument_names_for_identifier(
+    identifier_name: str,
+    *,
+    tool_call: ToolCall,
+    tools_by_name: dict[str, Tool],
+) -> tuple[str, ...]:
+    """Map internal identifier names to public domain-tool argument names."""
+    if identifier_name != SERVICE_TASK_REF:
+        return (identifier_name,)
+
+    candidates = tuple(
+        arg_name for arg_name in tool_call.arguments if is_identifier_arg_name(arg_name)
+    )
+    if candidates:
+        return candidates
+
+    tool = tools_by_name.get(tool_call.name)
+    if tool is None:
+        return (SERVICE_TASK_REF,)
+
+    required = tool.params.model_json_schema().get("required", [])
+    schema_candidates = tuple(
+        arg_name
+        for arg_name in required
+        if isinstance(arg_name, str) and is_identifier_arg_name(arg_name)
+    )
+    return schema_candidates or (SERVICE_TASK_REF,)
+
+
+def canonical_identifier_name(
+    *,
+    tool_name: Optional[str],
+    raw_name: str,
+) -> str:
+    """Return the StageGate control name for a public domain identifier field."""
+    if tool_name == SERVICE_TASK_READ_TOOL and is_identifier_arg_name(raw_name):
+        return SERVICE_TASK_REF
+    return raw_name
+
+
+def is_identifier_arg_name(name: str) -> bool:
+    """Return whether a public argument name has identifier shape."""
+    return name.endswith("_id")
 
 
 def equivalent_identifier_names(name: str) -> set[str]:
