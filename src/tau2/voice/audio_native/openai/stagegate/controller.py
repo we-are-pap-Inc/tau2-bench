@@ -362,10 +362,17 @@ class StageGateController:
         tick_id: Optional[int] = None,
     ) -> None:
         """Record assistant utterance text from model output."""
+        content = getattr(message, "content", None)
+        if content:
+            self._trace(
+                "assistant_audio_event",
+                tick_index=tick_id,
+                source=EvidenceSource.ASSISTANT_UTTERANCE.value,
+                payload={"content": content},
+            )
         validator = self._active_validator()
         if validator is None:
             return
-        content = getattr(message, "content", None)
         validator.record_assistant_utterance(
             content=content,
             tick_index=tick_id,
@@ -379,6 +386,13 @@ class StageGateController:
         tick_id: Optional[int] = None,
     ) -> None:
         """Record user transcript only when the adapter exposes it to the model path."""
+        if transcript:
+            self._trace(
+                "user_transcript_event",
+                tick_index=tick_id,
+                source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT.value,
+                payload={"transcript": transcript},
+            )
         validator = self._active_validator()
         if validator is None:
             return

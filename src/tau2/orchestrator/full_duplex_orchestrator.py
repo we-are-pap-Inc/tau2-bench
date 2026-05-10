@@ -472,15 +472,30 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 participant=participant,
                 is_agent=is_agent,
             )
-            if stagegate_controller is not None:
+            stagegate_trace_controller = self._get_stagegate_tick_trace_controller(
+                participant=participant,
+                is_agent=is_agent,
+            )
+            model_call_recorder = stagegate_controller or stagegate_trace_controller
+            if model_call_recorder is not None:
                 for tool_call in tool_calls:
-                    stagegate_controller.trace_model_function_call(
+                    model_call_recorder.trace_model_function_call(
                         tool_call,
                         tick_id=tick_id,
                     )
+            if stagegate_controller is not None:
                 results = [
                     self._execute_stagegate_tool_call(
                         stagegate_controller,
+                        tool_call,
+                        tick_id=tick_id,
+                    )
+                    for tool_call in tool_calls
+                ]
+            elif stagegate_trace_controller is not None:
+                results = [
+                    self._execute_trace_only_tool_call(
+                        stagegate_trace_controller,
                         tool_call,
                         tick_id=tick_id,
                     )
@@ -527,12 +542,28 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             return None
         return controller
 
+    def _get_stagegate_tick_trace_controller(
+        self,
+        *,
+        participant: Union[StreamingAgentT, StreamingUserT],
+        is_agent: bool,
+    ):
+        if not is_agent:
+            return None
+        controller = getattr(participant, "stagegate_controller", None)
+        if controller is None:
+            return None
+        self._attach_stagegate_trace_context(controller)
+        if not controller.tracing_enabled:
+            return None
+        return controller
+
     def _get_agent_stagegate_controller(self):
         controller = getattr(self.agent, "stagegate_controller", None)
         if controller is None:
             return None
         self._attach_stagegate_trace_context(controller)
-        if not controller.enabled:
+        if not controller.enabled and not controller.tracing_enabled:
             return None
         return controller
 
@@ -569,6 +600,27 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 validator_decision,
             )
 
+        stagegate_controller.trace_domain_tool_call(tool_call, tick_id=tick_id)
+        tool_start = time.perf_counter()
+        tool_result = self.environment.get_response(tool_call)
+        latency_ms = round((time.perf_counter() - tool_start) * 1000, 3)
+        stagegate_controller.trace_domain_tool_result(
+            tool_call,
+            tool_result,
+            tick_id=tick_id,
+            latency_ms=latency_ms,
+        )
+        if tool_result.error:
+            self.num_errors += 1
+        return tool_result
+
+    def _execute_trace_only_tool_call(
+        self,
+        stagegate_controller,
+        tool_call: ToolCall,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> ToolMessage:
         stagegate_controller.trace_domain_tool_call(tool_call, tick_id=tick_id)
         tool_start = time.perf_counter()
         tool_result = self.environment.get_response(tool_call)

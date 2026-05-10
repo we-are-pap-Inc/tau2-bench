@@ -44,6 +44,7 @@ from tau2.voice.audio_native.openai.events import (
     AudioTranscriptDeltaEvent,
     AudioTranscriptDoneEvent,
     FunctionCallArgumentsDoneEvent,
+    InputAudioTranscriptionCompletedEvent,
     ResponseDoneEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
@@ -320,6 +321,12 @@ class DiscreteTimeOpenAIAdapter(DiscreteTimeAdapter):
                 )
                 result.tool_calls.append(tool_call)
                 logger.debug(f"Tool call detected: {event.name}({event.call_id})")
+
+        elif isinstance(event, InputAudioTranscriptionCompletedEvent):
+            transcript = event.transcript.strip()
+            if transcript:
+                result.user_transcripts.append(transcript)
+                logger.debug(f"Input transcription completed: {transcript}")
 
         elif isinstance(event, AudioDoneEvent):
             logger.debug(f"Audio done for item {event.item_id}")

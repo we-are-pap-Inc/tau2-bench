@@ -192,6 +192,15 @@ remains validator-free; the pre-write validator is active only for
 - [x] Keep baseline tracing passive: `TAU2_TRACE_JSONL` with
   `condition="baseline"` may emit run-level traces, but baseline domain tools
   do not route through `_execute_stagegate_tool_call()`.
+- [x] Preserve trace-only per-tick visibility without enforcement: baseline
+  trace-only runs now record assistant utterance, model function call, domain
+  tool call, and domain tool result trace rows while executing domain tools
+  through direct `Environment.get_response()` calls outside the validator
+  wrapper.
+- [x] Wire OpenAI input-audio transcription events into the explicit
+  `AGENT_VISIBLE_TRANSCRIPT` evidence path. These provider transcripts can
+  satisfy confirmation; clean audio-native `UserMessage.content` remains
+  rejected and unused.
 - [x] Move evaluator-derived final outcome rows out of StageGate runtime and
   into `scripts/stagegate_posthoc_outcomes.py`, which writes
   `oracle_analysis.jsonl` after result files exist.
@@ -311,6 +320,24 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 audio-text leak fix:
   `npm run format`, `npm run check`, and `npm run lint` each failed with
   `ENOENT` because this Python repository has no root `package.json`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py::test_baseline_trace_jsonl_does_not_route_tools_through_stagegate
+  tests/test_streaming/test_stagegate.py::test_baseline_trace_jsonl_records_assistant_utterance_without_stagegate
+  tests/test_streaming/test_stagegate.py::test_openai_adapter_records_input_transcription_event
+  tests/test_streaming/test_stagegate.py::test_agent_wires_provider_user_transcript_to_stagegate_confirmation
+  tests/test_streaming/test_stagegate.py::test_next_tick_clean_user_content_does_not_satisfy_validator -q`
+  result: `5 passed, 2 warnings in 0.02s`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_stagegate.py
+  tests/test_stagegate_trace_viewer.py
+  tests/test_stagegate_prohibited_diff_guard.py -q`
+  result: `52 passed, 2 warnings in 0.12s`.
+- 2026-05-10 review follow-up:
+  `uv run pytest tests/test_streaming/test_discrete_time_audio_native_agent.py -q`
+  result: `33 passed, 2 warnings in 0.06s`.
+- 2026-05-10 review follow-up:
+  `make check-all` result: `All checks passed!` and
+  `329 files left unchanged`.
 
 - `uv run pytest tests/test_streaming/test_stagegate.py -q` initially could
   not collect in the freshly created core-only environment. Direct import

@@ -133,6 +133,13 @@ class TickResult(BaseModel):
         default="",
         description="Transcript text proportional to audio played this tick",
     )
+    user_transcripts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Provider or adapter input-audio transcript events for user speech "
+            "received on the model path this tick."
+        ),
+    )
 
     # --- Interruption tracking ---
     was_truncated: bool = Field(

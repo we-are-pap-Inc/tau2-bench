@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import time
@@ -17,6 +18,10 @@ from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
 from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
+from tau2.voice.audio_native.openai.discrete_time_adapter import (
+    DiscreteTimeOpenAIAdapter,
+)
+from tau2.voice.audio_native.openai.events import InputAudioTranscriptionCompletedEvent
 from tau2.voice.audio_native.openai.stagegate import (
     EntityLedger,
     EvidenceSource,
@@ -26,6 +31,7 @@ from tau2.voice.audio_native.openai.stagegate import (
     TraceEvent,
 )
 from tau2.voice.audio_native.openai.stagegate.trace import JsonlTraceWriter
+from tau2.voice.audio_native.tick_result import TickResult
 
 
 def _test_tool(arg: str) -> str:
@@ -198,6 +204,24 @@ class ScriptedStageGateAgent:
             ),
             state,
         )
+
+
+class ScriptedUtteranceAgent:
+    def __init__(self, controller: StageGateController, content: str):
+        self.stagegate_controller = controller
+        self.content = content
+
+    @classmethod
+    def is_stop(cls, message):
+        return False
+
+    def get_next_chunk(
+        self,
+        state,
+        participant_chunk=None,
+        tool_results=None,
+    ):
+        return AssistantMessage.text(self.content), state
 
 
 class ScriptedUser:
@@ -703,6 +727,52 @@ def test_baseline_trace_jsonl_does_not_route_tools_through_stagegate(
     assert json.loads(tool_results[0].content)["plan_name"] == "premium"
     assert environment.tools.write_count == 1
 
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "trace_events.jsonl").read_text().splitlines()
+    ]
+    assert [event["event_type"] for event in events] == [
+        "model_function_call",
+        "domain_tool_call",
+        "domain_tool_result",
+    ]
+    assert all(event["condition"] == "baseline" for event in events)
+    assert all(not event["event_type"].startswith("validator_") for event in events)
+
+
+def test_baseline_trace_jsonl_records_assistant_utterance_without_stagegate(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(tmp_path / "trace_events.jsonl"))
+    environment = _environment()
+    controller = StageGateController(
+        condition="baseline",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    agent = ScriptedUtteranceAgent(controller, "I can help with that account.")
+    orchestrator.agent = agent
+
+    orchestrator._process_participant_turn(
+        participant=agent,
+        state=SimpleNamespace(),
+        incoming_chunk=None,
+        is_agent=True,
+        pending_tool_results=None,
+        tick_id=1,
+    )
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "trace_events.jsonl").read_text().splitlines()
+    ]
+    assert [event["event_type"] for event in events] == ["assistant_audio_event"]
+    assert events[0]["source"] == EvidenceSource.ASSISTANT_UTTERANCE.value
+    assert events[0]["payload"]["content"] == "I can help with that account."
+
 
 def test_validator_never_mutates_domain_state_when_blocking():
     environment = _environment()
@@ -1001,6 +1071,94 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
     assert result.error is False
     assert json.loads(result.content)["plan_name"] == "premium"
     assert environment.tools.write_count == 1
+
+
+def test_openai_adapter_records_input_transcription_event():
+    adapter = DiscreteTimeOpenAIAdapter(
+        tick_duration_ms=200,
+        provider=MagicMock(),
+    )
+    tick_result = TickResult(
+        tick_number=1,
+        audio_sent_bytes=0,
+        audio_sent_duration_ms=0,
+        bytes_per_tick=1600,
+        bytes_per_second=8000,
+    )
+
+    asyncio.run(
+        adapter._process_event(
+            tick_result,
+            InputAudioTranscriptionCompletedEvent(
+                event_id="evt_transcript",
+                type="conversation.item.input_audio_transcription.completed",
+                item_id="item_user",
+                transcript="Yes, I confirm.",
+            ),
+        )
+    )
+
+    assert tick_result.user_transcripts == ["Yes, I confirm."]
+
+
+def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypatch):
+    monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stagegate")
+    environment = _environment()
+    adapter = MagicMock()
+    adapter.is_connected = True
+    adapter.run_tick.return_value = TickResult(
+        tick_number=1,
+        audio_sent_bytes=0,
+        audio_sent_duration_ms=0,
+        bytes_per_tick=8000,
+        bytes_per_second=8000,
+        user_transcripts=["Yes, I confirm."],
+    )
+    agent = DiscreteTimeAudioNativeAgent(
+        tools=environment.get_tools(),
+        domain_policy=environment.get_policy(),
+        adapter=adapter,
+        provider="openai",
+    )
+    controller = agent.stagegate_controller
+    controller.set_domain_name(environment.get_domain_name())
+    controller.validator.record_tool_result(
+        tool_call=ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tool_result=ToolMessage(
+            id="call_read",
+            role="tool",
+            content=json.dumps({"account_id": "acct_123", "status": "active"}),
+            error=False,
+        ),
+        tick_index=0,
+    )
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will update account acct_123 to premium. "
+            "This will change the account plan status."
+        ),
+        tick_id=0,
+    )
+    state = agent.get_init_state()
+
+    agent.get_next_chunk(
+        state,
+        participant_chunk=UserMessage.text("clean simulator text is ignored"),
+    )
+    decision = controller.validate_tool_call(
+        ToolCall(
+            id="call_write",
+            name="update_account",
+            arguments={"account_id": "acct_123", "plan_name": "premium"},
+        )
+    )
+
+    assert controller.validator.state.last_user_confirmation == "Yes, I confirm."
+    assert decision.decision == "allow"
 
 
 def test_validator_uses_confirmation_only_after_visible_recording():
