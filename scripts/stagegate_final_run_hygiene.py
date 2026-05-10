@@ -159,11 +159,16 @@ def uses_forbidden_task_filter(run: dict[str, Any]) -> bool:
 
 def manifest_keys_for_constant(field: str) -> tuple[str, ...]:
     """Return manifest keys that may carry a final constant."""
-    if field == "max_concurrency":
-        return ("max_concurrency", "concurrency")
-    if field == "max_steps_seconds":
-        return ("max_steps_seconds", "timeout")
-    return (field,)
+    return {
+        "model": ("model", "agent_model", "agent_llm"),
+        "provider": ("provider", "audio_provider"),
+        "reasoning_effort": ("reasoning_effort", "agent_reasoning_effort"),
+        "speech_complexity": ("speech_complexity", "complexity"),
+        "tick_duration": ("tick_duration",),
+        "max_steps_seconds": ("max_steps_seconds", "timeout", "task_timeout"),
+        "max_concurrency": ("max_concurrency", "concurrency"),
+        "seed": ("seed",),
+    }[field]
 
 
 def cli_flags_for_constant(field: str) -> tuple[str, ...]:

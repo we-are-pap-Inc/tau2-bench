@@ -35,6 +35,22 @@ def test_stagegate_final_run_hygiene_accepts_required_matrix():
     assert validate_final_run_manifest(_valid_manifest()) == []
 
 
+def test_stagegate_final_run_hygiene_accepts_alias_only_constant_metadata():
+    manifest = []
+    for run in _valid_manifest():
+        alias_run = dict(run)
+        alias_run["agent_model"] = alias_run.pop("model")
+        alias_run["audio_provider"] = alias_run.pop("provider")
+        alias_run["agent_reasoning_effort"] = alias_run.pop("reasoning_effort")
+        alias_run["complexity"] = alias_run.pop("speech_complexity")
+        alias_run["task_timeout"] = alias_run.pop("max_steps_seconds")
+        alias_run.pop("timeout")
+        alias_run["concurrency"] = alias_run.pop("max_concurrency")
+        manifest.append(alias_run)
+
+    assert validate_final_run_manifest(manifest) == []
+
+
 def test_stagegate_final_run_hygiene_rejects_task_filters():
     manifest = _valid_manifest()
     manifest[0]["args"] = ["tau2", "run", "--num-tasks", "5"]
