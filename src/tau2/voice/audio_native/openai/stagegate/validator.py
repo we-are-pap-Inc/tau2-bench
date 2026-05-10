@@ -16,7 +16,11 @@ from tau2.voice.audio_native.openai.stagegate.ledger import (
     normalize_value,
     parse_tool_result,
 )
-from tau2.voice.audio_native.openai.stagegate.stage_schema import StagePacket
+from tau2.voice.audio_native.openai.stagegate.stage_schema import (
+    EvidenceSource,
+    StagePacket,
+    ensure_runtime_evidence_source,
+)
 
 ValidatorOutcome = Literal["allow", "block"]
 SERVICE_TASK_REF = "service_task_ref"
@@ -213,8 +217,10 @@ class VisibleConversationState:
     verified_identifiers: dict[str, set[str]] = field(default_factory=dict)
     last_action_statement: Optional[str] = None
     last_action_statement_tick: Optional[int] = None
+    last_action_statement_source: Optional[EvidenceSource] = None
     last_user_confirmation: Optional[str] = None
     last_user_confirmation_tick: Optional[int] = None
+    last_user_confirmation_source: Optional[EvidenceSource] = None
 
 
 class PreWriteValidator:
@@ -297,16 +303,52 @@ class PreWriteValidator:
         content: Optional[str],
         tick_index: Optional[int] = None,
     ) -> None:
-        """Record agent-visible text from a participant chunk."""
+        """Record legacy assistant text; user text requires explicit evidence."""
+        if role == "assistant":
+            self.record_assistant_utterance(content=content, tick_index=tick_index)
+            return
+        raise ValueError(
+            "UserMessage.content from audio-native chunks is simulator gold text; "
+            "use record_user_confirmation_evidence with AGENT_VISIBLE_TRANSCRIPT."
+        )
+
+    def record_assistant_utterance(
+        self,
+        *,
+        content: Optional[str],
+        tick_index: Optional[int] = None,
+        source: EvidenceSource | str = EvidenceSource.ASSISTANT_UTTERANCE,
+    ) -> None:
+        """Record assistant-visible action summaries from model output."""
         if not content:
             return
-        if role == "assistant":
-            if looks_like_action_statement(content):
-                self.state.last_action_statement = content
-                self.state.last_action_statement_tick = tick_index
-        elif looks_like_user_confirmation(content):
+        source = ensure_runtime_evidence_source(source)
+        if source is not EvidenceSource.ASSISTANT_UTTERANCE:
+            raise ValueError(
+                "assistant action evidence must use ASSISTANT_UTTERANCE source"
+            )
+        if looks_like_action_statement(content):
+            self.state.last_action_statement = content
+            self.state.last_action_statement_tick = tick_index
+            self.state.last_action_statement_source = source
+
+    def record_user_confirmation_evidence(
+        self,
+        *,
+        content: Optional[str],
+        tick_index: Optional[int] = None,
+        source: EvidenceSource | str,
+    ) -> None:
+        """Record user confirmation only from model-path transcript evidence."""
+        if not content:
+            return
+        source = ensure_runtime_evidence_source(source)
+        if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
+            return
+        if looks_like_user_confirmation(content):
             self.state.last_user_confirmation = content
             self.state.last_user_confirmation_tick = tick_index
+            self.state.last_user_confirmation_source = source
 
     def record_tool_result(
         self,
@@ -490,6 +532,11 @@ class PreWriteValidator:
         if (
             self.state.last_action_statement_tick is None
             or self.state.last_user_confirmation_tick is None
+        ):
+            return False
+        if (
+            self.state.last_user_confirmation_source
+            is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT
         ):
             return False
         if (

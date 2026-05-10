@@ -105,7 +105,7 @@ Each slot should include:
       "normalized_value": "O-12345",
       "status": "heard_not_confirmed",
       "confidence": 0.72,
-      "source": "model_tool_args",
+      "source": "model_tool_argument",
       "evidence": [
         {"turn_id": 8, "event_id": "evt_abc", "quote_or_summary": "User appeared to say O-12345"}
       ],
@@ -166,6 +166,22 @@ Telecom:
 ## Pre-write validator
 
 Wrap side-effecting domain tools. Do not mutate domain state inside the validator.
+
+The validator admits only typed runtime evidence:
+
+- `ASSISTANT_UTTERANCE` for model-spoken action summaries.
+- `AGENT_VISIBLE_TRANSCRIPT` for user confirmation, only when the provider or
+  adapter exposes the transcript to the same model path that received the user
+  audio.
+- `MODEL_TOOL_ARGUMENT` for model belief about entities and intended tool
+  calls; this never satisfies user confirmation by itself.
+- `DOMAIN_TOOL_OUTPUT` for verified facts returned by official domain tools.
+
+`SIMULATOR_GOLD_TEXT` and `POSTHOC_ORACLE` are forbidden in runtime StageGate
+state. In audio-native runs, clean `UserMessage.content` from the simulator is
+not agent-visible when the model receives only `user_audio`, so it must not
+update the ledger or satisfy confirmation. If no agent-visible user transcript
+exists, confirmation remains missing.
 
 Validator checks:
 

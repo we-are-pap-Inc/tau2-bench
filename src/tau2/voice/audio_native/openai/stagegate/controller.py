@@ -13,6 +13,7 @@ from tau2.voice.audio_native.openai.stagegate.orchestrator import (
     StagePacketOrchestrator,
 )
 from tau2.voice.audio_native.openai.stagegate.stage_schema import (
+    EvidenceSource,
     StageGateCondition,
     TraceEvent,
 )
@@ -259,7 +260,7 @@ class StageGateController:
         self._trace(
             "model_function_call",
             tick_index=tick_id,
-            source="model_function_call",
+            source=EvidenceSource.MODEL_TOOL_ARGUMENT.value,
             tool_name=tool_call.name,
             tool_args=tool_call.arguments,
             payload={"tool_call_id": tool_call.id},
@@ -287,7 +288,7 @@ class StageGateController:
         self._trace(
             "domain_tool_call",
             tick_index=tick_id,
-            source="domain_tool_call",
+            source=EvidenceSource.MODEL_TOOL_ARGUMENT.value,
             tool_name=tool_call.name,
             tool_args=tool_call.arguments,
             payload={"tool_call_id": tool_call.id},
@@ -305,7 +306,7 @@ class StageGateController:
         self._trace(
             "domain_tool_result",
             tick_index=tick_id,
-            source="domain_tool_result",
+            source=EvidenceSource.DOMAIN_TOOL_OUTPUT.value,
             tool_name=tool_call.name,
             latency_ms=latency_ms,
             payload={
@@ -345,15 +346,46 @@ class StageGateController:
         is_agent: bool,
         tick_id: Optional[int] = None,
     ) -> None:
-        """Record agent-visible participant text for validation state."""
+        """Record legacy assistant text and reject audio-native user chunk text."""
+        if is_agent:
+            self.record_assistant_utterance(message, tick_id=tick_id)
+            return
+        raise ValueError(
+            "Audio-native UserMessage.content is simulator gold text and cannot "
+            "be used as StageGate runtime evidence."
+        )
+
+    def record_assistant_utterance(
+        self,
+        message: Message,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Record assistant utterance text from model output."""
         validator = self._active_validator()
         if validator is None:
             return
         content = getattr(message, "content", None)
-        validator.record_visible_message(
-            role="assistant" if is_agent else "user",
+        validator.record_assistant_utterance(
             content=content,
             tick_index=tick_id,
+            source=EvidenceSource.ASSISTANT_UTTERANCE,
+        )
+
+    def record_agent_visible_user_transcript(
+        self,
+        transcript: str,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Record user transcript only when the adapter exposes it to the model path."""
+        validator = self._active_validator()
+        if validator is None:
+            return
+        validator.record_user_confirmation_evidence(
+            content=transcript,
+            tick_index=tick_id,
+            source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
         )
 
     def validate_tool_call(

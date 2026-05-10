@@ -19,6 +19,7 @@ from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
 from tau2.voice.audio_native.openai.stagegate import (
     EntityLedger,
+    EvidenceSource,
     LedgerStatus,
     PreWriteValidator,
     StageGateController,
@@ -259,12 +260,11 @@ def _prepare_validated_account_change(
         ),
         tick_id=1,
     )
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
             "This will change the account plan status."
         ),
-        is_agent=True,
         tick_id=0,
     )
 
@@ -403,7 +403,7 @@ def test_ledger_updates_from_visible_model_tool_arguments():
     order_slot = controller.ledger.slots["order_id"]
     assert order_slot.status is LedgerStatus.HEARD_NOT_CONFIRMED
     assert order_slot.value == "O-12345"
-    assert order_slot.evidence[-1].source == "model_tool_args"
+    assert order_slot.evidence[-1].source == EvidenceSource.MODEL_TOOL_ARGUMENT.value
     assert order_slot.evidence[-1].event_id == "call_cancel"
     assert order_slot.evidence[-1].tick_index == 9
     assert controller.ledger.slots["return_reason"].value == "ordered by mistake"
@@ -596,7 +596,7 @@ def test_ledger_update_trace_events_are_emitted(monkeypatch, tmp_path):
         "ledger_update",
     ]
     ledger_event = events[1]
-    assert ledger_event["source"] == "model_tool_args"
+    assert ledger_event["source"] == EvidenceSource.MODEL_TOOL_ARGUMENT.value
     assert ledger_event["visible_to_agent"] is True
     assert ledger_event["tick_index"] == 7
     assert ledger_event["ledger_delta"]["account_id"]["status"] == (
@@ -660,6 +660,50 @@ def test_stage_only_does_not_block_normal_domain_tools():
     assert orchestrator.num_errors == 0
 
 
+def test_baseline_trace_jsonl_does_not_route_tools_through_stagegate(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(tmp_path / "trace_events.jsonl"))
+    environment = _environment()
+    controller = StageGateController(
+        condition="baseline",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    tool_call = ToolCall(
+        id="call_write",
+        name="update_account",
+        arguments={"account_id": "acct_123", "plan_name": "premium"},
+    )
+    agent = ScriptedStageGateAgent(controller, tool_call)
+    orchestrator.agent = agent
+
+    def fail_stagegate_execution(*args, **kwargs):
+        raise AssertionError("baseline routed through StageGate wrapper")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_execute_stagegate_tool_call",
+        fail_stagegate_execution,
+    )
+
+    _, _, _, tool_results = orchestrator._process_participant_turn(
+        participant=agent,
+        state=SimpleNamespace(),
+        incoming_chunk=None,
+        is_agent=True,
+        pending_tool_results=None,
+        tick_id=1,
+    )
+
+    assert tool_results[0].error is False
+    assert json.loads(tool_results[0].content)["plan_name"] == "premium"
+    assert environment.tools.write_count == 1
+
+
 def test_validator_never_mutates_domain_state_when_blocking():
     environment = _environment()
     controller = StageGateController(
@@ -708,12 +752,11 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
         ),
         tick_id=1,
     )
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
             "This will change the account plan status."
         ),
-        is_agent=True,
         tick_id=2,
     )
 
@@ -760,19 +803,14 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     assert read_result.error is False
     assert json.loads(read_result.content)["account_id"] == "acct_123"
 
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
             "This will change the account plan status."
         ),
-        is_agent=True,
         tick_id=2,
     )
-    controller.record_visible_message(
-        UserMessage.text("Yes, I confirm."),
-        is_agent=False,
-        tick_id=3,
-    )
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -814,19 +852,14 @@ def test_service_task_ref_preserves_mock_task_write_validation():
     assert user_result.error is False
     assert task_result.error is False
 
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update service task service_task_1 to completed. "
             "This will change the service task status."
         ),
-        is_agent=True,
         tick_id=3,
     )
-    controller.record_visible_message(
-        UserMessage.text("Yes, I confirm."),
-        is_agent=False,
-        tick_id=4,
-    )
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=4)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -845,6 +878,29 @@ def test_service_task_ref_preserves_mock_task_write_validation():
     assert controller.validator.state.verified_identifiers["service_task_ref"] == {
         "service_task_1"
     }
+
+
+def test_clean_user_message_content_is_rejected_as_runtime_evidence():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    with pytest.raises(ValueError, match="simulator gold text"):
+        controller.record_visible_message(
+            UserMessage.text("Yes, I confirm."),
+            is_agent=False,
+            tick_id=4,
+        )
+
+    assert all(
+        slot.status is not LedgerStatus.USER_CONFIRMED
+        for slot in controller.ledger.slots.values()
+    )
+    assert controller.validator.state.last_user_confirmation is None
 
 
 def test_same_tick_user_confirmation_cannot_satisfy_validator():
@@ -873,7 +929,7 @@ def test_same_tick_user_confirmation_cannot_satisfy_validator():
     assert environment.tools.write_count == 0
 
 
-def test_next_tick_user_confirmation_becomes_visible_to_validator():
+def test_next_tick_clean_user_content_does_not_satisfy_validator():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -897,8 +953,53 @@ def test_next_tick_user_confirmation_becomes_visible_to_validator():
 
     second_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
     assert orchestrator.agent.received_chunks[-1].content == "Yes, I confirm."
-    assert second_tick_result.error is False
-    assert json.loads(second_tick_result.content)["plan_name"] == "premium"
+    assert second_tick_result.error is True
+    assert json.loads(second_tick_result.content)["missing_facts"] == [
+        "missing_confirmation"
+    ]
+    assert environment.tools.write_count == 0
+
+
+def test_agent_visible_user_transcript_satisfies_confirmation():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tick_id=1,
+    )
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will update account acct_123 to premium. "
+            "This will change the account plan status."
+        ),
+        tick_id=2,
+    )
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_write",
+            name="update_account",
+            arguments={"account_id": "acct_123", "plan_name": "premium"},
+        ),
+        tick_id=4,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["plan_name"] == "premium"
     assert environment.tools.write_count == 1
 
 
@@ -928,8 +1029,7 @@ def test_validator_uses_confirmation_only_after_visible_recording():
         ),
         tick_index=1,
     )
-    validator.record_visible_message(
-        role="assistant",
+    validator.record_assistant_utterance(
         content=(
             "I will update account acct_123 to premium. "
             "This will change the account plan status."
@@ -938,16 +1038,82 @@ def test_validator_uses_confirmation_only_after_visible_recording():
     )
 
     before_delivery = validator.validate(write_call)
-    validator.record_visible_message(
-        role="user",
+    validator.record_user_confirmation_evidence(
         content="Yes, I confirm.",
         tick_index=3,
+        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
     after_delivery = validator.validate(write_call)
 
     assert before_delivery.decision == "block"
     assert before_delivery.reason == "missing_confirmation"
     assert after_delivery.decision == "allow"
+
+
+def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
+    environment = _environment()
+    validator = PreWriteValidator(
+        domain_name="mock",
+        domain_policy="Public policy.",
+        tools=environment.get_tools(),
+    )
+    write_call = ToolCall(
+        id="call_write",
+        name="update_account",
+        arguments={"account_id": "acct_123", "plan_name": "premium"},
+    )
+    validator.record_tool_result(
+        tool_call=ToolCall(
+            id="call_read",
+            name="get_account",
+            arguments={"account_id": "acct_123"},
+        ),
+        tool_result=ToolMessage(
+            id="call_read",
+            role="tool",
+            content=json.dumps({"account_id": "acct_123", "status": "active"}),
+            error=False,
+        ),
+        tick_index=1,
+    )
+    validator.record_assistant_utterance(
+        content=(
+            "I will update account acct_123 to premium. "
+            "This will change the account plan status."
+        ),
+        tick_index=2,
+    )
+    validator.record_user_confirmation_evidence(
+        content="Yes, I confirm.",
+        tick_index=3,
+        source=EvidenceSource.MODEL_TOOL_ARGUMENT,
+    )
+
+    decision = validator.validate(write_call)
+
+    assert decision.decision == "block"
+    assert decision.reason == "missing_confirmation"
+
+
+def test_forbidden_oracle_evidence_sources_are_rejected_at_runtime():
+    validator = PreWriteValidator(
+        domain_name="mock",
+        domain_policy="Public policy.",
+        tools=_environment().get_tools(),
+    )
+
+    with pytest.raises(ValueError, match="simulator_gold_text"):
+        validator.record_user_confirmation_evidence(
+            content="Yes, I confirm.",
+            tick_index=1,
+            source=EvidenceSource.SIMULATOR_GOLD_TEXT,
+        )
+    with pytest.raises(ValueError, match="posthoc_oracle"):
+        validator.record_user_confirmation_evidence(
+            content="Yes, I confirm.",
+            tick_index=1,
+            source=EvidenceSource.POSTHOC_ORACLE,
+        )
 
 
 def test_confirmation_requires_exact_identifier_mention():
@@ -969,19 +1135,14 @@ def test_confirmation_requires_exact_identifier_mention():
         ),
         tick_id=1,
     )
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_1234 to premium. "
             "This will change the account plan status."
         ),
-        is_agent=True,
         tick_id=2,
     )
-    controller.record_visible_message(
-        UserMessage.text("Yes, I confirm."),
-        is_agent=False,
-        tick_id=3,
-    )
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1018,16 +1179,11 @@ def test_action_statement_requires_consequence():
         ),
         tick_id=1,
     )
-    controller.record_visible_message(
+    controller.record_assistant_utterance(
         AssistantMessage.text("I will update account acct_123 to premium."),
-        is_agent=True,
         tick_id=2,
     )
-    controller.record_visible_message(
-        UserMessage.text("Yes, I confirm."),
-        is_agent=False,
-        tick_id=3,
-    )
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1141,11 +1297,14 @@ def test_stagegate_runtime_does_not_read_oracle_outcome_fields():
     repo_root = Path(__file__).resolve().parents[2]
     runtime_root = repo_root / "src/tau2/voice/audio_native/openai/stagegate"
     forbidden = {
+        "build_outcome_rows",
         "reward_info",
         "reward_breakdown",
         "reward",
         "evaluator_result",
+        "stagegate_posthoc_outcomes",
         "trace_final_outcome",
+        "write_jsonl",
     }
 
     matches = []
@@ -1189,18 +1348,17 @@ def test_policy_preconditions_require_all_required_visible_fields():
         ),
         tick_index=1,
     )
-    validator.record_visible_message(
-        role="assistant",
+    validator.record_assistant_utterance(
         content=(
             "I will send payment request for customer C1 and bill B1. "
             "This will change the bill status to awaiting payment."
         ),
         tick_index=2,
     )
-    validator.record_visible_message(
-        role="user",
+    validator.record_user_confirmation_evidence(
         content="Yes, I confirm.",
         tick_index=3,
+        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
     write_call = ToolCall(
         id="call_payment",

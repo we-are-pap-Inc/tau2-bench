@@ -8,8 +8,10 @@ from tau2.voice.audio_native.openai.stagegate.ledger import (
     LedgerStatus,
 )
 from tau2.voice.audio_native.openai.stagegate.stage_schema import (
+    EvidenceSource,
     StagePacket,
     TraceEvent,
+    ensure_runtime_evidence_source,
 )
 from tau2.voice.audio_native.openai.stagegate.validator import (
     PreWriteValidator,
@@ -18,6 +20,7 @@ from tau2.voice.audio_native.openai.stagegate.validator import (
 
 __all__ = [
     "EntityLedger",
+    "EvidenceSource",
     "LedgerEvidence",
     "LedgerSlot",
     "LedgerStatus",
@@ -26,4 +29,5 @@ __all__ = [
     "StagePacket",
     "TraceEvent",
     "ValidatorDecision",
+    "ensure_runtime_evidence_source",
 ]

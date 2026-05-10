@@ -18,6 +18,30 @@ StageOnly and StageGate are custom submissions because they add orchestration to
 - server state derived from the above
 - `benchmark_task_id` as trace/posthoc metadata only
 
+## Runtime evidence sources
+
+StageGate runtime state must be derived only from explicitly classified
+agent-visible sources:
+
+- `AGENT_VISIBLE_TRANSCRIPT`: provider or adapter transcript events that are
+  demonstrably exposed to the model path.
+- `MODEL_TOOL_ARGUMENT`: model-emitted function call names and arguments. These
+  are model belief, not confirmed user truth.
+- `DOMAIN_TOOL_OUTPUT`: successful official domain-tool outputs.
+- `ASSISTANT_UTTERANCE`: model output used to detect action summaries.
+
+The following sources are forbidden in runtime StageGate controller, ledger, or
+validator state:
+
+- `SIMULATOR_GOLD_TEXT`: clean user simulator text, including
+  `UserMessage.content` carried on audio-native user chunks when the agent only
+  receives `user_audio`.
+- `POSTHOC_ORACLE`: reward, evaluator, expected-state, task-outcome, or
+  posthoc outcome-analysis data.
+
+Posthoc analysis scripts may read oracle data after a run, but those scripts
+must remain separate from runtime StageGate imports and traces.
+
 ## Forbidden harness inputs
 
 - hidden task objective
@@ -56,6 +80,13 @@ The validator must not:
 - call domain tools itself unless the original model tool call has passed validation;
 - infer the expected answer from hidden task data;
 - use task ID to choose special-case logic.
+- treat simulator/gold user text as confirmation.
+- satisfy confirmation from model tool arguments alone.
+
+For audio-native runs, user confirmation is present only when an
+`AGENT_VISIBLE_TRANSCRIPT` event after the assistant action summary contains
+confirmation language. If no such transcript exists, the validator must block
+write actions requiring confirmation with `missing_confirmation`.
 
 ## Identifier naming
 
