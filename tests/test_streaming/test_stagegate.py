@@ -338,10 +338,14 @@ def test_stagegate_agent_adds_advance_stage_only_when_enabled(monkeypatch):
     agent.get_init_state()
 
     tool_names = [tool.name for tool in adapter.connect.call_args.kwargs["tools"]]
+    system_prompt = adapter.connect.call_args.kwargs["system_prompt"]
     assert tool_names == ["_test_tool", "advance_stage"]
+    assert "StageGate operating rules" in system_prompt
     assert (
-        "StageGate operating rules" in adapter.connect.call_args.kwargs["system_prompt"]
+        "call advance_stage before the first customer-specific domain tool call"
+        in system_prompt
     )
+    assert "include only facts visible in the conversation" in system_prompt
 
 
 def test_stagegate_agent_leaves_baseline_tools_unchanged(monkeypatch):
@@ -405,9 +409,12 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
     agent.get_init_state()
 
     tool_names = [tool.name for tool in adapter.connect.call_args.kwargs["tools"]]
+    system_prompt = adapter.connect.call_args.kwargs["system_prompt"]
     assert tool_names == ["_test_tool", "advance_stage"]
+    assert "StageGate operating rules" in system_prompt
     assert (
-        "StageGate operating rules" in adapter.connect.call_args.kwargs["system_prompt"]
+        "call advance_stage before the first customer-specific domain tool call"
+        in system_prompt
     )
     assert hasattr(agent.stagegate_controller, "ledger")
     assert hasattr(agent.stagegate_controller, "validator")

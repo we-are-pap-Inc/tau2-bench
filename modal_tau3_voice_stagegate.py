@@ -15,6 +15,7 @@ from scripts.stagegate_modal_runner_config import (
     DEFAULT_REPO_URL,
     DEFAULT_SECRET_NAME,
     REQUIRED_PROVIDER_SECRET_KEYS,
+    SpawnedStageGateCall,
     StageGateJob,
     artifact_dir,
     collect_completed_manifest,
@@ -31,6 +32,7 @@ from scripts.stagegate_modal_runner_config import (
     utc_now_iso,
     validate_condition,
     validate_domain,
+    wait_for_stagegate_calls,
     write_json,
 )
 
@@ -63,6 +65,7 @@ image = (
             "PATH": "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         }
     )
+    .add_local_python_source("scripts")
 )
 
 
@@ -134,6 +137,15 @@ def run_domain(
     workdir = Path("/tmp/tau2-bench")
     artifacts = Path(artifact_dir(batch_id, job))
     artifacts.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Starting StageGate Modal job condition=%s domain=%s batch_id=%s "
+        "repo_ref=%s artifact_dir=%s",
+        job.condition,
+        job.domain,
+        batch_id,
+        repo_ref,
+        artifacts,
+    )
 
     resolved_commit_sha: str | None = None
     status = "running"
@@ -169,6 +181,13 @@ def run_domain(
         env["TAU2_STAGEGATE_CONDITION"] = condition
         env["TAU2_TRACE_JSONL"] = trace_jsonl_path(batch_id, job)
         env["TAU2_TRACE_RUN_ID"] = trace_run_id(batch_id, job)
+        logger.info(
+            "Trace configured condition=%s domain=%s trace_jsonl=%s trace_run_id=%s",
+            job.condition,
+            job.domain,
+            env["TAU2_TRACE_JSONL"],
+            env["TAU2_TRACE_RUN_ID"],
+        )
 
         tau2_argv = command_metadata(
             batch_id=batch_id,
@@ -177,6 +196,12 @@ def run_domain(
             resolved_commit_sha=resolved_commit_sha,
             job=job,
         )["sanitized_command_argv"]
+        logger.info(
+            "Generated tau2 command condition=%s domain=%s command=%s",
+            job.condition,
+            job.domain,
+            command_to_log(tau2_argv),
+        )
         _run_logged(tau2_argv, cwd=workdir, env=env)
 
         source_simulation_dir = (
@@ -226,6 +251,7 @@ def run_domain(
 
 
 @app.function(
+    image=image,
     secrets=[
         modal.Secret.from_name(
             SECRET_NAME,
@@ -322,6 +348,10 @@ def launch(
     logger.info("Prepared %s %s job(s)", len(jobs), mode)
 
     if dry_run:
+        logger.info(
+            "Dry run only; live execution would use blocking/waiting mode "
+            "via Modal FunctionCall.get() for every scheduled job"
+        )
         for job in jobs:
             logger.info(
                 "Dry run job %s/%s: %s",
@@ -339,7 +369,7 @@ def launch(
             )
         return
 
-    calls = []
+    calls: list[SpawnedStageGateCall] = []
     for job in jobs:
         call = run_domain.spawn(
             job.condition,
@@ -349,12 +379,24 @@ def launch(
             repo_url,
             mode,
         )
-        calls.append(call)
+        function_call_id = getattr(call, "object_id", None)
+        calls.append(
+            SpawnedStageGateCall(
+                job=job,
+                function_call_id=function_call_id,
+                call=call,
+            )
+        )
         logger.info(
             "Spawned %s/%s function_call_id=%s",
             job.condition,
             job.domain,
-            getattr(call, "object_id", None),
+            function_call_id,
         )
 
-    logger.info("Launched %s job(s)", len(calls))
+    logger.info(
+        "Launched %s job(s); blocking until every Modal FunctionCall.get() completes",
+        len(calls),
+    )
+    wait_for_stagegate_calls(calls, log=logger)
+    logger.info("All %s StageGate Modal job(s) completed", len(calls))

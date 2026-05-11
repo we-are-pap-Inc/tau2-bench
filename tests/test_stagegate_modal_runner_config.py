@@ -17,6 +17,7 @@ from scripts.stagegate_modal_runner_config import (
     REQUIRED_PROVIDER_SECRET_KEYS,
     REQUIRED_REGULAR_VOICE_ID_KEYS,
     SMOKE_CONSTANTS,
+    SpawnedStageGateCall,
     StageGateJob,
     build_tau2_command,
     check_modal_preflight,
@@ -33,11 +34,25 @@ from scripts.stagegate_modal_runner_config import (
     trace_run_id,
     validate_final_command,
     validate_smoke_command,
+    wait_for_stagegate_calls,
     write_json,
     write_planned_manifest,
 )
 
 COMMIT_SHA = "1910fe2998f230bda6f6ad1b69edef4124275d63"
+
+
+class FakeBlockingCall:
+    def __init__(self, result=None, exc: Exception | None = None):
+        self.result = result
+        self.exc = exc
+        self.get_calls = 0
+
+    def get(self):
+        self.get_calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.result
 
 
 def test_final_matrix_is_exact_condition_domain_product():
@@ -245,6 +260,58 @@ def test_command_metadata_contains_sanitized_argv_only():
     assert "DEEPGRAM_API_KEY" not in metadata["sanitized_command"]
 
 
+def test_wait_for_stagegate_calls_blocks_on_every_scheduled_job():
+    jobs = planned_jobs(mode="smoke")
+    fake_calls = [
+        FakeBlockingCall(result={"status": "succeeded", "condition": job.condition})
+        for job in jobs
+    ]
+    spawned = [
+        SpawnedStageGateCall(
+            job=job,
+            function_call_id=f"fc-{index}",
+            call=fake_call,
+        )
+        for index, (job, fake_call) in enumerate(zip(jobs, fake_calls))
+    ]
+
+    results = wait_for_stagegate_calls(spawned)
+
+    assert len(results) == 3
+    assert [result["condition"] for result in results] == [
+        "baseline",
+        "stage_only",
+        "stagegate",
+    ]
+    assert [fake_call.get_calls for fake_call in fake_calls] == [1, 1, 1]
+
+
+def test_wait_for_stagegate_calls_waits_all_jobs_before_raising():
+    jobs = planned_jobs(mode="smoke")
+    fake_calls = [
+        FakeBlockingCall(exc=RuntimeError("first failure")),
+        FakeBlockingCall(result={"status": "succeeded"}),
+        FakeBlockingCall(exc=ValueError("third failure")),
+    ]
+    spawned = [
+        SpawnedStageGateCall(
+            job=job,
+            function_call_id=f"fc-{index}",
+            call=fake_call,
+        )
+        for index, (job, fake_call) in enumerate(zip(jobs, fake_calls))
+    ]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        wait_for_stagegate_calls(spawned)
+
+    assert [fake_call.get_calls for fake_call in fake_calls] == [1, 1, 1]
+    message = str(exc_info.value)
+    assert "2 StageGate Modal job(s) failed" in message
+    assert "baseline/retail function_call_id=fc-0" in message
+    assert "stagegate/retail function_call_id=fc-2" in message
+
+
 def test_write_planned_manifest_is_plan_only_and_final_hygiene_clean(tmp_path: Path):
     output = tmp_path / "batch_manifest_planned.json"
 
@@ -407,6 +474,25 @@ def test_modal_runner_has_remote_secret_key_preflight_without_env_reads():
     )
     assert "verify_secret_keys_only" in source
     assert "REQUIRED_PROVIDER_SECRET_KEYS" in source
+
+
+def test_modal_runner_waits_for_spawned_calls_before_entrypoint_exits():
+    source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
+
+    assert "run_domain.spawn(" in source
+    assert "wait_for_stagegate_calls(calls, log=logger)" in source
+    assert source.index("run_domain.spawn(") < source.index(
+        "wait_for_stagegate_calls(calls, log=logger)"
+    )
+    assert "FunctionCall.get()" in source
+    assert "blocking/waiting mode" in source
+
+
+def test_modal_runner_packages_config_helpers_for_remote_import():
+    source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
+
+    assert '.add_local_python_source("scripts")' in source
+    assert "@app.function(\n    image=image,\n    secrets=[" in source
 
 
 def test_modal_job_function_does_not_write_shared_batch_manifest():

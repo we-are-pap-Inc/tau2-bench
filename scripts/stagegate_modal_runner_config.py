@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 Condition = Literal["baseline", "stage_only", "stagegate"]
 Domain = Literal["retail", "airline", "telecom"]
@@ -82,6 +82,22 @@ class StageGateJob:
     condition: Condition
     domain: Domain
     mode: RunMode
+
+
+class BlockingModalCall(Protocol):
+    """Minimal Modal FunctionCall surface needed by the local launcher."""
+
+    def get(self) -> Any:
+        """Block until the remote call finishes and return its result."""
+
+
+@dataclass(frozen=True)
+class SpawnedStageGateCall:
+    """A spawned Modal call plus the StageGate job it represents."""
+
+    job: StageGateJob
+    function_call_id: str | None
+    call: BlockingModalCall
 
 
 def utc_now_iso() -> str:
@@ -241,6 +257,68 @@ def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
 def command_to_log(argv: list[str]) -> str:
     """Return shell-quoted command text for logs without secrets."""
     return shlex.join(argv)
+
+
+def wait_for_stagegate_calls(
+    calls: list[SpawnedStageGateCall],
+    *,
+    log: logging.Logger | None = None,
+) -> list[Any]:
+    """Wait for every spawned StageGate Modal call before returning."""
+    active_logger = log or logger
+    results: list[Any] = []
+    failures: list[tuple[SpawnedStageGateCall, BaseException]] = []
+
+    active_logger.info(
+        "Waiting for %s StageGate Modal job(s) to complete before exiting",
+        len(calls),
+    )
+    for spawned in calls:
+        job = spawned.job
+        call_id = spawned.function_call_id or "unknown"
+        active_logger.info(
+            "Waiting for StageGate Modal job condition=%s domain=%s "
+            "function_call_id=%s",
+            job.condition,
+            job.domain,
+            call_id,
+        )
+        try:
+            result = spawned.call.get()
+        except Exception as exc:
+            failures.append((spawned, exc))
+            active_logger.exception(
+                "StageGate Modal job failed condition=%s domain=%s function_call_id=%s",
+                job.condition,
+                job.domain,
+                call_id,
+            )
+        else:
+            results.append(result)
+            active_logger.info(
+                "StageGate Modal job completed condition=%s domain=%s "
+                "function_call_id=%s",
+                job.condition,
+                job.domain,
+                call_id,
+            )
+
+    if failures:
+        failure_summaries = []
+        for spawned, exc in failures:
+            job = spawned.job
+            call_id = spawned.function_call_id or "unknown"
+            detail = str(exc) or type(exc).__name__
+            failure_summaries.append(
+                f"{job.condition}/{job.domain} function_call_id={call_id}: "
+                f"{type(exc).__name__}: {detail}"
+            )
+        raise RuntimeError(
+            f"{len(failures)} StageGate Modal job(s) failed: "
+            + "; ".join(failure_summaries)
+        ) from failures[0][1]
+
+    return results
 
 
 def validate_no_task_filters(argv: list[str]) -> None:

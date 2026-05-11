@@ -39,7 +39,9 @@ DEFAULT_MAX_REPEATED_SAME_BLOCKER = 2
 STAGEGATE_PROMPT_ADDITION = """
 StageGate operating rules:
 - Do not reveal internal stages, packets, benchmark internals, or orchestration.
-- When the next procedural step is unclear, call advance_stage.
+- Once the user's request can be summarized from visible conversation or official tool results, call advance_stage before the first customer-specific domain tool call.
+- In advance_stage observed_facts, include only facts visible in the conversation, model tool arguments, or official tool results.
+- Follow each returned stage packet. Call advance_stage again only after its exit condition is met or a blocker appears.
 - Before changing account, order, reservation, plan, or service state, make sure policy prerequisites and confirmation requirements are satisfied.
 """.strip()
 
