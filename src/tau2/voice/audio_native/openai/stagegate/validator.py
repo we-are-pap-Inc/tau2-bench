@@ -143,21 +143,32 @@ ACTION_WORDS = {
     "disable",
     "enable",
     "exchange",
+    "exchanging",
     "modify",
     "refund",
     "resume",
     "return",
     "send",
+    "submit",
     "suspend",
+    "swap",
+    "swapped",
     "update",
 }
 
 CONSEQUENCE_WORDS = {
+    "card",
     "charge",
     "cost",
+    "credit",
+    "difference",
+    "email",
     "fee",
+    "instruction",
+    "instructions",
     "paid",
     "payment",
+    "price",
     "refund",
     "request",
     "status",
@@ -165,10 +176,15 @@ CONSEQUENCE_WORDS = {
 
 CONFIRMATION_PATTERNS = (
     re.compile(r"\b(confirm|confirmed|yes|yep|yeah|correct|proceed)\b", re.I),
-    re.compile(r"\b(go ahead|sounds good|that's right|that is right)\b", re.I),
+    re.compile(
+        r"\b(go ahead|please do|sounds good|that's right|that is right|okay,? do it)\b",
+        re.I,
+    ),
 )
 
 NEGATIVE_CONFIRMATION_PATTERN = re.compile(r"\b(no|don't|do not|stop|wait)\b", re.I)
+ASSISTANT_UTTERANCE_BUFFER_CHARS = 6000
+MAX_EVIDENCE_RECORDS = 30
 
 
 class ValidatorDecision(BaseModel):
@@ -210,11 +226,32 @@ class InspectionRecord:
 
 
 @dataclass
+class ActionSummaryEvidence:
+    """Visible assistant evidence for one pending side-effecting action."""
+
+    content: str
+    tick_index: Optional[int]
+    source: EvidenceSource
+
+
+@dataclass
+class UserConfirmationEvidence:
+    """Visible user evidence for confirming a pending action summary."""
+
+    content: str
+    tick_index: Optional[int]
+    source: EvidenceSource
+
+
+@dataclass
 class VisibleConversationState:
     """Validator state derived only from agent-visible conversation events."""
 
     read_inspections: list[InspectionRecord] = field(default_factory=list)
     verified_identifiers: dict[str, set[str]] = field(default_factory=dict)
+    assistant_utterance_buffer: str = ""
+    action_summaries: list[ActionSummaryEvidence] = field(default_factory=list)
+    user_confirmations: list[UserConfirmationEvidence] = field(default_factory=list)
     last_action_statement: Optional[str] = None
     last_action_statement_tick: Optional[int] = None
     last_action_statement_source: Optional[EvidenceSource] = None
@@ -256,6 +293,7 @@ class PreWriteValidator:
             )
 
         requirement = self.requirement_for_tool(tool_call.name)
+        matching_summary = self._matching_action_summary(tool_call, requirement)
         checks: dict[str, bool] = {
             "side_effecting_tool": True,
             "tool_arguments_complete": self._arguments_complete(tool_call),
@@ -274,8 +312,15 @@ class PreWriteValidator:
                 tool_call,
                 requirement,
             ),
-            "assistant_stated_action": self._assistant_stated_action(requirement),
-            "user_confirmed": self._user_confirmed(tool_call, requirement),
+            "assistant_stated_action": self._assistant_stated_action(
+                requirement,
+                matching_summary,
+            ),
+            "user_confirmed": self._user_confirmed(
+                tool_call,
+                requirement,
+                matching_summary=matching_summary,
+            ),
         }
         reason_by_check = {
             "tool_arguments_complete": "incomplete_tool_arguments",
@@ -327,10 +372,16 @@ class PreWriteValidator:
             raise ValueError(
                 "assistant action evidence must use ASSISTANT_UTTERANCE source"
             )
-        if looks_like_action_statement(content):
-            self.state.last_action_statement = content
-            self.state.last_action_statement_tick = tick_index
-            self.state.last_action_statement_source = source
+        self.state.assistant_utterance_buffer = trim_text(
+            f"{self.state.assistant_utterance_buffer}{content}",
+            max_chars=ASSISTANT_UTTERANCE_BUFFER_CHARS,
+        )
+        if looks_like_action_statement(self.state.assistant_utterance_buffer):
+            self._record_action_summary(
+                content=self.state.assistant_utterance_buffer,
+                tick_index=tick_index,
+                source=source,
+            )
 
     def record_user_confirmation_evidence(
         self,
@@ -346,9 +397,19 @@ class PreWriteValidator:
         if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
             return
         if looks_like_user_confirmation(content):
+            evidence = UserConfirmationEvidence(
+                content=content,
+                tick_index=tick_index,
+                source=source,
+            )
+            self.state.user_confirmations.append(evidence)
+            self.state.user_confirmations = self.state.user_confirmations[
+                -MAX_EVIDENCE_RECORDS:
+            ]
             self.state.last_user_confirmation = content
             self.state.last_user_confirmation_tick = tick_index
             self.state.last_user_confirmation_source = source
+        self.state.assistant_utterance_buffer = ""
 
     def record_tool_result(
         self,
@@ -517,34 +578,153 @@ class PreWriteValidator:
             for inspection in self.state.read_inspections
         )
 
-    def _assistant_stated_action(self, requirement: ActionRequirement) -> bool:
+    def _record_action_summary(
+        self,
+        *,
+        content: str,
+        tick_index: Optional[int],
+        source: EvidenceSource,
+    ) -> None:
+        summary = ActionSummaryEvidence(
+            content=content,
+            tick_index=tick_index,
+            source=source,
+        )
+        self.state.action_summaries.append(summary)
+        self.state.action_summaries = self.state.action_summaries[
+            -MAX_EVIDENCE_RECORDS:
+        ]
+        self.state.last_action_statement = content
+        self.state.last_action_statement_tick = tick_index
+        self.state.last_action_statement_source = source
+
+    def _assistant_stated_action(
+        self,
+        requirement: ActionRequirement,
+        matching_summary: Optional[ActionSummaryEvidence],
+    ) -> bool:
         if not requirement.requires_action_statement:
             return True
-        return self.state.last_action_statement is not None
+        return matching_summary is not None
 
     def _user_confirmed(
         self,
         tool_call: ToolCall,
         requirement: ActionRequirement,
+        *,
+        matching_summary: Optional[ActionSummaryEvidence],
     ) -> bool:
         if not requirement.requires_user_confirmation:
             return True
-        if (
-            self.state.last_action_statement_tick is None
-            or self.state.last_user_confirmation_tick is None
+        if matching_summary is None or matching_summary.tick_index is None:
+            return False
+        return any(
+            confirmation.source is EvidenceSource.AGENT_VISIBLE_TRANSCRIPT
+            and confirmation.tick_index is not None
+            and confirmation.tick_index > matching_summary.tick_index
+            for confirmation in self.state.user_confirmations
+        )
+
+    def _matching_action_summary(
+        self,
+        tool_call: ToolCall,
+        requirement: ActionRequirement,
+    ) -> Optional[ActionSummaryEvidence]:
+        if not requirement.requires_action_statement:
+            return None
+        for summary in reversed(self.state.action_summaries):
+            if self._action_summary_matches_tool_call(summary, tool_call, requirement):
+                return summary
+        return None
+
+    def _action_summary_matches_tool_call(
+        self,
+        summary: ActionSummaryEvidence,
+        tool_call: ToolCall,
+        requirement: ActionRequirement,
+    ) -> bool:
+        if summary.source is not EvidenceSource.ASSISTANT_UTTERANCE:
+            return False
+        if not looks_like_action_statement(summary.content):
+            return False
+        if tool_call.name == "exchange_delivered_order_items":
+            return self._exchange_summary_matches_tool_call(summary.content, tool_call)
+        return self._action_statement_mentions_exact_args(
+            summary.content,
+            tool_call,
+            requirement,
+        )
+
+    def _exchange_summary_matches_tool_call(
+        self,
+        content: str,
+        tool_call: ToolCall,
+    ) -> bool:
+        normalized = normalize_value(content) or ""
+        if not re.search(
+            r"\b(exchange|exchanging|exchanged|swap|swapped)\b", normalized
         ):
             return False
-        if (
-            self.state.last_user_confirmation_source
-            is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT
-        ):
+        if not summary_requests_confirmation(normalized):
             return False
-        if (
-            self.state.last_user_confirmation_tick
-            < self.state.last_action_statement_tick
-        ):
+        if not self._summary_mentions_order_reference(normalized, tool_call):
             return False
-        return self._action_statement_mentions_exact_args(tool_call, requirement)
+        return self._summary_mentions_exchange_items(normalized, tool_call)
+
+    def _summary_mentions_order_reference(
+        self,
+        normalized_summary: str,
+        tool_call: ToolCall,
+    ) -> bool:
+        order_id = normalize_value(tool_call.arguments.get("order_id"))
+        if order_id and normalized_text_mentions_value(normalized_summary, order_id):
+            return True
+        return "order" in normalized_summary
+
+    def _summary_mentions_exchange_items(
+        self,
+        normalized_summary: str,
+        tool_call: ToolCall,
+    ) -> bool:
+        old_item_ids = {
+            normalize_value(value)
+            for value in iter_values(tool_call.arguments.get("item_ids"))
+        }
+        new_item_ids = {
+            normalize_value(value)
+            for value in iter_values(tool_call.arguments.get("new_item_ids"))
+        }
+        old_item_ids.discard(None)
+        new_item_ids.discard(None)
+        mentioned_old = {
+            value
+            for value in old_item_ids
+            if normalized_text_mentions_value(normalized_summary, value)
+        }
+        mentioned_new = {
+            value
+            for value in new_item_ids
+            if normalized_text_mentions_value(normalized_summary, value)
+        }
+        if mentioned_old and mentioned_new:
+            return True
+
+        target_values = old_item_ids | new_item_ids
+        descriptor_tokens = self._descriptor_tokens_for_values(target_values)
+        summary_tokens = meaningful_tokens(normalized_summary)
+        return len(summary_tokens & descriptor_tokens) >= 3
+
+    def _descriptor_tokens_for_values(self, normalized_values: set[str]) -> set[str]:
+        if not normalized_values:
+            return set()
+        tokens: set[str] = set()
+        for inspection in self.state.read_inspections:
+            for text in descriptor_strings_for_values(
+                inspection.payload,
+                normalized_values,
+            ):
+                tokens.update(meaningful_tokens(text))
+        return tokens
 
     def _is_value_verified(
         self,
@@ -595,17 +775,22 @@ class PreWriteValidator:
 
     def _action_statement_mentions_exact_args(
         self,
+        statement: str,
         tool_call: ToolCall,
         requirement: ActionRequirement,
     ) -> bool:
+        normalized_statement = normalize_value(statement)
+        if normalized_statement is None:
+            return False
         for arg_name in requirement.exact_args:
             values = list(self._tool_argument_values(tool_call, arg_name))
             if not values:
                 return False
             for value in values:
                 normalized = normalize_value(value)
-                if normalized is not None and not self._last_confirmed_action_mentions(
-                    normalized
+                if normalized is not None and not normalized_text_mentions_value(
+                    normalized_statement,
+                    normalized,
                 ):
                     return False
         return True
@@ -907,10 +1092,11 @@ def build_corrective_packet(
         allowed_read_tools=read_tools,
         allowed_write_tools=[],
         do_not=[
-            f"Do not call {tool_call.name} again until the missing prerequisite is satisfied."
+            f"Do not call {tool_call.name} again until the missing prerequisite is satisfied.",
+            "Do not call advance_stage before retrying the original write tool.",
         ],
         exit_condition="The missing prerequisite is visible in conversation, ledger, or official read-tool state.",
-        when_done="Call advance_stage or retry the original tool only after the corrective step is complete.",
+        when_done=f"After the user confirms, retry {tool_call.name} directly.",
     )
 
 
@@ -936,12 +1122,14 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     if reason == "missing_confirmation":
         return (
             f"Before making the change, summarize the intended {tool_call.name} "
-            "action and consequence, then ask the user for explicit confirmation."
+            "action and consequence, then ask the user for explicit confirmation. "
+            f"After the user confirms, retry {tool_call.name} directly."
         )
     if reason == "missing_action_summary":
         return (
-            "Tell the user exactly what will change and any consequence before "
-            "asking for confirmation."
+            "Restate exactly what will change and any consequence, ask for explicit "
+            f"confirmation, then retry {tool_call.name} directly after the user "
+            "confirms."
         )
     if reason == "missing_policy_state_inspection":
         return (
@@ -956,6 +1144,13 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     if reason == "ambiguous_tool_arguments":
         return "Ask one clarification question to resolve the ambiguous tool argument."
     return "Collect the missing required tool argument before retrying."
+
+
+def trim_text(text: str, *, max_chars: int) -> str:
+    """Keep only the recent transcript text needed for validator evidence."""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
 
 
 def looks_like_action_statement(content: str) -> bool:
@@ -973,6 +1168,91 @@ def looks_like_user_confirmation(content: str) -> bool:
     if NEGATIVE_CONFIRMATION_PATTERN.search(content):
         return False
     return any(pattern.search(content) for pattern in CONFIRMATION_PATTERNS)
+
+
+def summary_requests_confirmation(normalized_content: str) -> bool:
+    """Return whether an assistant summary asked the user to confirm/proceed."""
+    return any(
+        cue in normalized_content
+        for cue in (
+            "confirm",
+            "please reply yes",
+            "please say yes",
+            "say yes",
+            "reply yes",
+            "proceed",
+        )
+    )
+
+
+def meaningful_tokens(text: str) -> set[str]:
+    """Return compact content tokens for matching summaries to read-tool payloads."""
+    stopwords = {
+        "and",
+        "any",
+        "are",
+        "for",
+        "from",
+        "item",
+        "items",
+        "order",
+        "the",
+        "this",
+        "that",
+        "will",
+        "with",
+        "your",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in stopwords and not token.isdigit()
+    }
+
+
+def descriptor_strings_for_values(
+    payload: Any,
+    normalized_values: set[str],
+) -> list[str]:
+    """Collect string descriptors from payload objects containing target IDs."""
+    descriptors: list[str] = []
+    if isinstance(payload, dict):
+        if payload_contains_normalized_value(payload, normalized_values):
+            descriptors.extend(string_leaf_values(payload))
+        for value in payload.values():
+            descriptors.extend(descriptor_strings_for_values(value, normalized_values))
+    elif isinstance(payload, list):
+        for item in payload:
+            descriptors.extend(descriptor_strings_for_values(item, normalized_values))
+    return descriptors
+
+
+def payload_contains_normalized_value(
+    payload: dict[str, Any], values: set[str]
+) -> bool:
+    """Return whether a dictionary contains one of the target normalized values."""
+    for value in payload.values():
+        if isinstance(value, (dict, list)):
+            continue
+        normalized = normalize_value(value)
+        if normalized in values:
+            return True
+    return False
+
+
+def string_leaf_values(payload: Any) -> list[str]:
+    """Return all non-ID string leaves from a payload subtree."""
+    values: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if isinstance(value, str) and not key.lower().endswith("_id"):
+                values.append(value)
+            elif isinstance(value, (dict, list)):
+                values.extend(string_leaf_values(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(string_leaf_values(item))
+    return values
 
 
 def is_empty_value(value: Any) -> bool:

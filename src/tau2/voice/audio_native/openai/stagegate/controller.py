@@ -124,6 +124,8 @@ class StageGateController:
         self.last_stage_packet: Optional[dict[str, object]] = None
         self.last_validator_decision: Optional[dict[str, object]] = None
         self.last_corrective_packet: Optional[dict[str, object]] = None
+        self.last_blocked_side_effecting_tool: Optional[dict[str, object]] = None
+        self.last_successful_side_effecting_tool: Optional[dict[str, object]] = None
         if self.condition == "stagegate":
             self.ledger = EntityLedger.for_domain(domain_name)
             self.validator = PreWriteValidator(
@@ -224,6 +226,10 @@ class StageGateController:
         last_action = str(args.get("last_action", ""))
         blocker = args.get("blocker")
         blocker_text = str(blocker) if blocker is not None else None
+        forced_stage = self._forced_stage_for_advance(
+            current_stage=current_stage,
+            blocker=blocker_text,
+        )
 
         self._trace(
             "advance_stage_call",
@@ -248,6 +254,7 @@ class StageGateController:
             tools=self.session_tools(self.tools),
             domain_name=self.domain_name,
             ledger=self._active_ledger(),
+            forced_stage=forced_stage,
         )
         guard_reason = self._record_advance_stage_guard_state(
             packet=packet,
@@ -394,6 +401,18 @@ class StageGateController:
                 "tool_error": tool_result.error,
             },
         )
+        validator = self._active_validator()
+        if (
+            validator is not None
+            and not tool_result.error
+            and validator.is_side_effecting_tool(tool_call.name)
+        ):
+            self.last_successful_side_effecting_tool = {
+                "tool_name": tool_call.name,
+                "tool_call_id": tool_call.id,
+                "tick_index": tick_id,
+            }
+            self.last_blocked_side_effecting_tool = None
         ledger = self._active_ledger()
         if ledger is None or tool_result.error:
             return
@@ -409,7 +428,6 @@ class StageGateController:
             tool_name=tool_call.name,
             tick_id=tick_id,
         )
-        validator = self._active_validator()
         if validator is not None:
             validator.record_tool_result(
                 tool_call=tool_call,
@@ -511,6 +529,15 @@ class StageGateController:
             self.validator_allow_count += 1
         else:
             self.validator_block_count += 1
+            if decision.checks.get(
+                "side_effecting_tool"
+            ) is True or validator.is_side_effecting_tool(tool_call.name):
+                self.last_blocked_side_effecting_tool = {
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "tick_index": tick_id,
+                    "reason": decision.reason,
+                }
         self.last_validator_decision = {
             "tool_name": tool_call.name,
             "decision": decision.decision,
@@ -630,6 +657,10 @@ class StageGateController:
             "last_stage_packet": self.last_stage_packet,
             "last_validator_decision": self.last_validator_decision,
             "last_corrective_packet": self.last_corrective_packet,
+            "last_blocked_side_effecting_tool": self.last_blocked_side_effecting_tool,
+            "last_successful_side_effecting_tool": (
+                self.last_successful_side_effecting_tool
+            ),
         }
 
     def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
@@ -737,6 +768,22 @@ class StageGateController:
         else:
             self.stage_sequence.append(packet.stage)
         self.last_stage_packet = packet.model_dump(mode="json")
+
+    def _forced_stage_for_advance(
+        self,
+        *,
+        current_stage: str,
+        blocker: Optional[str],
+    ) -> Optional[str]:
+        if self.condition != "stagegate":
+            return None
+        if blocker is not None:
+            return None
+        if current_stage not in {"execute_write_action", "verify_result_and_close"}:
+            return None
+        if self.last_successful_side_effecting_tool is not None:
+            return None
+        return "execute_write_action"
 
 
 def _resolve_int_setting(

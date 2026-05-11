@@ -543,6 +543,24 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-09 task-ID isolation and final-run hygiene fix:
   `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
   result: passed.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after final formatting: `64 passed, 2 warnings in 0.17s`.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `make format`
+  result after final formatting: Ruff format left 329 files unchanged.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `make check-all`
+  result: Ruff check passed and Ruff format left 329 files unchanged.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `git diff --check`
+  result: passed with no whitespace errors.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/stagegate --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -623,6 +641,23 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
   treats slash-separated hint terms such as `payment/refund` as alternatives
   instead of requiring both terms to appear.
+- 2026-05-10 smoke_007 triage: The validator must aggregate assistant
+  proportional transcript fragments before detecting an action summary. In
+  smoke_007, the visible summary was split across many ticks, so per-fragment
+  matching failed and caused false `missing_action_summary` blocks.
+- 2026-05-10 smoke_007 triage: User confirmation remains valid only from
+  `AGENT_VISIBLE_TRANSCRIPT`, but natural confirmations such as `Yes`,
+  `Yeah`, `Yep`, `correct`, `go ahead`, `please do`, `proceed`, `sounds good`,
+  and `okay, do it` are accepted when they occur after the matching assistant
+  action summary.
+- 2026-05-10 smoke_007 triage: `advance_stage` is not allowed to advance from
+  `execute_write_action` to `verify_result_and_close` in StageGate unless a
+  side-effecting domain tool has actually returned successfully. Model-supplied
+  `observed_facts` cannot override the validator's blocked-write state.
+- 2026-05-10 smoke_007 triage: Retail item identifiers are split into semantic
+  slots for order items, candidate replacements, selected old items, and
+  selected new items. Product variant lists are not surfaced as user-facing
+  `item_id` ambiguities in closeout packets.
 
 ## Remaining Work
 

@@ -252,6 +252,10 @@ DOMAIN_SLOTS = {
         "phone",
         "order_id",
         "item_id",
+        "order_item_ids",
+        "candidate_replacement_item_ids",
+        "selected_old_item_ids",
+        "selected_new_item_ids",
         "return_reason",
         "refund_or_exchange_intent",
         "address",
@@ -288,7 +292,7 @@ FIELD_ALIASES = {
         "email": {"email"},
         "phone": {"phone", "phone_number"},
         "order_id": {"order_id"},
-        "item_id": {"item_id", "item_ids", "return_items", "exchange_items"},
+        "item_id": {"item_id"},
         "return_reason": {"return_reason", "reason", "cancel_reason"},
         "address": {"address", "new_address"},
         "payment_method": {
@@ -386,11 +390,14 @@ def extract_domain_facts(
 
     facts: dict[str, Any] = {}
     for slot, aliases in FIELD_ALIASES.get(domain, {}).items():
+        if domain == "retail" and slot == "item_id":
+            continue
         values = unique_values(values_by_key(payload, aliases))
         if values:
             facts[slot] = values[0] if len(values) == 1 else values
 
     if domain == "retail":
+        facts.update(retail_item_id_facts(tool_name=tool_name, payload=payload))
         names = unique_values(extract_names(payload))
         if names:
             facts["customer_name"] = names[0] if len(names) == 1 else names
@@ -426,6 +433,34 @@ def extract_domain_facts(
     return {
         field: value for field, value in facts.items() if field in DOMAIN_SLOTS[domain]
     }
+
+
+def retail_item_id_facts(*, tool_name: str, payload: Any) -> dict[str, Any]:
+    """Extract retail item identifiers into semantic slots."""
+    facts: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        if tool_name == "exchange_delivered_order_items":
+            old_ids = flat_unique_values(values_by_key(payload, {"item_ids"}))
+            new_ids = flat_unique_values(values_by_key(payload, {"new_item_ids"}))
+            if old_ids:
+                facts["selected_old_item_ids"] = old_ids
+            if new_ids:
+                facts["selected_new_item_ids"] = new_ids
+        elif tool_name == "return_delivered_order_items":
+            old_ids = flat_unique_values(values_by_key(payload, {"item_ids"}))
+            if old_ids:
+                facts["selected_old_item_ids"] = old_ids
+        elif tool_name == "get_order_details":
+            order_ids = flat_unique_values(
+                values_by_key(payload, {"item_id", "item_ids"})
+            )
+            if order_ids:
+                facts["order_item_ids"] = order_ids
+        elif tool_name == "get_product_details":
+            replacement_ids = flat_unique_values(values_by_key(payload, {"item_id"}))
+            if replacement_ids:
+                facts["candidate_replacement_item_ids"] = replacement_ids
+    return facts
 
 
 def values_by_key(payload: Any, aliases: set[str]) -> list[Any]:
@@ -546,6 +581,17 @@ def unique_values(values: list[Any]) -> list[Any]:
         seen.add(normalized)
         unique.append(value)
     return unique
+
+
+def flat_unique_values(values: list[Any]) -> list[Any]:
+    """Return unique scalar values from possibly nested list values."""
+    flattened: list[Any] = []
+    for value in values:
+        if isinstance(value, list):
+            flattened.extend(value)
+        else:
+            flattened.append(value)
+    return unique_values(flattened)
 
 
 def first_value(values: list[Any]) -> Any:

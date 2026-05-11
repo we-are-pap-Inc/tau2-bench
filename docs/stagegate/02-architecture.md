@@ -132,6 +132,10 @@ Retail:
 - phone
 - order_id
 - item_id
+- order_item_ids
+- candidate_replacement_item_ids
+- selected_old_item_ids
+- selected_new_item_ids
 - return_reason
 - refund_or_exchange_intent
 - address

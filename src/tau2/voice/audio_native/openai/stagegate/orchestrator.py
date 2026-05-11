@@ -208,6 +208,10 @@ SLOT_LABELS = {
     "phone": "customer phone",
     "order_id": "order ID",
     "item_id": "item ID",
+    "order_item_ids": "order item IDs",
+    "candidate_replacement_item_ids": "candidate replacement item IDs",
+    "selected_old_item_ids": "selected old item IDs",
+    "selected_new_item_ids": "selected new item IDs",
     "return_reason": "return or cancellation reason",
     "refund_or_exchange_intent": "refund, exchange, return, or cancellation intent",
     "address": "address",
@@ -291,9 +295,10 @@ class StagePacketOrchestrator:
         tools: list[Tool],
         domain_name: Optional[str] = None,
         ledger: EntityLedger | None = None,
+        forced_stage: str | None = None,
     ) -> StagePacket:
         """Build a compact packet from visible state."""
-        stage = self._choose_stage(current_stage, blocker)
+        stage = forced_stage or self._choose_stage(current_stage, blocker)
         domain = self._domain(domain_name=domain_name, ledger=ledger)
         inventory = self._split_tools(tools)
         allowed_read_tools = self._allowed_read_tools(
@@ -594,12 +599,19 @@ class StagePacketOrchestrator:
         stage: str,
         domain: str,
     ) -> list[str]:
+        ambiguous_facts = ledger.ambiguous_facts()
+        if stage == "verify_result_and_close" and domain == "retail":
+            ambiguous_facts = [
+                fact
+                for fact in ambiguous_facts
+                if not is_retail_item_id_ambiguity(fact)
+            ]
         stage_slots = set(self._stage_slots(stage, domain))
         if not stage_slots:
-            return ledger.ambiguous_facts()
+            return ambiguous_facts
         return [
             fact
-            for fact in ledger.ambiguous_facts()
+            for fact in ambiguous_facts
             if fact.split(":", maxsplit=1)[0] in stage_slots
         ]
 
@@ -656,3 +668,15 @@ class StagePacketOrchestrator:
             "telecom": "account or phone line",
             "mock": "account",
         }.get(domain, "customer record")
+
+
+def is_retail_item_id_ambiguity(fact: str) -> bool:
+    """Return whether a retail item-ID ambiguity should be hidden at close."""
+    field = fact.split(":", maxsplit=1)[0]
+    return field in {
+        "item_id",
+        "order_item_ids",
+        "candidate_replacement_item_ids",
+        "selected_old_item_ids",
+        "selected_new_item_ids",
+    }

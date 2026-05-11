@@ -153,11 +153,195 @@ class StageGateToolkit(ToolKitBase):
         return dict(self.service_tasks[task_id])
 
 
+class RetailExchangeToolkit(ToolKitBase):
+    def __init__(self):
+        self.write_count = 0
+
+    @is_tool(ToolType.READ)
+    def find_user_id_by_name_zip(
+        self,
+        first_name: str,
+        last_name: str,
+        zip: str,
+    ) -> str:
+        """Find a retail user by name and ZIP.
+
+        Args:
+            first_name: User first name.
+            last_name: User last name.
+            zip: User ZIP code.
+
+        Returns:
+            User ID.
+        """
+        return "yusuf_rossi_9620"
+
+    @is_tool(ToolType.READ)
+    def get_user_details(self, user_id: str) -> dict:
+        """Get retail user details.
+
+        Args:
+            user_id: User ID.
+
+        Returns:
+            User profile details.
+        """
+        return {
+            "user_id": user_id,
+            "name": {"first_name": "Yusuf", "last_name": "Rossi"},
+            "email": "yusuf.rossi7301@example.com",
+            "address": {"zip": "19122"},
+            "payment_methods": [
+                {
+                    "payment_method_id": "credit_card_9513926",
+                    "source": "credit card ending 2478",
+                }
+            ],
+        }
+
+    @is_tool(ToolType.READ)
+    def get_order_details(self, order_id: str) -> dict:
+        """Get retail order details.
+
+        Args:
+            order_id: Order ID.
+
+        Returns:
+            Order details.
+        """
+        return {
+            "order_id": order_id,
+            "user_id": "yusuf_rossi_9620",
+            "status": "delivered",
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {
+                        "switch type": "linear",
+                        "backlight": "RGB",
+                        "size": "full size",
+                    },
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "4983901480",
+                    "options": {
+                        "compatibility": "Apple HomeKit",
+                        "color": "black",
+                    },
+                },
+            ],
+            "payment_history": [
+                {
+                    "transaction_type": "payment",
+                    "payment_method_id": "credit_card_9513926",
+                }
+            ],
+        }
+
+    @is_tool(ToolType.READ)
+    def get_product_details(self, product_id: str) -> dict:
+        """Get retail product details.
+
+        Args:
+            product_id: Product ID.
+
+        Returns:
+            Product details.
+        """
+        if product_id == "1656367028":
+            return {
+                "name": "Mechanical Keyboard",
+                "product_id": product_id,
+                "variants": {
+                    "7706410293": {
+                        "item_id": "7706410293",
+                        "options": {
+                            "switch type": "clicky",
+                            "backlight": "none",
+                            "size": "full size",
+                        },
+                        "available": True,
+                    },
+                    "9025753381": {
+                        "item_id": "9025753381",
+                        "options": {
+                            "switch type": "clicky",
+                            "backlight": "RGB",
+                            "size": "full size",
+                        },
+                        "available": False,
+                    },
+                },
+            }
+        return {
+            "name": "Smart Thermostat",
+            "product_id": product_id,
+            "variants": {
+                "7747408585": {
+                    "item_id": "7747408585",
+                    "options": {
+                        "compatibility": "Google Assistant",
+                        "color": "black",
+                    },
+                    "available": True,
+                },
+                "4983901480": {
+                    "item_id": "4983901480",
+                    "options": {
+                        "compatibility": "Apple HomeKit",
+                        "color": "black",
+                    },
+                    "available": True,
+                },
+            },
+        }
+
+    @is_tool(ToolType.WRITE)
+    def exchange_delivered_order_items(
+        self,
+        order_id: str,
+        item_ids: list[str],
+        new_item_ids: list[str],
+        payment_method_id: str,
+    ) -> dict:
+        """Exchange delivered order items.
+
+        Args:
+            order_id: Order ID.
+            item_ids: Existing delivered item IDs.
+            new_item_ids: Replacement item IDs.
+            payment_method_id: Payment method for price difference.
+
+        Returns:
+            Exchange request result.
+        """
+        self.write_count += 1
+        return {
+            "order_id": order_id,
+            "status": "exchange requested",
+            "exchange_items": item_ids,
+            "exchange_new_items": new_item_ids,
+            "exchange_payment_method_id": payment_method_id,
+        }
+
+
 def _environment(domain_name: str = "mock") -> Environment:
     return Environment(
         domain_name=domain_name,
         policy="Public policy.",
         tools=StageGateToolkit(),
+    )
+
+
+def _retail_exchange_environment() -> Environment:
+    return Environment(
+        domain_name="retail",
+        policy="Retail public policy.",
+        tools=RetailExchangeToolkit(),
     )
 
 
@@ -321,6 +505,65 @@ def _prepare_validated_account_change(
     )
 
 
+def _exchange_tool_call(call_id: str = "call_exchange") -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name="exchange_delivered_order_items",
+        arguments={
+            "order_id": "#W2378156",
+            "item_ids": ["1151293680", "4983901480"],
+            "new_item_ids": ["7706410293", "7747408585"],
+            "payment_method_id": "credit_card_9513926",
+        },
+    )
+
+
+def _prepare_validated_retail_exchange(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+) -> None:
+    for tick_id, tool_call in enumerate(
+        [
+            ToolCall(
+                id="call_find_user",
+                name="find_user_id_by_name_zip",
+                arguments={
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
+            ),
+            ToolCall(
+                id="call_user",
+                name="get_user_details",
+                arguments={"user_id": "yusuf_rossi_9620"},
+            ),
+            ToolCall(
+                id="call_order",
+                name="get_order_details",
+                arguments={"order_id": "#W2378156"},
+            ),
+            ToolCall(
+                id="call_keyboard",
+                name="get_product_details",
+                arguments={"product_id": "1656367028"},
+            ),
+            ToolCall(
+                id="call_thermostat",
+                name="get_product_details",
+                arguments={"product_id": "4896585277"},
+            ),
+        ],
+        start=1,
+    ):
+        result = orchestrator._execute_stagegate_tool_call(
+            controller,
+            tool_call,
+            tick_id=tick_id,
+        )
+        assert result.error is False
+
+
 def test_stagegate_agent_adds_advance_stage_only_when_enabled(monkeypatch):
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stage_only")
     adapter = MagicMock()
@@ -429,6 +672,10 @@ def test_entity_ledger_initializes_domain_slots_and_serializes():
         "phone",
         "order_id",
         "item_id",
+        "order_item_ids",
+        "candidate_replacement_item_ids",
+        "selected_old_item_ids",
+        "selected_new_item_ids",
         "return_reason",
         "refund_or_exchange_intent",
         "address",
@@ -528,7 +775,8 @@ def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
     )
 
     assert retail_ledger.slots["customer_name"].status is LedgerStatus.MISSING
-    assert retail_ledger.slots["item_id"].value == "item_1"
+    assert retail_ledger.slots["item_id"].status is LedgerStatus.MISSING
+    assert retail_ledger.slots["candidate_replacement_item_ids"].value == ["item_1"]
 
     telecom_ledger = EntityLedger.for_domain("telecom")
     telecom_ledger.update_from_tool_result(
@@ -1145,6 +1393,237 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
     assert events[-1]["validator_reason"] == "missing_confirmation"
 
 
+def test_exchange_summary_and_yes_confirmation_allows_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    summary_chunks = [
+        "You're exchanging order W2378156: mechanical keyboard item 1151293680 ",
+        "to replacement item 7706410293, and smart thermostat item 4983901480 ",
+        "to replacement item 7747408585. Any price difference will go on ",
+        "the saved credit card ending 2478. Please confirm by saying yes.",
+    ]
+    for index, chunk in enumerate(summary_chunks, start=10):
+        controller.record_assistant_utterance(
+            AssistantMessage.text(chunk), tick_id=index
+        )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=14)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=15,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["status"] == "exchange requested"
+    assert environment.tools.write_count == 1
+
+
+def test_exchange_summary_and_yeah_confirmation_allows_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I'll submit the exchange on order W2378156: swap item 1151293680 "
+            "for 7706410293 and item 4983901480 for 7747408585. The order "
+            "will move to exchange requested, and any charge or refund uses "
+            "the saved credit card ending 2478. Please reply YES to proceed."
+        ),
+        tick_id=10,
+    )
+    controller.record_agent_visible_user_transcript("Yeah.", tick_id=11)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=12,
+    )
+
+    assert result.error is False
+    assert environment.tools.write_count == 1
+
+
+def test_confirmation_before_exchange_summary_does_not_allow_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    controller.record_agent_visible_user_transcript("Yes", tick_id=10)
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I'll submit the exchange on order W2378156: item 1151293680 to "
+            "7706410293 and item 4983901480 to 7747408585. Any price difference "
+            "will go on the saved credit card ending 2478. Please confirm."
+        ),
+        tick_id=11,
+    )
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=12,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert environment.tools.write_count == 0
+
+
+def test_missing_exchange_summary_still_blocks_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    controller.record_agent_visible_user_transcript("Yes", tick_id=10)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=11,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["missing_action_summary"]
+    assert "retry exchange_delivered_order_items directly" in packet["when_done"]
+    assert "advance_stage" not in packet["when_done"]
+    assert environment.tools.write_count == 0
+
+
+def test_advance_stage_cannot_verify_after_blocked_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=10,
+    )
+    assert blocked.error is True
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=[
+            "Model claims action summary and confirmation are satisfied.",
+        ],
+        last_action="Validated prerequisite action summary and confirmation.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+    assert packet["stage"] != "verify_result_and_close"
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=[
+            "Model still claims the blocked write completed.",
+        ],
+        last_action="Attempting to close without a domain tool result.",
+        tick_id=12,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+
+
+def test_verify_result_and_close_requires_successful_write_result():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=["User confirmed a write action."],
+        last_action="Ready to verify.",
+        tick_id=1,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+
+
+def test_retail_item_id_product_list_ambiguity_not_surfaced_at_close():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I'll submit the exchange on order W2378156: item 1151293680 to "
+            "7706410293 and item 4983901480 to 7747408585. The order status "
+            "will become exchange requested. Please confirm."
+        ),
+        tick_id=10,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=11)
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=12,
+    )
+    assert result.error is False
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=["Exchange tool succeeded."],
+        last_action="exchange_delivered_order_items returned exchange requested",
+        tick_id=13,
+    )
+
+    assert packet["stage"] == "verify_result_and_close"
+    assert not any(
+        fact.startswith("item_id:")
+        or fact.startswith("candidate_replacement_item_ids:")
+        for fact in packet["ambiguous_facts"]
+    )
+
+
 def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     environment = _environment()
     controller = StageGateController(
@@ -1617,7 +2096,7 @@ def test_confirmation_requires_exact_identifier_mention():
 
     packet = json.loads(result.content)
     assert result.error is True
-    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert packet["missing_facts"] == ["missing_action_summary"]
     assert environment.tools.write_count == 0
 
 
