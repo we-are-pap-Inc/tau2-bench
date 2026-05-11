@@ -226,6 +226,10 @@ remains validator-free; the pre-write validator is active only for
   tool name and stable argument fingerprint; the model must call
   `record_pending_write_summary` and `record_pending_write_confirmation` before
   the same fingerprinted retry is allowed.
+- [x] Make pending-write tools operate on the single active pending write so the
+  model-facing protocol does not require copying an opaque pending-write ID.
+- [x] Block `transfer_to_human_agents` while a resolvable active pending write is
+  waiting for summary, structured confirmation, or direct retry.
 - [x] Emit pending-write trace events for creation, structured summary record,
   structured confirmation/denial/unclear decisions, mismatched retry, and
   consumption.
@@ -656,6 +660,18 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 structured pending-write protocol:
   `npm run format`, `npm run check`, and `npm run lint` all failed with npm
   `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 active pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `73 passed, 2 warnings in 0.35s`.
+- 2026-05-10 active pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 active pending-write protocol:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-10 active pending-write protocol:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -736,15 +752,9 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
   treats slash-separated hint terms such as `payment/refund` as alternatives
   instead of requiring both terms to appear.
-- 2026-05-10 smoke_007 triage: The validator must aggregate assistant
-  proportional transcript fragments before detecting an action summary. In
-  smoke_007, the visible summary was split across many ticks, so per-fragment
-  matching failed and caused false `missing_action_summary` blocks.
-- 2026-05-10 smoke_007 triage: User confirmation remains valid only from
-  `AGENT_VISIBLE_TRANSCRIPT`, but natural confirmations such as `Yes`,
-  `Yeah`, `Yep`, `correct`, `go ahead`, `please do`, `proceed`, `sounds good`,
-  and `okay, do it` are accepted when they occur after the matching assistant
-  action summary.
+- 2026-05-10 smoke_007/smoke_008 transcript-pattern triage is superseded: the
+  validator no longer aggregates transcript text or matches natural-language
+  summaries/confirmations. Transcript events establish ordering only.
 - 2026-05-10 smoke_007 triage: `advance_stage` is not allowed to advance from
   `execute_write_action` to `verify_result_and_close` in StageGate unless a
   side-effecting domain tool has actually returned successfully. Model-supplied
@@ -753,12 +763,9 @@ Warnings observed in the passing focused and voice test commands:
   slots for order items, candidate replacements, selected old items, and
   selected new items. Product variant lists are not surfaced as user-facing
   `item_id` ambiguities in closeout packets.
-- 2026-05-10 smoke_008 follow-up: An exchange summary that omits the literal
-  order ID can still be valid when it contains all old order item IDs, all
-  selected replacement item IDs, consequence/payment language, and a request
-  for confirmation. This keeps the write gate tied to visible, action-specific
-  evidence without requiring the assistant to repeat the order number when the
-  exact item-level write is already unambiguous.
+- 2026-05-10 smoke_008 follow-up is superseded: exchange-specific transcript
+  summary matching has been removed in favor of the structured pending-write
+  protocol.
 - 2026-05-10 structural pending-write confirmation: The validator now treats
   the attempted side-effecting write as the object being summarized and
   confirmed. Confirmation is valid only for the matching tool name and argument
@@ -772,6 +779,12 @@ Warnings observed in the passing focused and voice test commands:
   confirmation path is a StageGate-only internal protocol:
   `record_pending_write_summary`, a later user-turn event, then
   `record_pending_write_confirmation`.
+- 2026-05-10 smoke_009 triage: the runtime correctly created
+  `pending_write=needs_summary`, but the model-facing affordance failed because
+  the model believed the pending-write record step required an unavailable ID
+  and transferred to a human. Pending-write recorder tools now resolve the
+  active pending write by default, and transfer is blocked while that active
+  write remains structurally resolvable.
 
 ## Remaining Work
 

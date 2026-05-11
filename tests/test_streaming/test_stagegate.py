@@ -152,6 +152,18 @@ class StageGateToolkit(ToolKitBase):
         self.service_tasks[task_id]["status"] = status
         return dict(self.service_tasks[task_id])
 
+    @is_tool(ToolType.GENERIC)
+    def transfer_to_human_agents(self, summary: str) -> str:
+        """Transfer the customer to a human agent.
+
+        Args:
+            summary: A summary for the human agent.
+
+        Returns:
+            Transfer status.
+        """
+        return "Transfer successful"
+
 
 class RetailExchangeToolkit(ToolKitBase):
     def __init__(self):
@@ -327,6 +339,18 @@ class RetailExchangeToolkit(ToolKitBase):
             "exchange_new_items": new_item_ids,
             "exchange_payment_method_id": payment_method_id,
         }
+
+    @is_tool(ToolType.GENERIC)
+    def transfer_to_human_agents(self, summary: str) -> str:
+        """Transfer the customer to a human agent.
+
+        Args:
+            summary: A summary for the human agent.
+
+        Returns:
+            Transfer status.
+        """
+        return "Transfer successful"
 
 
 def _environment(domain_name: str = "mock") -> Environment:
@@ -538,12 +562,16 @@ def _record_pending_summary(
             id=f"call_record_summary_{tick_id}",
             name="record_pending_write_summary",
             arguments={
-                "pending_write_id": pending_write_id or _pending_write_id(controller),
                 "summary_presented": True,
                 "action_type": action_type,
                 "consequence_presented": True,
                 "confirmation_requested": True,
-            },
+            }
+            | (
+                {"pending_write_id": pending_write_id}
+                if pending_write_id is not None
+                else {}
+            ),
         ),
         tick_id=tick_id,
     )
@@ -569,10 +597,14 @@ def _record_pending_confirmation(
             id=f"call_record_confirmation_{tool_tick_id}",
             name="record_pending_write_confirmation",
             arguments={
-                "pending_write_id": pending_write_id or _pending_write_id(controller),
                 "decision": decision,
                 "basis": basis,
-            },
+            }
+            | (
+                {"pending_write_id": pending_write_id}
+                if pending_write_id is not None
+                else {}
+            ),
         ),
         tick_id=tool_tick_id,
     )
@@ -713,7 +745,8 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
     )
     agent.get_init_state()
 
-    tool_names = [tool.name for tool in adapter.connect.call_args.kwargs["tools"]]
+    tools = adapter.connect.call_args.kwargs["tools"]
+    tool_names = [tool.name for tool in tools]
     system_prompt = adapter.connect.call_args.kwargs["system_prompt"]
     assert tool_names == [
         "_test_tool",
@@ -721,12 +754,20 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
         "record_pending_write_summary",
         "record_pending_write_confirmation",
     ]
+    tool_schema_by_name = {tool.name: tool.params.model_json_schema() for tool in tools}
+    assert "pending_write_id" not in tool_schema_by_name[
+        "record_pending_write_summary"
+    ].get("required", [])
+    assert "pending_write_id" not in tool_schema_by_name[
+        "record_pending_write_confirmation"
+    ].get("required", [])
     assert "StageGate operating rules" in system_prompt
     assert (
         "call advance_stage before the first customer-specific domain tool call"
         in system_prompt
     )
     assert "record_pending_write_summary" in system_prompt
+    assert "no pending_write_id is needed" in system_prompt
     assert hasattr(agent.stagegate_controller, "ledger")
     assert hasattr(agent.stagegate_controller, "validator")
 
@@ -1450,6 +1491,7 @@ def test_pending_write_creation_blocks_first_write(monkeypatch, tmp_path):
     assert packet["missing_facts"] == ["missing_action_summary"]
     assert "record_pending_write_summary" in packet["ask_next"]
     assert "record_pending_write_confirmation" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
     assert "retry update_account directly" in packet["when_done"]
     assert environment.tools.write_count == 0
     assert "pending_write_created" in [event["event_type"] for event in events]
@@ -1509,6 +1551,42 @@ def test_confirmation_tool_records_confirmed_after_user_turn():
 
     assert confirmation_result.error is False
     assert json.loads(confirmation_result.content)["reason"] == "confirmation_confirmed"
+    assert controller.validator.pending_write_snapshot()["status"] == "confirmed"
+
+
+def test_pending_write_tools_accept_optional_debug_id():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    pending_id = _pending_write_id(controller)
+    summary_result = _record_pending_summary(
+        orchestrator,
+        controller,
+        pending_write_id=pending_id,
+        tick_id=11,
+    )
+    confirmation_result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        pending_write_id=pending_id,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    assert summary_result.error is False
+    assert confirmation_result.error is False
     assert controller.validator.pending_write_snapshot()["status"] == "confirmed"
 
 
@@ -1642,9 +1720,104 @@ def test_missing_exchange_summary_still_blocks_write():
     assert packet["missing_facts"] == ["missing_action_summary"]
     assert "record_pending_write_summary" in packet["ask_next"]
     assert "record_pending_write_confirmation" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
     assert "retry exchange_delivered_order_items directly" in packet["when_done"]
     assert "advance_stage" not in packet["when_done"]
     assert environment.tools.write_count == 0
+
+
+def test_transfer_to_human_blocked_during_resolvable_pending_write(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer",
+            name="transfer_to_human_agents",
+            arguments={"summary": "Cannot complete the pending write protocol."},
+        ),
+        tick_id=11,
+    )
+
+    packet = json.loads(result.content)
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert result.error is True
+    assert packet["missing_facts"] == ["transfer_blocked_pending_write"]
+    assert "record_pending_write_summary" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
+    assert "transfer_blocked_pending_write" in event_types
+    assert environment.tools.write_count == 0
+
+
+def test_transfer_to_human_allowed_without_resolvable_pending_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    no_pending = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_no_pending",
+            name="transfer_to_human_agents",
+            arguments={"summary": "Out of scope."},
+        ),
+        tick_id=1,
+    )
+    assert no_pending.error is False
+    assert no_pending.content == "Transfer successful"
+
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="denied",
+        basis="user_declined",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+    denied_pending = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_denied",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User declined the pending write."},
+        ),
+        tick_id=14,
+    )
+
+    assert denied_pending.error is False
+    assert denied_pending.content == "Transfer successful"
 
 
 def test_pending_exchange_summary_and_confirmation_allows_retry():
@@ -2281,9 +2454,7 @@ def test_validator_uses_structured_confirmation_only_after_user_turn():
         tick_index=1,
     )
     before_summary = validator.validate(write_call, tick_index=2)
-    pending_id = validator.pending_write_snapshot()["pending_write_id"]
     summary_result = validator.record_pending_write_summary(
-        pending_write_id=str(pending_id),
         summary_presented=True,
         action_type="update_account",
         consequence_presented=True,
@@ -2291,7 +2462,6 @@ def test_validator_uses_structured_confirmation_only_after_user_turn():
         tick_index=3,
     )
     before_user_turn = validator.record_pending_write_confirmation(
-        pending_write_id=str(pending_id),
         decision="confirmed",
         basis="latest_user_turn",
         tick_index=4,
@@ -2302,7 +2472,6 @@ def test_validator_uses_structured_confirmation_only_after_user_turn():
         source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
     confirmation_result = validator.record_pending_write_confirmation(
-        pending_write_id=str(pending_id),
         decision="confirmed",
         basis="latest_user_turn",
         tick_index=6,
@@ -2345,9 +2514,8 @@ def test_model_tool_argument_text_cannot_satisfy_user_turn_order():
         tick_index=1,
     )
     first_decision = validator.validate(write_call, tick_index=2)
-    pending_id = str(first_decision.pending_write_id)
+    assert first_decision.pending_write_id is not None
     validator.record_pending_write_summary(
-        pending_write_id=pending_id,
         summary_presented=True,
         action_type="update_account",
         consequence_presented=True,
@@ -2360,7 +2528,6 @@ def test_model_tool_argument_text_cannot_satisfy_user_turn_order():
         source=EvidenceSource.MODEL_TOOL_ARGUMENT,
     )
     confirmation_result = validator.record_pending_write_confirmation(
-        pending_write_id=pending_id,
         decision="confirmed",
         basis="latest_user_turn",
         tick_index=5,
@@ -2451,7 +2618,6 @@ def test_summary_tool_requires_structured_consequence_and_confirmation_request()
             id="call_bad_summary",
             name="record_pending_write_summary",
             arguments={
-                "pending_write_id": _pending_write_id(controller),
                 "summary_presented": True,
                 "action_type": "update_account",
                 "consequence_presented": False,
@@ -2649,9 +2815,8 @@ def test_policy_preconditions_require_all_required_visible_fields():
     )
 
     pending_block = validator.validate(write_call, tick_index=5)
-    pending_id = str(pending_block.pending_write_id)
+    assert pending_block.pending_write_id is not None
     validator.record_pending_write_summary(
-        pending_write_id=pending_id,
         summary_presented=True,
         action_type="send_payment_request",
         consequence_presented=True,
@@ -2664,7 +2829,6 @@ def test_policy_preconditions_require_all_required_visible_fields():
         source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
     validator.record_pending_write_confirmation(
-        pending_write_id=pending_id,
         decision="confirmed",
         basis="latest_user_turn",
         tick_index=8,

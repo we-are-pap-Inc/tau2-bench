@@ -198,7 +198,7 @@ Validator checks:
 6. Are policy preconditions satisfied?
 7. Is there a matching pending write keyed by the attempted tool and stable
    argument fingerprint?
-8. Has the model called `record_pending_write_summary` for that pending write?
+8. Has the model called `record_pending_write_summary` for the active pending write?
 9. Has a later user turn occurred, and has the model called
    `record_pending_write_confirmation` with a structured decision?
 
@@ -212,12 +212,18 @@ Pending write confirmation:
   agent must explicitly call StageGate internal tools:
   `record_pending_write_summary` after summarizing the pending write and
   `record_pending_write_confirmation` after a later user response.
+- There is at most one active pending write. The model-facing internal tools
+  apply to that active pending write and do not require a pending write ID.
 - A retry is allowed only when the pending write is `confirmed` and the retried
   tool name and argument fingerprint match.
 - A successful side-effecting domain-tool result marks the pending write
   `consumed`; only consumed writes can satisfy write-intent closeout.
 - Changed retry arguments create a `pending_write_mismatch` block and require a
   fresh structured summary and confirmation.
+- `transfer_to_human_agents` is blocked while a resolvable active pending write
+  is `needs_summary`, `summarized`, `confirmed`, or `mismatched_retry`. Transfer
+  is allowed with no active pending write, or after the active pending write is
+  `denied`, `unclear`, `consumed`, or `expired`.
 
 Allow result:
 
@@ -229,9 +235,9 @@ Block result:
       "decision": "block",
       "reason": "missing_confirmation",
       "corrective_packet": {
-        "say_next": "State the pending action and consequence, call record_pending_write_summary, then after the user responds call record_pending_write_confirmation.",
+        "say_next": "Tell the user the pending action and consequence, ask for explicit confirmation, call record_pending_write_summary with structured booleans, then after the user responds call record_pending_write_confirmation with a structured decision.",
         "allowed_next_tools": [],
-        "do_not": ["Do not call advance_stage before retrying the original write tool."]
+        "do_not": ["Do not call advance_stage before retrying the original write tool.", "Do not transfer while the active pending write is still resolvable."]
       }
     }
 
@@ -267,3 +273,4 @@ Pending-write runtime events are:
 - `pending_write_unclear`
 - `pending_write_mismatch`
 - `pending_write_consumed`
+- `transfer_blocked_pending_write`

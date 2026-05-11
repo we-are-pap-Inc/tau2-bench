@@ -116,6 +116,13 @@ NON_SIDE_EFFECTING_TOOL_NAMES = {
     "calculate",
     "transfer_to_human_agents",
 }
+TRANSFER_TOOL_NAME = "transfer_to_human_agents"
+TRANSFER_BLOCKING_PENDING_WRITE_STATUSES = {
+    "needs_summary",
+    "summarized",
+    "confirmed",
+    "mismatched_retry",
+}
 
 IDENTITY_READ_TOOLS_BY_DOMAIN = {
     "mock": {"get_account", "get_users"},
@@ -273,6 +280,14 @@ class PreWriteValidator:
         current_stage: Optional[str] = None,
     ) -> ValidatorDecision:
         """Validate a domain tool call without calling the tool."""
+        if tool_call.name == TRANSFER_TOOL_NAME:
+            transfer_block = self._transfer_block_for_pending_write(
+                tool_call,
+                tick_index=tick_index,
+            )
+            if transfer_block is not None:
+                return transfer_block
+
         if not self.is_side_effecting_tool(tool_call.name):
             return ValidatorDecision(
                 decision="allow",
@@ -540,7 +555,7 @@ class PreWriteValidator:
     def record_pending_write_summary(
         self,
         *,
-        pending_write_id: str,
+        pending_write_id: Optional[str] = None,
         summary_presented: bool,
         action_type: str,
         consequence_presented: bool,
@@ -550,11 +565,17 @@ class PreWriteValidator:
     ) -> PendingWriteToolResult:
         """Record that the model completed the structured summary step."""
         pending_write = self._active_pending_write()
-        if pending_write is None or pending_write.pending_write_id != pending_write_id:
+        if pending_write is None:
             return PendingWriteToolResult(
                 ok=False,
                 reason="pending_write_not_found",
                 pending_write=self.pending_write_snapshot(),
+            )
+        if pending_write_id and pending_write.pending_write_id != pending_write_id:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_id_mismatch",
+                pending_write=pending_write.snapshot(),
             )
         if not summary_presented:
             return PendingWriteToolResult(
@@ -601,7 +622,7 @@ class PreWriteValidator:
     def record_pending_write_confirmation(
         self,
         *,
-        pending_write_id: str,
+        pending_write_id: Optional[str] = None,
         decision: str,
         basis: str,
         notes: Optional[str] = None,
@@ -626,11 +647,17 @@ class PreWriteValidator:
                 pending_write=self.pending_write_snapshot(),
             )
         pending_write = self._active_pending_write()
-        if pending_write is None or pending_write.pending_write_id != pending_write_id:
+        if pending_write is None:
             return PendingWriteToolResult(
                 ok=False,
                 reason="pending_write_not_found",
                 pending_write=self.pending_write_snapshot(),
+            )
+        if pending_write_id and pending_write.pending_write_id != pending_write_id:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_id_mismatch",
+                pending_write=pending_write.snapshot(),
             )
         if pending_write.status != "summarized":
             return PendingWriteToolResult(
@@ -722,6 +749,37 @@ class PreWriteValidator:
         if pending_write.status in {"consumed", "expired", "none"}:
             return None
         return pending_write
+
+    def _transfer_block_for_pending_write(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+    ) -> Optional[ValidatorDecision]:
+        pending_write = self._active_pending_write()
+        if pending_write is None:
+            return None
+        if pending_write.status not in TRANSFER_BLOCKING_PENDING_WRITE_STATUSES:
+            return None
+
+        self._queue_pending_write_event(
+            "transfer_blocked_pending_write",
+            pending_write,
+            tick_index=tick_index,
+        )
+        return self._block(
+            tool_call,
+            reason="transfer_blocked_pending_write",
+            checks={
+                "side_effecting_tool": False,
+                "pending_write_exists": True,
+                "pending_write_summarized": pending_write.status
+                in {"summarized", "confirmed"},
+                "pending_write_confirmed": pending_write.status == "confirmed",
+                "pending_write_consumed": False,
+            },
+            pending_write=pending_write,
+        )
 
     def _ensure_pending_write(
         self,
@@ -1248,6 +1306,21 @@ def build_corrective_packet(
     read_tools: list[str],
 ) -> StagePacket:
     """Build a corrective StageGate packet for a blocked tool call."""
+    do_not = [
+        f"Do not call {tool_call.name} again until the missing prerequisite is satisfied.",
+        "Do not call advance_stage before retrying the original write tool.",
+    ]
+    if reason in {
+        "missing_action_summary",
+        "missing_confirmation",
+        "pending_write_mismatch",
+        "transfer_blocked_pending_write",
+    }:
+        do_not.append(
+            "Do not transfer to a human agent unless the pending write protocol is "
+            "structurally impossible or the pending write is denied or unclear."
+        )
+
     return StagePacket(
         stage=stage_for_reason(reason),
         objective="Recover the missing prerequisite before executing a write/action tool.",
@@ -1255,12 +1328,16 @@ def build_corrective_packet(
         missing_facts=[reason],
         ambiguous_facts=[],
         ask_next=corrective_instruction(tool_call=tool_call, reason=reason),
-        allowed_read_tools=read_tools,
-        allowed_write_tools=[],
-        do_not=[
-            f"Do not call {tool_call.name} again until the missing prerequisite is satisfied.",
-            "Do not call advance_stage before retrying the original write tool.",
+        allowed_read_tools=[
+            tool_name
+            for tool_name in read_tools
+            if not (
+                reason == "transfer_blocked_pending_write"
+                and tool_name == TRANSFER_TOOL_NAME
+            )
         ],
+        allowed_write_tools=[],
+        do_not=do_not,
         exit_condition=(
             "The pending write has a structured summary record and a structured "
             "confirmed decision after a later user turn."
@@ -1293,24 +1370,43 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     """Return concise corrective text for the model."""
     if reason == "missing_confirmation":
         return (
-            f"After the user responds, call record_pending_write_confirmation "
-            f"for the pending {tool_call.name}; if confirmed, retry the same "
-            "original domain write tool directly."
+            "After the user responds, call "
+            'record_pending_write_confirmation({"decision": "confirmed", '
+            '"basis": "latest_user_turn"}) if the user confirmed, or use '
+            "decision=denied/unclear as appropriate. If confirmed, retry the "
+            f"same original {tool_call.name} domain write tool directly."
         )
     if reason == "missing_action_summary":
         return (
-            "State the pending action and consequence, ask for explicit "
-            "confirmation, call record_pending_write_summary, then after the "
-            "user responds call record_pending_write_confirmation. If confirmed, "
-            "retry the same original domain write tool directly."
+            "Tell the user the pending action and consequence, ask for explicit "
+            "confirmation, then call "
+            'record_pending_write_summary({"summary_presented": true, '
+            f'"action_type": "{tool_call.name}", "consequence_presented": true, '
+            '"confirmation_requested": true}). Wait for the user response. If '
+            "the user confirms, call "
+            'record_pending_write_confirmation({"decision": "confirmed", '
+            '"basis": "latest_user_turn"}), then retry the same original '
+            f"{tool_call.name} domain write tool directly."
         )
     if reason == "pending_write_mismatch":
         return (
             "The retried write differs from the confirmed pending action. "
-            "Summarize the changed pending action and consequence, call "
-            "record_pending_write_summary, then after the user responds call "
-            "record_pending_write_confirmation. If confirmed, retry the same "
-            "domain write tool directly."
+            "Summarize the changed pending action and consequence, ask for "
+            "explicit confirmation, then call "
+            'record_pending_write_summary({"summary_presented": true, '
+            f'"action_type": "{tool_call.name}", "consequence_presented": true, '
+            '"confirmation_requested": true}). After the user responds, call '
+            "record_pending_write_confirmation with decision=confirmed, denied, "
+            "or unclear. If confirmed, retry the same domain write tool directly."
+        )
+    if reason == "transfer_blocked_pending_write":
+        return (
+            "A resolvable pending write is active. Do not transfer yet. Follow "
+            "the active pending-write protocol: summarize the pending action and "
+            "consequence, call record_pending_write_summary without a "
+            "separate ID field, wait for the user response, call "
+            "record_pending_write_confirmation for the active pending write, then "
+            "retry the original write directly if confirmed."
         )
     if reason == "pending_write_denied":
         return (
