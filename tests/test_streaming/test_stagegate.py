@@ -834,6 +834,25 @@ def test_stage_packets_include_only_stage_scoped_missing_facts():
     assert len(packet["missing_facts"]) < len(controller.ledger.slots)
 
 
+def test_stage_only_missing_fact_matching_ignores_short_substrings():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        observed_facts=["The order is late."],
+    )
+
+    assert "customer email, phone, or name and ZIP" in packet["missing_facts"]
+    assert "order ID if known" in packet["missing_facts"]
+
+
 def test_retail_identity_packet_excludes_later_stage_slots():
     environment = _environment(domain_name="retail")
     controller = StageGateController(

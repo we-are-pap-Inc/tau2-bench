@@ -1,5 +1,6 @@
 """Stage packet generation for StageGate."""
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -228,6 +229,45 @@ SLOT_LABELS = {
     "issue_type": "issue type",
     "confirmation": "explicit user confirmation",
 }
+
+HINT_ALTERNATIVE_RE = re.compile(r"\s+or\s+|,")
+HINT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+HINT_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "customer",
+        "fact",
+        "facts",
+        "for",
+        "from",
+        "if",
+        "in",
+        "is",
+        "known",
+        "of",
+        "official",
+        "on",
+        "or",
+        "passenger",
+        "policy",
+        "relevant",
+        "the",
+        "to",
+        "user",
+        "was",
+        "were",
+        "with",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -568,9 +608,21 @@ class StagePacketOrchestrator:
         return stage_scope.get(domain, stage_scope.get("default", ()))
 
     def _observed_fact_mentions(self, observed_facts: list[str], hint: str) -> bool:
-        terms = [term.strip().lower() for term in hint.replace("/", " ").split()]
-        text = " ".join(observed_facts).lower()
-        return bool(text) and any(term and term in text for term in terms)
+        text_tokens = set(self._meaningful_hint_tokens(" ".join(observed_facts)))
+        if not text_tokens:
+            return False
+        for alternative in HINT_ALTERNATIVE_RE.split(hint):
+            hint_tokens = self._meaningful_hint_tokens(alternative)
+            if hint_tokens and all(token in text_tokens for token in hint_tokens):
+                return True
+        return False
+
+    def _meaningful_hint_tokens(self, text: str) -> tuple[str, ...]:
+        return tuple(
+            token
+            for token in HINT_TOKEN_RE.findall(text.lower())
+            if token not in HINT_STOPWORDS and (len(token) > 2 or token == "id")
+        )
 
     def _fallback_ask_next(self, packet: StagePacket) -> str:
         if packet.ambiguous_facts:

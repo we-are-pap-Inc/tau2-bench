@@ -375,6 +375,10 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 Milestone 7.5 hardening:
   `make check-all` result: `All checks passed!` and
   `329 files left unchanged`.
+- 2026-05-10 Milestone 7.5 review follow-up:
+  `uv run --extra dev --extra voice python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after fixing StageOnly observed-fact hint matching:
+  `56 passed, 2 warnings in 0.14s`.
 
 - `uv run pytest tests/test_streaming/test_stagegate.py -q` initially could
   not collect in the freshly created core-only environment. Direct import
@@ -608,6 +612,10 @@ Warnings observed in the passing focused and voice test commands:
   and include stage-call counts, validator allow/block counts, ledger update
   count, final stage, stage sequence, last stage packet, and last validator or
   corrective packet.
+- 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
+  now uses word-boundary tokenization, stopword filtering, and full-token
+  alternative matching. This prevents short words such as `or`, `and`, and `if`
+  from matching unrelated words and suppressing required stage hints.
 
 ## Remaining Work
 
