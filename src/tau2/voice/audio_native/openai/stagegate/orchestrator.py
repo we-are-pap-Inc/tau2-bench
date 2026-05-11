@@ -337,6 +337,14 @@ class StagePacketOrchestrator:
             ambiguous.extend(self._stage_ambiguous_facts(ledger, stage, domain))
         if blocker:
             missing.insert(0, blocker)
+        if (
+            domain == "retail"
+            and stage == "execute_write_action"
+            and selected_write_tool
+            and missing
+            and self._retail_replacement_progress(ledger) == "selected_exchange_ready"
+        ):
+            allowed_write_tools = []
         ask_next = self._ask_next(
             stage,
             missing,
@@ -354,12 +362,14 @@ class StagePacketOrchestrator:
             domain=domain,
             ledger=ledger,
             selected_write_tool=selected_write_tool,
+            missing=missing,
         )
         next_tool_call = self._next_tool_call(
             stage=stage,
             domain=domain,
             ledger=ledger,
             selected_write_tool=selected_write_tool,
+            missing=missing,
         )
         return StagePacket(
             stage=stage,
@@ -502,11 +512,17 @@ class StagePacketOrchestrator:
         retail_progress = self._retail_replacement_progress(ledger)
         if domain == "retail" and stage == "propose_action_and_confirm":
             if selected_write_tool and retail_progress == "selected_exchange_ready":
+                if missing or not self._slot_has_value(ledger, "confirmation"):
+                    return (
+                        "Summarize the selected exchange and payment/refund "
+                        "consequence, ask for explicit confirmation, and do not "
+                        f"attempt {selected_write_tool} until confirmation is "
+                        "recorded. Do not reopen replacement choices."
+                    )
                 return (
-                    "Summarize the selected exchange and payment/refund consequence, "
-                    "ask for explicit confirmation, and if the user has already "
-                    f"confirmed then attempt {selected_write_tool} next. Do not "
-                    "reopen replacement choices."
+                    "Proceed toward the confirmed write path for the selected "
+                    "exchange. Do not reopen replacement choices or enumerate "
+                    "more product variants."
                 )
             if retail_progress == "replacement_candidates_inspected":
                 return (
@@ -517,6 +533,13 @@ class StagePacketOrchestrator:
                 )
         if domain == "retail" and stage == "execute_write_action":
             if selected_write_tool and retail_progress == "selected_exchange_ready":
+                if missing or not self._slot_has_value(ledger, "confirmation"):
+                    return (
+                        "Summarize the selected exchange and payment/refund "
+                        "consequence, ask for explicit confirmation, and do not "
+                        f"call {selected_write_tool} until confirmation is "
+                        "recorded."
+                    )
                 return (
                     f"Call {selected_write_tool} with the selected old item IDs, "
                     "selected new item IDs, order ID, and payment method. Do not "
@@ -829,6 +852,7 @@ class StagePacketOrchestrator:
         domain: str,
         ledger: EntityLedger | None,
         selected_write_tool: str | None,
+        missing: list[str],
     ) -> list[dict[str, object]]:
         if (
             domain != "retail"
@@ -838,6 +862,26 @@ class StagePacketOrchestrator:
             return []
         progress = self._retail_replacement_progress(ledger)
         if progress == "selected_exchange_ready" and stage == "execute_write_action":
+            if missing or not self._slot_has_value(ledger, "confirmation"):
+                return [
+                    {
+                        "step": "summarize_selected_replacements",
+                        "instruction": (
+                            "State the selected replacements and payment/refund "
+                            "consequence."
+                        ),
+                    },
+                    {
+                        "step": "ask_user_to_confirm",
+                        "instruction": "Ask for explicit confirmation.",
+                    },
+                    {
+                        "step": "do_not_attempt_write_before_confirmation",
+                        "instruction": (
+                            "Do not call the write tool until confirmation is recorded."
+                        ),
+                    },
+                ]
             return [
                 {
                     "step": "attempt_confirmed_write",
@@ -894,11 +938,14 @@ class StagePacketOrchestrator:
         domain: str,
         ledger: EntityLedger | None,
         selected_write_tool: str | None,
+        missing: list[str],
     ) -> dict[str, object] | None:
         if (
             domain != "retail"
             or stage != "execute_write_action"
             or selected_write_tool is None
+            or missing
+            or not self._slot_has_value(ledger, "confirmation")
             or self._retail_replacement_progress(ledger) != "selected_exchange_ready"
         ):
             return None

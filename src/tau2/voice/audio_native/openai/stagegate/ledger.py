@@ -839,8 +839,6 @@ def is_lookup_failure_result(
     """Return whether official tool output says a lookup failed."""
     if not tool_name.startswith(LOOKUP_TOOL_PREFIXES):
         return False
-    if error:
-        return True
     if not content:
         return False
     try:

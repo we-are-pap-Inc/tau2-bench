@@ -1062,7 +1062,7 @@ def test_retail_order_and_item_reads_fill_item_id_compatibility_slot():
     assert item_ledger.slots["item_id"].value == "1151293680"
 
 
-def test_errored_lookup_results_mark_failed_without_verifying_ledger():
+def test_generic_errored_lookup_results_do_not_mark_failed_lookup():
     environment = _environment(domain_name="telecom")
     controller = StageGateController(
         condition="stagegate",
@@ -1080,7 +1080,36 @@ def test_errored_lookup_results_mark_failed_without_verifying_ledger():
         ToolMessage(
             id="call_customer",
             role="tool",
-            content=json.dumps({"customer_id": "cust_123"}),
+            content=json.dumps({"customer_id": "cust_123", "error": "timeout"}),
+            error=True,
+        ),
+        tick_id=4,
+    )
+
+    slot = controller.ledger.slots["account_id"]
+    assert slot.status is LedgerStatus.MISSING
+    assert "account_id" not in controller.ledger.known_facts()
+
+
+def test_official_not_found_lookup_result_marks_failed_without_verifying_ledger():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_domain_tool_result(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        ToolMessage(
+            id="call_customer",
+            role="tool",
+            content=json.dumps({"error": "customer not found"}),
             error=True,
         ),
         tick_id=4,
@@ -3006,7 +3035,7 @@ def test_retail_propose_packet_treats_fallback_preference_as_progress():
     assert "enumerate more product variants" in do_not
 
 
-def test_retail_propose_packet_points_to_write_after_selected_replacements():
+def test_retail_propose_packet_asks_confirmation_after_selected_replacements():
     environment = _retail_exchange_environment()
     controller = StageGateController(
         condition="stagegate",
@@ -3027,7 +3056,9 @@ def test_retail_propose_packet_points_to_write_after_selected_replacements():
     )
 
     assert packet["stage"] == "propose_action_and_confirm"
-    assert "attempt exchange_delivered_order_items next" in packet["ask_next"]
+    assert "ask for explicit confirmation" in packet["ask_next"]
+    assert "until confirmation is recorded" in packet["ask_next"]
+    assert "attempt exchange_delivered_order_items next" not in packet["ask_next"]
     assert any(
         rule.startswith("Do not reopen replacement preference discussion")
         for rule in packet["do_not"]
@@ -3036,6 +3067,35 @@ def test_retail_propose_packet_points_to_write_after_selected_replacements():
         "exchange_delivered_order_items"
     )
     assert "candidate_replacement_item_ids" not in packet["known_facts"]
+
+
+def test_retail_execute_packet_requires_confirmation_before_write_guidance():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    _record_selected_retail_exchange(controller)
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="propose_action_and_confirm",
+        observed_facts=["Selected replacement items are ready."],
+        last_action="Selected replacement item IDs but has not recorded confirmation.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+    assert "explicit user confirmation" in packet["missing_facts"]
+    assert packet["allowed_write_tools"] == []
+    assert packet["next_tool_call"] is None
+    assert "ask for explicit confirmation" in packet["ask_next"]
+    assert "until confirmation is recorded" in packet["ask_next"]
+    assert _step_by_name(packet, "do_not_attempt_write_before_confirmation")
 
 
 def test_retail_execute_packet_prioritizes_exchange_after_selected_replacements():
