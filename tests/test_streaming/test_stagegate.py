@@ -171,6 +171,34 @@ def _controller(environment: Environment) -> StageGateController:
     return controller
 
 
+def _advance_stage_packet(
+    controller: StageGateController,
+    *,
+    current_stage: str = "understand_intent",
+    observed_facts: list[str] | None = None,
+    last_action: str = "started",
+    blocker: str | None = None,
+    tick_id: int = 1,
+) -> dict:
+    arguments = {
+        "current_stage": current_stage,
+        "observed_facts": observed_facts or [],
+        "last_action": last_action,
+    }
+    if blocker is not None:
+        arguments["blocker"] = blocker
+    result = controller.handle_advance_stage(
+        ToolCall(
+            id=f"call_stage_{tick_id}",
+            name="advance_stage",
+            arguments=arguments,
+        ),
+        tick_id=tick_id,
+    )
+    assert result.error is False
+    return json.loads(result.content)
+
+
 def _orchestrator_shell(environment: Environment) -> FullDuplexOrchestrator:
     orchestrator = FullDuplexOrchestrator.__new__(FullDuplexOrchestrator)
     orchestrator.environment = environment
@@ -586,7 +614,7 @@ def test_ledger_contradiction_surfaces_as_ambiguous_stage_fact():
     assert "account_id: cust_123, cust_999" in packet["ambiguous_facts"]
     assert (
         packet["ask_next"]
-        == "Clarify the exact value for: account_id: cust_123, cust_999."
+        == "Ask one concise clarification question for account_id: cust_123, cust_999."
     )
 
 
@@ -656,6 +684,225 @@ def test_advance_stage_returns_packet_without_domain_tool_execution():
     assert packet["stage"] == "identify_or_authenticate"
     assert environment.tools.write_count == 0
     environment.get_response.assert_not_called()
+
+
+def test_max_advance_stage_calls_triggers_guard(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+        max_advance_stage_calls_per_sim=1,
+        max_repeated_same_stage=10,
+        max_repeated_same_blocker=10,
+    )
+
+    first_packet = _advance_stage_packet(controller, tick_id=1)
+    guarded_packet = _advance_stage_packet(controller, tick_id=2)
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert first_packet["schema_version"] == "stagegate.stage_packet.v1"
+    assert guarded_packet["schema_version"] == "stagegate.stage_packet.v1"
+    assert guarded_packet["allowed_write_tools"] == []
+    assert guarded_packet["ask_next"].startswith("Ask the customer for")
+    assert controller.loop_guard_triggered is True
+    assert any(event["event_type"] == "stage_loop_guard_triggered" for event in events)
+
+
+def test_repeated_same_stage_triggers_guard():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+        max_advance_stage_calls_per_sim=10,
+        max_repeated_same_stage=1,
+        max_repeated_same_blocker=10,
+    )
+
+    _advance_stage_packet(controller, current_stage="understand_intent", tick_id=1)
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        tick_id=2,
+    )
+
+    assert controller.loop_guard_triggered is True
+    assert controller.repeated_stage_count == 2
+    assert packet["do_not"][0] == "Do not call advance_stage again immediately."
+
+
+def test_repeated_blocker_triggers_guard():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+        max_advance_stage_calls_per_sim=10,
+        max_repeated_same_stage=10,
+        max_repeated_same_blocker=1,
+    )
+
+    _advance_stage_packet(
+        controller,
+        current_stage="propose_action_and_confirm",
+        blocker="missing_confirmation",
+        tick_id=1,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="propose_action_and_confirm",
+        blocker="missing_confirmation",
+        tick_id=2,
+    )
+
+    assert controller.loop_guard_triggered is True
+    assert controller.repeated_blocker_count == 2
+    assert packet["missing_facts"][0] == "missing_confirmation"
+
+
+def test_guard_fallback_does_not_execute_domain_tool():
+    environment = _environment()
+    environment.get_response = MagicMock(side_effect=AssertionError("unexpected call"))
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+        max_advance_stage_calls_per_sim=1,
+        max_repeated_same_stage=10,
+        max_repeated_same_blocker=10,
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_stage_1",
+            name="advance_stage",
+            arguments={
+                "current_stage": "understand_intent",
+                "observed_facts": [],
+                "last_action": "started",
+            },
+        ),
+        tick_id=1,
+    )
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_stage_2",
+            name="advance_stage",
+            arguments={
+                "current_stage": "understand_intent",
+                "observed_facts": [],
+                "last_action": "still unclear",
+            },
+        ),
+        tick_id=2,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["allowed_write_tools"] == []
+    assert environment.tools.write_count == 0
+    environment.get_response.assert_not_called()
+
+
+def test_stage_packets_include_only_stage_scoped_missing_facts():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        tick_id=1,
+    )
+
+    missing = " ".join(packet["missing_facts"]).lower()
+    assert "payment" not in missing
+    assert "address" not in missing
+    assert len(packet["missing_facts"]) < len(controller.ledger.slots)
+
+
+def test_retail_identity_packet_excludes_later_stage_slots():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(controller, current_stage="understand_intent")
+    text = " ".join([*packet["missing_facts"], *packet["do_not"]]).lower()
+
+    assert "payment method" not in text
+    assert "address" not in text
+
+
+def test_airline_identity_packet_excludes_fee_and_change_slots():
+    environment = _environment(domain_name="airline")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(controller, current_stage="understand_intent")
+    text = " ".join(packet["missing_facts"]).lower()
+
+    assert "fee" not in text
+    assert "change" not in text
+
+
+def test_telecom_identity_packet_excludes_plan_and_device_slots():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(controller, current_stage="understand_intent")
+    text = " ".join(packet["missing_facts"]).lower()
+
+    assert "plan" not in text
+    assert "device" not in text
+
+
+def test_stagegate_packet_uses_ledger_enrichment():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_email",
+            name="find_user_id_by_email",
+            arguments={"email": "ada@example.com"},
+        ),
+        tick_id=1,
+    )
+
+    packet = _advance_stage_packet(controller, current_stage="understand_intent")
+
+    assert packet["known_facts"]["email"]["value"] == "ada@example.com"
+    assert "customer email" not in packet["missing_facts"]
 
 
 def test_stage_only_does_not_block_normal_domain_tools():
@@ -1688,6 +1935,70 @@ def test_domain_tool_trace_events_are_emitted(monkeypatch, tmp_path):
     assert events[4]["payload"]["tool_error"] is False
 
 
+def test_trace_summary_includes_stage_validator_and_ledger_counts(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    _advance_stage_packet(controller, current_stage="understand_intent", tick_id=1)
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        tick_id=2,
+    )
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_read",
+            name="get_tasks",
+            arguments={},
+        ),
+        tick_id=3,
+    )
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_write",
+            name="update_account",
+            arguments={"account_id": "cust_123", "plan_name": "premium"},
+        ),
+        tick_id=4,
+    )
+    controller.trace_run_end(termination_reason="max_steps", duration_seconds=1.5)
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    summary_event = [
+        event for event in events if event["event_type"] == "trace_summary"
+    ][-1]
+    run_end = events[-1]
+
+    assert summary_event["payload"]["advance_stage_call_count"] == 1
+    assert summary_event["payload"]["validator_allow_count"] == 1
+    assert summary_event["payload"]["validator_block_count"] == 1
+    assert summary_event["payload"]["ledger_update_count"] == 1
+    assert summary_event["payload"]["stage_sequence"] == ["identify_or_authenticate"]
+    assert summary_event["payload"]["final_stage"] == "identify_or_authenticate"
+    assert summary_event["payload"]["last_stage_packet"]["schema_version"] == (
+        "stagegate.stage_packet.v1"
+    )
+    assert summary_event["payload"]["last_validator_decision"]["decision"] == "block"
+    assert run_end["payload"]["advance_stage_call_count"] == 1
+    assert run_end["payload"]["termination_reason"] == "max_steps"
+
+
 def test_run_single_task_attaches_trial_for_trace_context(monkeypatch):
     orchestrator = SimpleNamespace()
 
@@ -1753,8 +2064,13 @@ def test_full_duplex_run_traces_run_end_on_exception(monkeypatch, tmp_path):
         FullDuplexOrchestrator.run(orchestrator)
 
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
-    assert [event["event_type"] for event in events] == ["run_start", "run_end"]
+    assert [event["event_type"] for event in events] == [
+        "run_start",
+        "trace_summary",
+        "run_end",
+    ]
     assert events[0]["trial"] == 3
     assert events[1]["trial"] == 3
-    assert events[1]["payload"]["termination_reason"] == "exception"
-    assert events[1]["payload"]["duration_seconds"] >= 0
+    assert events[2]["trial"] == 3
+    assert events[2]["payload"]["termination_reason"] == "exception"
+    assert events[2]["payload"]["duration_seconds"] >= 0

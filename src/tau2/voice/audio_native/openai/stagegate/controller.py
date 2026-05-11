@@ -29,6 +29,12 @@ from tau2.voice.audio_native.openai.stagegate.validator import (
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
 ADVANCE_STAGE_TOOL_NAME = "advance_stage"
 VALID_CONDITIONS = {"baseline", "stage_only", "stagegate"}
+MAX_ADVANCE_STAGE_CALLS_ENV_VAR = "TAU2_STAGEGATE_MAX_ADVANCE_STAGE_CALLS"
+MAX_REPEATED_STAGE_ENV_VAR = "TAU2_STAGEGATE_MAX_REPEATED_STAGE"
+MAX_REPEATED_BLOCKER_ENV_VAR = "TAU2_STAGEGATE_MAX_REPEATED_BLOCKER"
+DEFAULT_MAX_ADVANCE_STAGE_CALLS_PER_SIM = 12
+DEFAULT_MAX_REPEATED_SAME_STAGE = 3
+DEFAULT_MAX_REPEATED_SAME_BLOCKER = 2
 
 STAGEGATE_PROMPT_ADDITION = """
 StageGate operating rules:
@@ -71,6 +77,9 @@ class StageGateController:
         tools: list[Tool],
         domain_name: Optional[str] = None,
         trace_writer: Optional[JsonlTraceWriter] = None,
+        max_advance_stage_calls_per_sim: Optional[int] = None,
+        max_repeated_same_stage: Optional[int] = None,
+        max_repeated_same_blocker: Optional[int] = None,
     ):
         self.condition = condition
         self.domain_policy = domain_policy
@@ -82,6 +91,37 @@ class StageGateController:
         self.benchmark_task_id: Optional[str] = None
         self.sim_id: Optional[str] = None
         self.trial: Optional[int] = None
+        self.max_advance_stage_calls_per_sim = _resolve_int_setting(
+            explicit=max_advance_stage_calls_per_sim,
+            env_var=MAX_ADVANCE_STAGE_CALLS_ENV_VAR,
+            default=DEFAULT_MAX_ADVANCE_STAGE_CALLS_PER_SIM,
+        )
+        self.max_repeated_same_stage = _resolve_int_setting(
+            explicit=max_repeated_same_stage,
+            env_var=MAX_REPEATED_STAGE_ENV_VAR,
+            default=DEFAULT_MAX_REPEATED_SAME_STAGE,
+        )
+        self.max_repeated_same_blocker = _resolve_int_setting(
+            explicit=max_repeated_same_blocker,
+            env_var=MAX_REPEATED_BLOCKER_ENV_VAR,
+            default=DEFAULT_MAX_REPEATED_SAME_BLOCKER,
+        )
+        self.advance_stage_call_count = 0
+        self.stage_sequence: list[str] = []
+        self.repeated_stage_count = 0
+        self.repeated_blocker_count = 0
+        self._last_stage: Optional[str] = None
+        self._current_repeated_stage_count = 0
+        self._last_blocker_pattern: Optional[tuple[str, ...]] = None
+        self._current_repeated_blocker_count = 0
+        self.loop_guard_triggered = False
+        self.validator_block_count = 0
+        self.validator_allow_count = 0
+        self.ledger_update_count = 0
+        self.final_stage: Optional[str] = None
+        self.last_stage_packet: Optional[dict[str, object]] = None
+        self.last_validator_decision: Optional[dict[str, object]] = None
+        self.last_corrective_packet: Optional[dict[str, object]] = None
         if self.condition == "stagegate":
             self.ledger = EntityLedger.for_domain(domain_name)
             self.validator = PreWriteValidator(
@@ -204,8 +244,37 @@ class StageGateController:
             last_action=last_action,
             blocker=blocker_text,
             tools=self.session_tools(self.tools),
+            domain_name=self.domain_name,
             ledger=self._active_ledger(),
         )
+        guard_reason = self._record_advance_stage_guard_state(
+            packet=packet,
+            blocker=blocker_text,
+        )
+        if guard_reason is not None:
+            packet = self.packet_orchestrator.build_fallback_packet(
+                packet=packet,
+                guard_reason=guard_reason,
+            )
+            self.loop_guard_triggered = True
+            self._remember_stage_packet(packet)
+            self.last_corrective_packet = packet.model_dump(mode="json")
+            self._trace(
+                "stage_loop_guard_triggered",
+                tick_index=tick_id,
+                stage=packet.stage,
+                source="advance_stage_guard",
+                tool_name=tool_call.name,
+                tool_args=tool_call.arguments,
+                payload={
+                    "tool_call_id": tool_call.id,
+                    "guard_reason": guard_reason,
+                    "summary": self.trace_summary_payload(),
+                    "fallback_packet": packet.model_dump(mode="json"),
+                },
+            )
+        else:
+            self._remember_stage_packet(packet)
         self._trace(
             "stage_packet_returned",
             tick_index=tick_id,
@@ -241,7 +310,14 @@ class StageGateController:
         duration_seconds: Optional[float] = None,
     ) -> None:
         """Emit run_end before posthoc evaluation output is available."""
-        payload: dict[str, object] = {}
+        summary = self.trace_summary_payload()
+        self._trace(
+            "trace_summary",
+            visible_to_agent=False,
+            source="stagegate_summary",
+            payload=summary,
+        )
+        payload: dict[str, object] = dict(summary)
         if termination_reason is not None:
             payload["termination_reason"] = termination_reason
         if duration_seconds is not None:
@@ -427,6 +503,18 @@ class StageGateController:
             payload["corrective_packet"] = decision.corrective_packet.model_dump(
                 mode="json"
             )
+            self.last_corrective_packet = payload["corrective_packet"]
+
+        if decision.allowed:
+            self.validator_allow_count += 1
+        else:
+            self.validator_block_count += 1
+        self.last_validator_decision = {
+            "tool_name": tool_call.name,
+            "decision": decision.decision,
+            "reason": decision.reason,
+            "checks": decision.checks,
+        }
 
         self._trace(
             "validator_check",
@@ -525,6 +613,23 @@ class StageGateController:
             return None
         return getattr(self, "validator", None)
 
+    def trace_summary_payload(self) -> dict[str, object]:
+        """Return trace-only StageGate triage counters for the current run."""
+        return {
+            "advance_stage_call_count": self.advance_stage_call_count,
+            "repeated_stage_count": self.repeated_stage_count,
+            "repeated_blocker_count": self.repeated_blocker_count,
+            "loop_guard_triggered": self.loop_guard_triggered,
+            "validator_block_count": self.validator_block_count,
+            "validator_allow_count": self.validator_allow_count,
+            "ledger_update_count": self.ledger_update_count,
+            "stage_sequence": list(self.stage_sequence),
+            "final_stage": self.final_stage,
+            "last_stage_packet": self.last_stage_packet,
+            "last_validator_decision": self.last_validator_decision,
+            "last_corrective_packet": self.last_corrective_packet,
+        }
+
     def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
         if self.condition != "stagegate":
             return
@@ -547,6 +652,7 @@ class StageGateController:
         tick_id: Optional[int],
     ) -> None:
         for delta in deltas:
+            self.ledger_update_count += 1
             self._trace(
                 "ledger_update",
                 tick_index=tick_id,
@@ -555,3 +661,95 @@ class StageGateController:
                 ledger_delta={str(delta["field"]): delta},
                 payload={"tool_call_id": tool_call_id},
             )
+
+    def _record_advance_stage_guard_state(
+        self,
+        *,
+        packet,
+        blocker: Optional[str],
+    ) -> Optional[str]:
+        self.advance_stage_call_count += 1
+        self._record_stage_streak(packet.stage)
+        self._record_blocker_streak(blocker=blocker, missing_facts=packet.missing_facts)
+        self.stage_sequence.append(packet.stage)
+        self.final_stage = packet.stage
+
+        if self.advance_stage_call_count > self.max_advance_stage_calls_per_sim:
+            return "max_advance_stage_calls"
+        if self._current_repeated_stage_count > self.max_repeated_same_stage:
+            return "repeated_same_stage"
+        if self._current_repeated_blocker_count > self.max_repeated_same_blocker:
+            return "repeated_same_blocker"
+        return None
+
+    def _record_stage_streak(self, stage: str) -> None:
+        if stage == self._last_stage:
+            self._current_repeated_stage_count += 1
+        else:
+            self._last_stage = stage
+            self._current_repeated_stage_count = 1
+        self.repeated_stage_count = max(
+            self.repeated_stage_count,
+            self._current_repeated_stage_count,
+        )
+
+    def _record_blocker_streak(
+        self,
+        *,
+        blocker: Optional[str],
+        missing_facts: list[str],
+    ) -> None:
+        pattern = self._blocker_pattern(blocker=blocker, missing_facts=missing_facts)
+        if pattern is None:
+            self._last_blocker_pattern = None
+            self._current_repeated_blocker_count = 0
+            return
+        if pattern == self._last_blocker_pattern:
+            self._current_repeated_blocker_count += 1
+        else:
+            self._last_blocker_pattern = pattern
+            self._current_repeated_blocker_count = 1
+        self.repeated_blocker_count = max(
+            self.repeated_blocker_count,
+            self._current_repeated_blocker_count,
+        )
+
+    def _blocker_pattern(
+        self,
+        *,
+        blocker: Optional[str],
+        missing_facts: list[str],
+    ) -> Optional[tuple[str, ...]]:
+        values = [blocker or "", *missing_facts]
+        normalized = tuple(
+            " ".join(value.strip().lower().split())
+            for value in values
+            if value and value.strip()
+        )
+        return normalized or None
+
+    def _remember_stage_packet(self, packet) -> None:
+        self.final_stage = packet.stage
+        if self.stage_sequence:
+            self.stage_sequence[-1] = packet.stage
+        else:
+            self.stage_sequence.append(packet.stage)
+        self.last_stage_packet = packet.model_dump(mode="json")
+
+
+def _resolve_int_setting(
+    *,
+    explicit: Optional[int],
+    env_var: str,
+    default: int,
+) -> int:
+    if explicit is not None:
+        return max(1, int(explicit))
+    raw_value = os.environ.get(env_var)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        logger.warning(f"Invalid {env_var}={raw_value!r}; using default {default}.")
+        return default
