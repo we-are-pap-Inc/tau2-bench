@@ -135,6 +135,11 @@ agent.
   an error `ToolMessage` containing a corrective stage packet and do not touch
   domain state. Baseline plus passive JSONL tracing stays on the normal domain
   tool execution path.
+- `src/tau2/data_model/message.py` and the full-duplex orchestrator keep
+  replayable environment tool calls/results separate from StageGate-internal
+  tool calls/results. StageGate-blocked domain writes and StageGate control
+  tools remain model-visible and trace-visible, but they are stored in internal
+  tick fields and excluded from replay/evaluation message-history conversion.
 - `src/tau2/voice/audio_native/openai/__init__.py` lazy-loads provider and
   adapter classes so importing the StageOnly package does not make core
   τ-bench imports require voice-only dependencies.
@@ -243,6 +248,11 @@ remains validator-free; the pre-write validator is active only for
   consumption.
 - [x] Gate `advance_stage` with pending-write state so unconsumed pending writes
   cannot drift to `verify_result_and_close`.
+- [x] Separate model-visible StageGate blocked/control tool outputs from the
+  canonical replayable environment action trajectory. Only actual
+  `Environment.get_response()` executions are serialized into canonical
+  `Tick.*_tool_calls` / `Tick.*_tool_results`; blocked writes and StageGate
+  internal tools are stored in internal tick fields and remain trace-visible.
 
 ## Tests
 
@@ -306,6 +316,11 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   blocked/confirmed/consumed writes, pending-write trace events,
   baseline/StageOnly absence of validator state, and absence of semantic
   transcript regex in the validator source.
+- trajectory/replay tests cover StageGate-blocked writes as internal
+  non-replayable outputs, model-visible corrective packets, replayable allowed
+  retries, StageGate internal tools excluded from domain action replay, the
+  successful exchange sequence containing only the final allowed exchange write,
+  and trace visibility for the blocked write.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -703,6 +718,21 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-11 pending-write `next_tool_call` affordance:
   `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
   result: `StageGate prohibited-path guard passed.`
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `83 passed, 2 warnings in 0.42s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_environment.py -q`
+  result: `9 passed, 2 warnings in 0.01s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -816,6 +846,13 @@ Warnings observed in the passing focused and voice test commands:
   and transferred to a human. Pending-write recorder tools now resolve the
   active pending write by default, and transfer is blocked while that active
   write remains structurally resolvable.
+- 2026-05-11 smoke_010 replay triage: the live pending-write protocol
+  succeeded, but the first StageGate-blocked exchange was serialized as a
+  replayable environment action. Replay then executed that blocked call against
+  a clean environment and compared the real exchange result with the stored
+  StageGate corrective packet. Canonical full-duplex tool-call/result fields
+  now contain only actual environment executions; blocked writes and internal
+  StageGate tools are stored separately and ignored by replay.
 
 ## Remaining Work
 

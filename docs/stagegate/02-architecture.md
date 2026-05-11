@@ -234,6 +234,28 @@ Pending write confirmation:
   is allowed with no active pending write, or after the active pending write is
   `denied`, `consumed`, or `expired`.
 
+## Trajectory and Replay Boundary
+
+StageGate separates model-visible scaffold behavior from replayable benchmark
+environment actions:
+
+- `model_requested_domain_tool`: the model attempted a domain tool call. This is
+  trace-visible, but it is not automatically an environment execution.
+- `stagegate_blocked_domain_tool`: StageGate intercepted the requested domain
+  write before `Environment.get_response()`. The model still receives the
+  corrective tool output, but the blocked call/result is stored only in
+  internal tick fields and is excluded from replay.
+- `environment_domain_tool_result`: the domain tool actually executed through
+  the environment. Only these results are serialized into the canonical
+  replayable tool-call/result fields.
+
+The canonical `Tick.agent_tool_calls`, `Tick.user_tool_calls`, and matching
+result fields contain only real environment executions. StageGate-internal
+control tools (`advance_stage`, `record_pending_write_summary`,
+`record_pending_write_confirmation`) and StageGate-blocked domain writes are
+stored in internal tick fields for auditability and model-visible continuity,
+but are ignored by replay/evaluation conversion.
+
 Allow result:
 
     {"decision": "allow"}
@@ -294,3 +316,4 @@ Pending-write runtime events are:
 - `pending_write_mismatch`
 - `pending_write_consumed`
 - `transfer_blocked_pending_write`
+- `stagegate_blocked_domain_tool`

@@ -15,6 +15,7 @@ from tau2.data_model.simulation import RewardInfo, SimulationRun
 from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
+from tau2.evaluator.evaluator_env import FullDuplexEnvironmentEvaluator
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
 from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
@@ -437,6 +438,41 @@ class ScriptedStageGateAgent:
                 content=None,
                 contains_speech=False,
                 tool_calls=[self.tool_call],
+            ),
+            state,
+        )
+
+
+class ScriptedSequenceStageGateAgent:
+    def __init__(self, controller: StageGateController, tool_calls: list[ToolCall]):
+        self.stagegate_controller = controller
+        self.tool_calls = list(tool_calls)
+        self.received_chunks = []
+        self.received_tool_results = []
+
+    @classmethod
+    def is_stop(cls, message):
+        return False
+
+    def get_next_chunk(
+        self,
+        state,
+        participant_chunk=None,
+        tool_results=None,
+    ):
+        self.received_chunks.append(participant_chunk)
+        self.received_tool_results.append(tool_results)
+        if not self.tool_calls:
+            return (
+                AssistantMessage(role="assistant", content=None, contains_speech=False),
+                state,
+            )
+        return (
+            AssistantMessage(
+                role="assistant",
+                content=None,
+                contains_speech=False,
+                tool_calls=[self.tool_calls.pop(0)],
             ),
             state,
         )
@@ -1583,8 +1619,352 @@ def test_pending_write_creation_blocks_first_write(monkeypatch, tmp_path):
     assert "retry update_account directly" in packet["when_done"]
     assert environment.tools.write_count == 0
     assert "pending_write_created" in [event["event_type"] for event in events]
-    assert events[-1]["event_type"] == "validator_block"
+    assert events[-2]["event_type"] == "validator_block"
+    assert events[-2]["validator_reason"] == "missing_action_summary"
+    assert events[-1]["event_type"] == "stagegate_blocked_domain_tool"
     assert events[-1]["validator_reason"] == "missing_action_summary"
+    assert events[-1]["payload"]["replayable_environment_action"] is False
+    assert events[-1]["payload"]["environment_mutated"] is False
+
+
+def test_stagegate_blocked_write_is_internal_and_not_replayable(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _visibility_orchestrator(
+        environment,
+        controller,
+        user_chunks=[UserMessage.text("Yes, I confirm.")],
+    )
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+
+    tick = orchestrator.ticks[-1]
+    assert tick.agent_tool_calls == []
+    assert tick.agent_tool_results == []
+    assert [call.name for call in tick.agent_internal_tool_calls] == ["update_account"]
+    assert tick.agent_internal_tool_results[0].error is True
+    assert (
+        json.loads(tick.agent_internal_tool_results[0].content)["schema_version"]
+        == "stagegate.stage_packet.v1"
+    )
+    assert orchestrator.pending_agent_tool_results is not None
+
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    assert not any(
+        getattr(message, "tool_calls", None)
+        and any(call.name == "update_account" for call in message.tool_calls)
+        for message in replay_messages
+    )
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert "model_function_call" in event_types
+    assert "validator_block" in event_types
+    assert "stagegate_blocked_domain_tool" in event_types
+    assert not any(
+        event["event_type"] == "domain_tool_call"
+        and event["tool_name"] == "update_account"
+        for event in events
+    )
+    assert not any(
+        event["event_type"] == "domain_tool_result"
+        and event["tool_name"] == "update_account"
+        for event in events
+    )
+
+
+def test_allowed_retry_is_replayable_after_stagegate_confirmation():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _visibility_orchestrator(
+        environment,
+        controller,
+        user_chunks=[UserMessage.text("Please do.")],
+    )
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+    first_tick = orchestrator.ticks[-1]
+    assert first_tick.agent_tool_calls == []
+    assert first_tick.agent_internal_tool_calls[0].name == "update_account"
+    assert environment.tools.write_count == 0
+
+    summary = _record_pending_summary(
+        orchestrator,
+        controller,
+        tick_id=20,
+        action_type="update_account",
+    )
+    assert json.loads(summary.content)["ok"] is True
+    confirmation = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=21,
+        tool_tick_id=22,
+    )
+    assert json.loads(confirmation.content)["ok"] is True
+
+    orchestrator.step()
+    second_tick = orchestrator.ticks[-1]
+    assert [call.name for call in second_tick.agent_tool_calls] == ["update_account"]
+    assert second_tick.agent_tool_results[0].error is False
+    assert second_tick.agent_internal_tool_calls == []
+    assert environment.tools.write_count == 1
+
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    replayed_environment = _environment()
+    replayed_environment.set_state(None, None, replay_messages)
+    assert replayed_environment.tools.write_count == 1
+
+
+def test_stagegate_internal_tools_are_not_replayable_domain_actions():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_stage",
+                name="advance_stage",
+                arguments={
+                    "current_stage": "understand_intent",
+                    "observed_facts": [],
+                    "last_action": "started",
+                },
+            ),
+            ToolCall(
+                id="call_summary",
+                name="record_pending_write_summary",
+                arguments={
+                    "summary_presented": True,
+                    "action_type": "update_account",
+                    "consequence_presented": True,
+                    "confirmation_requested": True,
+                },
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser(
+        [UserMessage.text("Hi."), UserMessage.text("Still here.")]
+    )
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need help.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_internal_tools")
+    orchestrator.simulation_id = "sim_internal_tools"
+
+    orchestrator.step()
+    orchestrator.step()
+
+    assert [
+        call.name
+        for tick in orchestrator.ticks
+        for call in tick.agent_internal_tool_calls
+    ] == ["advance_stage", "record_pending_write_summary"]
+    assert [
+        call.name for tick in orchestrator.ticks for call in tick.agent_tool_calls
+    ] == []
+    assert (
+        FullDuplexEnvironmentEvaluator.ticks_to_message_history(orchestrator.ticks)
+        == []
+    )
+
+
+def test_stage_only_advance_stage_is_not_replayable_domain_action():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_stage",
+                name="advance_stage",
+                arguments={
+                    "current_stage": "understand_intent",
+                    "observed_facts": [],
+                    "last_action": "started",
+                },
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser([UserMessage.text("Hi.")])
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need help.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_stage_only_internal")
+    orchestrator.simulation_id = "sim_stage_only_internal"
+
+    orchestrator.step()
+
+    assert not hasattr(controller, "ledger")
+    assert not hasattr(controller, "validator")
+    assert orchestrator.ticks[-1].agent_tool_calls == []
+    assert [call.name for call in orchestrator.ticks[-1].agent_internal_tool_calls] == [
+        "advance_stage"
+    ]
+    assert (
+        FullDuplexEnvironmentEvaluator.ticks_to_message_history(orchestrator.ticks)
+        == []
+    )
+
+
+def test_successful_stagegate_exchange_serializes_only_allowed_exchange():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    exchange_call = _exchange_tool_call("call_exchange_retry")
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_find_user",
+                name="find_user_id_by_name_zip",
+                arguments={
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
+            ),
+            ToolCall(
+                id="call_user",
+                name="get_user_details",
+                arguments={"user_id": "yusuf_rossi_9620"},
+            ),
+            ToolCall(
+                id="call_order",
+                name="get_order_details",
+                arguments={"order_id": "#W2378156"},
+            ),
+            ToolCall(
+                id="call_keyboard",
+                name="get_product_details",
+                arguments={"product_id": "1656367028"},
+            ),
+            ToolCall(
+                id="call_thermostat",
+                name="get_product_details",
+                arguments={"product_id": "4896585277"},
+            ),
+            _exchange_tool_call("call_exchange_blocked"),
+            ToolCall(
+                id="call_summary",
+                name="record_pending_write_summary",
+                arguments={
+                    "summary_presented": True,
+                    "action_type": "exchange_delivered_order_items",
+                    "consequence_presented": True,
+                    "confirmation_requested": True,
+                },
+            ),
+            ToolCall(
+                id="call_confirmation",
+                name="record_pending_write_confirmation",
+                arguments={
+                    "decision": "confirmed",
+                    "basis": "latest_user_turn",
+                },
+            ),
+            exchange_call,
+        ],
+    )
+    orchestrator.user = ScriptedUser([UserMessage.text("continue") for _ in range(9)])
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need an exchange.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_exchange_serialization")
+    orchestrator.simulation_id = "sim_exchange_serialization"
+
+    for _ in range(7):
+        orchestrator.step()
+    controller.record_agent_visible_user_transcript("Yes.", tick_id=7)
+    orchestrator.step()
+    orchestrator.step()
+
+    canonical_tool_names = [
+        call.name for tick in orchestrator.ticks for call in tick.agent_tool_calls
+    ]
+    assert canonical_tool_names == [
+        "find_user_id_by_name_zip",
+        "get_user_details",
+        "get_order_details",
+        "get_product_details",
+        "get_product_details",
+        "exchange_delivered_order_items",
+    ]
+    assert [
+        call.name
+        for tick in orchestrator.ticks
+        for call in tick.agent_internal_tool_calls
+    ] == [
+        "exchange_delivered_order_items",
+        "record_pending_write_summary",
+        "record_pending_write_confirmation",
+    ]
+    assert environment.tools.write_count == 1
+
+    replayed_environment = _retail_exchange_environment()
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    replayed_environment.set_state(None, None, replay_messages)
+    assert replayed_environment.tools.write_count == 1
 
 
 def test_summary_tool_records_summary_without_transcript_parsing():
@@ -2588,10 +2968,13 @@ def test_same_tick_user_turn_cannot_satisfy_pending_confirmation():
     orchestrator.step()
 
     tick = orchestrator.ticks[-1]
-    packet = json.loads(tick.agent_tool_results[0].content)
+    packet = json.loads(tick.agent_internal_tool_results[0].content)
     assert tick.user_chunk.content == "Yes, I confirm."
     assert orchestrator.agent.received_chunks[-1].content == "I want the premium plan."
-    assert tick.agent_tool_results[0].error is True
+    assert tick.agent_tool_calls == []
+    assert tick.agent_tool_results == []
+    assert tick.agent_internal_tool_calls[0].name == "update_account"
+    assert tick.agent_internal_tool_results[0].error is True
     assert packet["missing_facts"] == ["missing_action_summary"]
     assert environment.tools.write_count == 0
 
@@ -2612,14 +2995,20 @@ def test_next_tick_clean_user_content_does_not_confirm_without_internal_tool():
     _prepare_validated_account_change(orchestrator, controller)
 
     orchestrator.step()
-    first_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    first_tick = orchestrator.ticks[-1]
+    first_tick_result = first_tick.agent_internal_tool_results[0]
+    assert first_tick.agent_tool_calls == []
+    assert first_tick.agent_tool_results == []
     assert first_tick_result.error is True
     assert environment.tools.write_count == 0
 
     orchestrator.step()
 
-    second_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    second_tick = orchestrator.ticks[-1]
+    second_tick_result = second_tick.agent_internal_tool_results[0]
     assert orchestrator.agent.received_chunks[-1].content == "Yes, I confirm."
+    assert second_tick.agent_tool_calls == []
+    assert second_tick.agent_tool_results == []
     assert second_tick_result.error is True
     assert json.loads(second_tick_result.content)["missing_facts"] == [
         "missing_action_summary"

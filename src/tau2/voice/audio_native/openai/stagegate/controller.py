@@ -772,6 +772,40 @@ class StageGateController:
             error=True,
         )
 
+    def trace_stagegate_blocked_domain_tool(
+        self,
+        tool_call: ToolCall,
+        decision: ValidatorDecision,
+        tool_message: ToolMessage,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Trace a StageGate-intercepted domain tool that did not hit the environment."""
+        payload: dict[str, object] = {
+            "tool_call_id": tool_call.id,
+            "tool_result_id": tool_message.id,
+            "replayable_environment_action": False,
+            "environment_mutated": False,
+            "model_visible": True,
+            "reason": decision.reason,
+            "checks": decision.checks,
+        }
+        if decision.pending_write_id is not None:
+            payload["pending_write_id"] = decision.pending_write_id
+            payload["args_fingerprint"] = decision.args_fingerprint
+            payload["matched_facets"] = decision.matched_facets
+            payload["missing_facets"] = decision.missing_facets
+        self._trace(
+            "stagegate_blocked_domain_tool",
+            tick_index=tick_id,
+            source="stagegate_validator",
+            tool_name=tool_call.name,
+            tool_args=tool_call.arguments,
+            validator_decision=decision.decision,
+            validator_reason=decision.reason,
+            payload=payload,
+        )
+
     def _trace(
         self,
         event_type: str,
