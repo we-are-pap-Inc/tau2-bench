@@ -667,9 +667,11 @@ class PreWriteValidator:
             return False
         if not summary_requests_confirmation(normalized):
             return False
-        if not self._summary_mentions_order_reference(normalized, tool_call):
+        if not self._summary_mentions_exchange_items(normalized, tool_call):
             return False
-        return self._summary_mentions_exchange_items(normalized, tool_call)
+        if self._summary_mentions_order_reference(normalized, tool_call):
+            return True
+        return self._summary_mentions_all_exchange_item_ids(normalized, tool_call)
 
     def _summary_mentions_order_reference(
         self,
@@ -713,6 +715,27 @@ class PreWriteValidator:
         descriptor_tokens = self._descriptor_tokens_for_values(target_values)
         summary_tokens = meaningful_tokens(normalized_summary)
         return len(summary_tokens & descriptor_tokens) >= 3
+
+    def _summary_mentions_all_exchange_item_ids(
+        self,
+        normalized_summary: str,
+        tool_call: ToolCall,
+    ) -> bool:
+        old_item_ids = {
+            normalize_value(value)
+            for value in iter_values(tool_call.arguments.get("item_ids"))
+        }
+        new_item_ids = {
+            normalize_value(value)
+            for value in iter_values(tool_call.arguments.get("new_item_ids"))
+        }
+        old_item_ids.discard(None)
+        new_item_ids.discard(None)
+        all_item_ids = old_item_ids | new_item_ids
+        return bool(all_item_ids) and all(
+            normalized_text_mentions_value(normalized_summary, value)
+            for value in all_item_ids
+        )
 
     def _descriptor_tokens_for_values(self, normalized_values: set[str]) -> set[str]:
         if not normalized_values:

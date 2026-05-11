@@ -561,6 +561,41 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 smoke_007 confirmation-validator triage:
   `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/stagegate --head HEAD`
   result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 smoke_008 post-patch smoke:
+  `uv run --with modal modal run modal_tau3_voice_stagegate.py --batch-id smoke_008 --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git --repo-ref e595172fad05c15dc95e35adb35431f54c328d48 --mode smoke`
+  completed all three Modal jobs. Baseline result: reward `1.0`,
+  termination `user_stop`. StageOnly result: reward `1.0`, termination
+  `user_stop`. StageGate result: reward `0.0`, termination `max_steps`.
+- 2026-05-10 smoke_008 post-patch smoke:
+  `uv run --with modal modal run modal_tau3_voice_stagegate.py --batch-id smoke_008 --collect-completed`
+  result: completed manifest written with 3 runs at
+  `/runs/smoke_008/batch_manifest_completed.json`.
+- 2026-05-10 smoke_008 post-patch smoke:
+  StageGate trace replay against the updated local validator showed the live
+  exchange summaries would now match the attempted write at ticks `1000` and
+  `1368`, with user confirmations at ticks `1127` and `1383`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q -k 'exchange_summary or confirmation_before_exchange_summary or missing_exchange_summary'`
+  result: `5 passed, 60 deselected, 2 warnings in 0.07s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `65 passed, 2 warnings in 0.17s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `make format` result: Ruff format left `329 files` unchanged.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `make check-all` result: Ruff check passed and Ruff format left
+  `329 files` unchanged.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `git diff --check` result: passed with no whitespace errors.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/stagegate --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -658,6 +693,12 @@ Warnings observed in the passing focused and voice test commands:
   slots for order items, candidate replacements, selected old items, and
   selected new items. Product variant lists are not surfaced as user-facing
   `item_id` ambiguities in closeout packets.
+- 2026-05-10 smoke_008 follow-up: An exchange summary that omits the literal
+  order ID can still be valid when it contains all old order item IDs, all
+  selected replacement item IDs, consequence/payment language, and a request
+  for confirmation. This keeps the write gate tied to visible, action-specific
+  evidence without requiring the assistant to repeat the order number when the
+  exact item-level write is already unambiguous.
 
 ## Remaining Work
 

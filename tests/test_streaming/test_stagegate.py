@@ -1459,6 +1459,39 @@ def test_exchange_summary_and_yeah_confirmation_allows_write():
     assert environment.tools.write_count == 1
 
 
+def test_exchange_summary_with_exact_item_ids_can_omit_order_word():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "Here's the exchange I'm set to submit. Mechanical Keyboard item "
+            "1151293680 to full-size clicky with no backlight item 7706410293. "
+            "Smart Thermostat item 4983901480 to Google Home compatible black "
+            "thermostat item 7747408585. The price difference is a refund to "
+            "the card ending 2478. Please reply yes to confirm and proceed."
+        ),
+        tick_id=10,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=11)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=12,
+    )
+
+    assert result.error is False
+    assert environment.tools.write_count == 1
+
+
 def test_confirmation_before_exchange_summary_does_not_allow_write():
     environment = _retail_exchange_environment()
     controller = StageGateController(
