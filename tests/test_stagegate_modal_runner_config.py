@@ -16,6 +16,7 @@ from scripts.stagegate_modal_runner_config import (
     REQUIRED_API_SECRET_KEYS,
     REQUIRED_PROVIDER_SECRET_KEYS,
     REQUIRED_REGULAR_VOICE_ID_KEYS,
+    SMOKE_CONSTANTS,
     StageGateJob,
     build_tau2_command,
     check_modal_preflight,
@@ -27,7 +28,11 @@ from scripts.stagegate_modal_runner_config import (
     planned_jobs,
     planned_manifest,
     require_full_commit_sha,
+    run_constants,
+    save_name,
+    trace_run_id,
     validate_final_command,
+    validate_smoke_command,
     write_json,
     write_planned_manifest,
 )
@@ -55,12 +60,29 @@ def test_final_mode_rejects_subsets_and_non_sha_refs():
     require_full_commit_sha("stagegate", mode="smoke")
 
 
-def test_smoke_mode_defaults_and_accepts_subset():
+def test_smoke_mode_defaults_to_all_conditions_on_retail():
     assert planned_jobs(mode="smoke") == [
-        StageGateJob(condition="baseline", domain="retail", mode="smoke")
+        StageGateJob(condition="baseline", domain="retail", mode="smoke"),
+        StageGateJob(condition="stage_only", domain="retail", mode="smoke"),
+        StageGateJob(condition="stagegate", domain="retail", mode="smoke"),
     ]
-    assert planned_jobs(mode="smoke", condition="stagegate", domain="telecom") == [
-        StageGateJob(condition="stagegate", domain="telecom", mode="smoke")
+
+
+def test_smoke_mode_rejects_condition_subsets_and_non_retail_without_override():
+    with pytest.raises(ValueError, match="all StageGate conditions"):
+        planned_jobs(mode="smoke", condition="stagegate")
+
+    with pytest.raises(ValueError, match="retail only"):
+        planned_jobs(mode="smoke", domain="telecom")
+
+    assert planned_jobs(
+        mode="smoke",
+        domain="telecom",
+        allow_dev_smoke_domain=True,
+    ) == [
+        StageGateJob(condition="baseline", domain="telecom", mode="smoke"),
+        StageGateJob(condition="stage_only", domain="telecom", mode="smoke"),
+        StageGateJob(condition="stagegate", domain="telecom", mode="smoke"),
     ]
 
 
@@ -71,9 +93,26 @@ def test_build_tau2_command_enforces_final_constants_and_no_task_filters():
     validate_final_command(argv)
     assert "--num-tasks" not in argv
     assert "--task-ids" not in argv
+    assert "--audio-taps" not in argv
     assert argv[argv.index("--audio-native-model") + 1] == FINAL_CONSTANTS["model"]
     assert argv[argv.index("--speech-complexity") + 1] == "regular"
-    assert argv[argv.index("--save-to") + 1] == "batch_stagegate_airline"
+    assert argv[argv.index("--max-steps-seconds") + 1] == "1200"
+    assert argv[argv.index("--save-to") + 1] == "final_batch_stagegate_airline"
+
+
+def test_build_tau2_command_enforces_smoke_constants_and_debug_artifacts():
+    job = StageGateJob(condition="stage_only", domain="retail", mode="smoke")
+    argv = build_tau2_command("batch", job)
+
+    validate_smoke_command(argv)
+    assert argv[argv.index("--audio-native-model") + 1] == SMOKE_CONSTANTS["model"]
+    assert argv[argv.index("--speech-complexity") + 1] == "control"
+    assert argv[argv.index("--max-steps-seconds") + 1] == "300"
+    assert argv[argv.index("--num-tasks") + 1] == "1"
+    assert "--audio-taps" in argv
+    assert "--auto-resume" not in argv
+    assert "--task-ids" not in argv
+    assert argv[argv.index("--save-to") + 1] == "smoke_batch_stage_only_retail"
 
 
 def test_validate_final_command_rejects_task_filters_and_mutated_constants():
@@ -87,6 +126,24 @@ def test_validate_final_command_rejects_task_filters_and_mutated_constants():
     mutated[mutated.index("--speech-complexity") + 1] = "control"
     with pytest.raises(ValueError, match="--speech-complexity"):
         validate_final_command(mutated)
+
+    with pytest.raises(ValueError, match="audio-taps"):
+        validate_final_command([*argv, "--audio-taps"])
+
+
+def test_validate_smoke_command_rejects_final_shape_and_task_ids():
+    job = StageGateJob(condition="baseline", domain="retail", mode="smoke")
+    argv = build_tau2_command("batch", job)
+
+    with pytest.raises(ValueError, match="--task-ids"):
+        validate_smoke_command([*argv, "--task-ids", "retail_1"])
+
+    with pytest.raises(ValueError, match="auto-resume"):
+        validate_smoke_command([*argv, "--auto-resume"])
+
+    without_audio_taps = [arg for arg in argv if arg != "--audio-taps"]
+    with pytest.raises(ValueError, match="audio-taps"):
+        validate_smoke_command(without_audio_taps)
 
 
 def test_manifest_shape_passes_final_hygiene_guard():
@@ -126,6 +183,28 @@ def test_smoke_manifest_is_rejected_by_final_hygiene_guard():
     assert any("40-character repo SHA" in error for error in errors)
 
 
+def test_smoke_manifest_has_trace_run_id_and_smoke_metadata():
+    job = StageGateJob(condition="stagegate", domain="retail", mode="smoke")
+    manifest = job_manifest_base(
+        batch_id="batch",
+        repo_url=DEFAULT_REPO_URL,
+        repo_ref="stagegate",
+        resolved_commit_sha=None,
+        job=job,
+        start_timestamp=None,
+        end_timestamp=None,
+        status="planned",
+    )
+
+    assert manifest["run_constants"] == run_constants(job)
+    assert manifest["trace_jsonl"] == "/runs/batch/stagegate/retail/trace_events.jsonl"
+    assert manifest["trace_run_id"] == trace_run_id("batch", job)
+    assert manifest["num_tasks"] == "1"
+    assert manifest["audio_taps"] is True
+    assert manifest["auto_resume"] is False
+    assert manifest["save_name"] == save_name("batch", job)
+
+
 def test_collect_completed_manifest_reads_per_job_manifests(tmp_path: Path):
     batch_dir = tmp_path / "batch"
     job = StageGateJob(condition="baseline", domain="retail", mode="final")
@@ -158,7 +237,12 @@ def test_command_metadata_contains_sanitized_argv_only():
     )
 
     assert metadata["sanitized_command_argv"] == build_tau2_command("batch", job)
+    assert metadata["trace_jsonl"] == "/runs/batch/baseline/retail/trace_events.jsonl"
+    assert metadata["trace_run_id"] == "batch:baseline:retail"
+    assert metadata["run_constants"] == run_constants(job)
     assert "OPENAI_API_KEY" not in metadata["sanitized_command"]
+    assert "ELEVENLABS_API_KEY" not in metadata["sanitized_command"]
+    assert "DEEPGRAM_API_KEY" not in metadata["sanitized_command"]
 
 
 def test_write_planned_manifest_is_plan_only_and_final_hygiene_clean(tmp_path: Path):
@@ -176,6 +260,28 @@ def test_write_planned_manifest_is_plan_only_and_final_hygiene_clean(tmp_path: P
     assert len(manifest["runs"]) == 9
     assert validate_final_run_manifest(manifest["runs"]) == []
     assert "modal" not in sys.modules
+
+
+def test_write_planned_smoke_manifest_is_three_retail_jobs(tmp_path: Path):
+    output = tmp_path / "batch_manifest_planned.json"
+
+    manifest = write_planned_manifest(
+        batch_id="batch",
+        repo_url=DEFAULT_REPO_URL,
+        repo_ref="stagegate",
+        mode="smoke",
+        output_path=output,
+    )
+
+    assert output.exists()
+    assert [(run["condition"], run["domain"]) for run in manifest["runs"]] == [
+        ("baseline", "retail"),
+        ("stage_only", "retail"),
+        ("stagegate", "retail"),
+    ]
+    assert all(run["mode"] == "smoke" for run in manifest["runs"])
+    assert all(run["speech_complexity"] == "control" for run in manifest["runs"])
+    assert any(validate_final_run_manifest(manifest["runs"]))
 
 
 def test_plan_only_cli_does_not_require_modal_or_secret(tmp_path: Path):
@@ -255,7 +361,7 @@ def test_modal_preflight_accepts_existing_secret():
     assert result["secret_exists"] is True
 
 
-def test_modal_secret_required_keys_include_regular_voice_personas_only():
+def test_modal_secret_required_keys_include_control_and_regular_voice_personas():
     assert REQUIRED_API_SECRET_KEYS == (
         "OPENAI_API_KEY",
         "ELEVENLABS_API_KEY",
@@ -270,9 +376,9 @@ def test_modal_secret_required_keys_include_regular_voice_personas_only():
     )
     assert set(REQUIRED_PROVIDER_SECRET_KEYS) == {
         *REQUIRED_API_SECRET_KEYS,
+        *OPTIONAL_CONTROL_VOICE_ID_KEYS,
         *REQUIRED_REGULAR_VOICE_ID_KEYS,
     }
-    assert not set(OPTIONAL_CONTROL_VOICE_ID_KEYS) & set(REQUIRED_PROVIDER_SECRET_KEYS)
 
 
 def test_modal_runner_has_remote_secret_key_preflight_without_env_reads():

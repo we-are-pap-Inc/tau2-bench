@@ -43,17 +43,19 @@ are not Modal auth keys:
       OPENAI_API_KEY=... \
       ELEVENLABS_API_KEY=... \
       DEEPGRAM_API_KEY=... \
+      TAU2_VOICE_ID_MATT_DELANEY=... \
+      TAU2_VOICE_ID_LISA_BRENNER=... \
       TAU2_VOICE_ID_MILDRED_KAPLAN=... \
       TAU2_VOICE_ID_ARJUN_ROY=... \
       TAU2_VOICE_ID_WEI_LIN=... \
       TAU2_VOICE_ID_MAMADOU_DIALLO=... \
       TAU2_VOICE_ID_PRIYA_PATIL=...
 
-Final and smoke runs in this runner use `speech_complexity: regular`, so
-external τ-Voice runs need the five regular ElevenLabs persona voice IDs above.
-The control-only persona IDs `TAU2_VOICE_ID_MATT_DELANEY` and
-`TAU2_VOICE_ID_LISA_BRENNER` are only needed for separate control-speech local
-experiments, not for this final-matrix runner.
+Smoke runs use `speech_complexity: control`, so they need the two control
+persona IDs: `TAU2_VOICE_ID_MATT_DELANEY` and
+`TAU2_VOICE_ID_LISA_BRENNER`. Final runs use `speech_complexity: regular`, so
+they need the five regular persona IDs above. The shared Modal Secret must
+contain all seven persona IDs plus provider API keys.
 
 Create or reuse one Modal Volume:
 
@@ -69,8 +71,8 @@ Run preflight before any live Modal launch:
 Preflight checks the Modal CLI, Modal auth/config through `modal secret list`,
 and whether the `tau3-voice-secrets` Secret exists. It does not print secret
 values and reports the required key names only. The live Modal functions require
-`OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, `DEEPGRAM_API_KEY`, and the five regular
-`TAU2_VOICE_ID_*` keys via
+`OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, `DEEPGRAM_API_KEY`, the two control
+`TAU2_VOICE_ID_*` keys, and the five regular `TAU2_VOICE_ID_*` keys via
 `modal.Secret.from_name(..., required_keys=...)`.
 
 To validate exact Secret key presence without launching benchmark jobs, run the
@@ -101,16 +103,16 @@ manifest.
 Smoke plan-only dry-run:
 
     uv run python scripts/stagegate_modal_runner_config.py plan \
-      --batch-id dryrun \
+      --batch-id 2026_05_11 \
       --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
       --repo-ref stagegate \
       --mode smoke \
-      --condition baseline \
-      --domain retail \
       --print-matrix \
       --skip-hygiene
 
-Smoke manifests are marked `mode: smoke` and intentionally fail final hygiene.
+Smoke manifests contain exactly three retail jobs, one per condition, and are
+marked `mode: smoke`. They intentionally fail final hygiene because they use
+control speech and `--num-tasks 1`.
 
 ## Final Mode
 
@@ -121,6 +123,7 @@ Final mode:
   condition across `retail`, `airline`, and `telecom`;
 - rejects `--condition` and `--domain` subset flags;
 - uses no `--num-tasks` or `--task-ids`;
+- does not use `--audio-taps`;
 - uses fixed constants:
 
       model: gpt-realtime-2
@@ -131,6 +134,10 @@ Final mode:
       max_steps_seconds: 1200
       max_concurrency: 1
       seed: 300
+
+Final job save names use:
+
+      final_<batch_id>_<condition>_<domain>
 
 Launch command:
 
@@ -166,27 +173,59 @@ Smoke mode may use a branch or other non-SHA repo ref only because it is
 explicitly marked `--mode smoke`. Smoke runs are recorded as smoke in metadata
 and are invalid for final reporting.
 
+Smoke mode is for paid development validation. By default it launches exactly
+three retail jobs:
+
+    baseline   × retail
+    stage_only × retail
+    stagegate  × retail
+
+Smoke mode uses fixed constants:
+
+      model: gpt-realtime-2
+      provider: openai
+      reasoning_effort: high
+      speech_complexity: control
+      tick_duration: 0.2
+      max_steps_seconds: 300
+      max_concurrency: 1
+      seed: 300
+      num_tasks: 1
+      audio_taps: true
+
+Smoke job save names use:
+
+      smoke_<batch_id>_<condition>_<domain>
+
 Modal smoke dry-run command. This imports the Modal app and therefore still
 requires Modal auth and the configured Secret:
 
     uv run --with modal modal run modal_tau3_voice_stagegate.py \
-      --batch-id dryrun \
+      --batch-id 2026_05_11 \
       --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
       --repo-ref FINAL_40_CHAR_COMMIT_SHA_OR_BRANCH \
       --mode smoke \
-      --condition baseline \
-      --domain retail \
       --dry-run
 
-Live one-job smoke command:
+Live three-job smoke command:
 
     uv run --with modal modal run modal_tau3_voice_stagegate.py \
-      --batch-id smoke_YYYY_MM_DD \
+      --batch-id 2026_05_11 \
+      --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
+      --repo-ref FINAL_40_CHAR_COMMIT_SHA_OR_BRANCH \
+      --mode smoke
+
+Non-retail smoke runs are development-only and require the explicit
+`--allow-dev-smoke-domain` flag:
+
+    uv run --with modal modal run modal_tau3_voice_stagegate.py \
+      --batch-id dev_2026_05_11 \
       --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
       --repo-ref FINAL_40_CHAR_COMMIT_SHA_OR_BRANCH \
       --mode smoke \
-      --condition baseline \
-      --domain retail
+      --domain telecom \
+      --allow-dev-smoke-domain \
+      --dry-run
 
 ## Live Final Mode
 
@@ -245,8 +284,10 @@ contents, or secret values.
 
 - Modal function timeout is `24 * 60 * 60`.
 - Jobs use CPU and memory only; remote APIs perform model inference.
-- `tau2 run` uses `--auto-resume`, so completed non-infrastructure runs are
-  skipped if the same save directory is resumed.
+- Final `tau2 run` commands use `--auto-resume`, so completed
+  non-infrastructure runs are skipped if the same save directory is resumed.
+- Smoke `tau2 run` commands do not use `--auto-resume`; they use `--num-tasks 1`
+  and `--audio-taps` for development evidence.
 - Keep one final commit SHA fixed across all 9 jobs.
 - Do not mix final results from different commits or smoke runs.
 

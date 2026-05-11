@@ -49,16 +49,48 @@ Run all three voice domains:
 
 Do not use `--num-tasks` or `--task-ids` in final runs.
 
-## Development-only smoke tests
+## Paid development smoke tests
 
-Smoke tests may use:
+Smoke tests are paid development validation only. They must never be reported as
+final benchmark results.
 
-- `--speech-complexity control`
-- `--num-tasks 1`
-- `--num-tasks 5`
-- `--audio-taps`
+The fixed Modal smoke matrix is retail-only across all three conditions:
 
-Never report smoke-test results as final results.
+    baseline   × retail
+    stage_only × retail
+    stagegate  × retail
+
+Smoke constants:
+
+    MODEL=gpt-realtime-2
+    EFFORT=high
+    SPEECH=control
+    TICK=0.2
+    MAXSEC=300
+    MAX_CONCURRENCY=1
+    SEED=300
+    NUM_TASKS=1
+
+Smoke command shape:
+
+    uv run tau2 run \
+      --domain retail \
+      --audio-native \
+      --audio-native-provider openai \
+      --audio-native-model "$MODEL" \
+      --reasoning-effort "$EFFORT" \
+      --speech-complexity "$SPEECH" \
+      --tick-duration "$TICK" \
+      --max-steps-seconds "$MAXSEC" \
+      --max-concurrency "$MAX_CONCURRENCY" \
+      --seed "$SEED" \
+      --num-tasks "$NUM_TASKS" \
+      --verbose-logs \
+      --audio-taps \
+      --save-to "$SAVE_NAME"
+
+Smoke runs intentionally use task filtering and control speech. They are invalid
+for final reporting.
 
 ## Final job matrix
 
