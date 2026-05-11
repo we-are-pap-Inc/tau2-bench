@@ -719,6 +719,22 @@ def _prepare_validated_retail_exchange(
         assert result.error is False
 
 
+def _record_selected_retail_exchange(controller: StageGateController) -> None:
+    controller.trace_model_function_call(
+        _exchange_tool_call("call_selected_exchange_args"),
+        tick_id=8,
+    )
+
+
+def _record_confirmed_retail_exchange(controller: StageGateController) -> None:
+    controller.ledger.update_from_tool_args(
+        tool_name="advance_stage",
+        arguments={"confirmation": True},
+        event_id="call_confirmed_exchange",
+        tick_index=9,
+    )
+
+
 def test_stagegate_agent_adds_advance_stage_only_when_enabled(monkeypatch):
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stage_only")
     adapter = MagicMock()
@@ -2644,6 +2660,121 @@ def test_needs_confirmation_pending_write_does_not_reach_verify_close():
     ]
     _assert_confirmation_next_tool_call(packet)
     assert "commit_pending_write" in packet["ask_next"]
+
+
+def test_retail_propose_packet_treats_fallback_preference_as_progress():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="check_policy_eligibility",
+        observed_facts=["Product details and payment method are inspected."],
+        last_action="Checked product variants against customer preferences.",
+        tick_id=10,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert "fallback preference" in packet["ask_next"]
+    assert "ask for confirmation" in packet["ask_next"]
+    do_not = " ".join(packet["do_not"]).lower()
+    assert "fallback preference resolved the choice" in do_not
+    assert "enumerate more product variants" in do_not
+
+
+def test_retail_propose_packet_points_to_write_after_selected_replacements():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    _record_selected_retail_exchange(controller)
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="check_policy_eligibility",
+        observed_facts=["Selected replacement items are ready to summarize."],
+        last_action="Selected valid replacement item IDs.",
+        tick_id=10,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert "attempt exchange_delivered_order_items next" in packet["ask_next"]
+    assert any(
+        rule.startswith("Do not reopen replacement preference discussion")
+        for rule in packet["do_not"]
+    )
+    assert _step_by_name(packet, "attempt_write_after_confirmation")["tool_name"] == (
+        "exchange_delivered_order_items"
+    )
+    assert "candidate_replacement_item_ids" not in packet["known_facts"]
+
+
+def test_retail_execute_packet_prioritizes_exchange_after_selected_replacements():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    _record_selected_retail_exchange(controller)
+    _record_confirmed_retail_exchange(controller)
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="propose_action_and_confirm",
+        observed_facts=["User confirmation was structurally recorded."],
+        last_action="Selected exchange was confirmed.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+    assert packet["allowed_write_tools"][0] == "exchange_delivered_order_items"
+    assert packet["next_tool_call"] == {
+        "name": "exchange_delivered_order_items",
+        "arguments_source": "selected ledger values from visible tool outputs and model tool arguments",
+        "when": "now",
+    }
+    assert _step_by_name(packet, "attempt_confirmed_write")["tool_name"] == (
+        "exchange_delivered_order_items"
+    )
+    assert "Do not call advance_stage before attempting the write" in packet["ask_next"]
+
+
+def test_stage_only_retail_packet_does_not_get_stagegate_replacement_rules():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="check_policy_eligibility",
+        observed_facts=["Product details and payment method are inspected."],
+        last_action="Checked product variants against customer preferences.",
+        tick_id=10,
+    )
+
+    text = " ".join([packet["ask_next"], *packet["do_not"]]).lower()
+    assert "fallback preference resolved the choice" not in text
+    assert "enumerate more product variants" not in text
 
 
 def test_pending_write_trace_events_are_emitted(monkeypatch, tmp_path):
