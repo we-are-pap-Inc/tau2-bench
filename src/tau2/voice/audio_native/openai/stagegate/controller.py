@@ -256,6 +256,7 @@ class StageGateController:
             ledger=self._active_ledger(),
             forced_stage=forced_stage,
         )
+        packet = self._apply_pending_write_guidance(packet)
         guard_reason = self._record_advance_stage_guard_state(
             packet=packet,
             blocker=blocker_text,
@@ -407,6 +408,11 @@ class StageGateController:
             and not tool_result.error
             and validator.is_side_effecting_tool(tool_call.name)
         ):
+            validator.mark_side_effecting_write_consumed(
+                tool_call=tool_call,
+                tick_index=tick_id,
+            )
+            self._trace_pending_write_events(validator.drain_pending_write_events())
             self.last_successful_side_effecting_tool = {
                 "tool_name": tool_call.name,
                 "tool_call_id": tool_call.id,
@@ -474,6 +480,7 @@ class StageGateController:
             tick_index=tick_id,
             source=EvidenceSource.ASSISTANT_UTTERANCE,
         )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def record_agent_visible_user_transcript(
         self,
@@ -497,6 +504,7 @@ class StageGateController:
             tick_index=tick_id,
             source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
         )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def validate_tool_call(
         self,
@@ -514,11 +522,22 @@ class StageGateController:
             )
 
         start = time.perf_counter()
-        decision = validator.validate(tool_call, ledger=self._active_ledger())
+        decision = validator.validate(
+            tool_call,
+            ledger=self._active_ledger(),
+            tick_index=tick_id,
+            current_stage=self.final_stage,
+        )
         payload = {
             "tool_call_id": tool_call.id,
             "checks": decision.checks,
         }
+        if decision.pending_write_id is not None:
+            payload["pending_write_id"] = decision.pending_write_id
+            payload["args_fingerprint"] = decision.args_fingerprint
+            payload["matched_facets"] = decision.matched_facets
+            payload["missing_facets"] = decision.missing_facets
+        self._trace_pending_write_events(validator.drain_pending_write_events())
         if decision.corrective_packet is not None:
             payload["corrective_packet"] = decision.corrective_packet.model_dump(
                 mode="json"
@@ -543,6 +562,10 @@ class StageGateController:
             "decision": decision.decision,
             "reason": decision.reason,
             "checks": decision.checks,
+            "pending_write_id": decision.pending_write_id,
+            "args_fingerprint": decision.args_fingerprint,
+            "matched_facets": decision.matched_facets,
+            "missing_facets": decision.missing_facets,
         }
 
         self._trace(
@@ -661,6 +684,7 @@ class StageGateController:
             "last_successful_side_effecting_tool": (
                 self.last_successful_side_effecting_tool
             ),
+            "pending_write": self._pending_write_snapshot(),
         }
 
     def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
@@ -694,6 +718,94 @@ class StageGateController:
                 ledger_delta={str(delta["field"]): delta},
                 payload={"tool_call_id": tool_call_id},
             )
+
+    def _trace_pending_write_events(self, events: list[dict[str, object]]) -> None:
+        for event in events:
+            event_type = str(event.get("event_type", "pending_write_event"))
+            tick_index = event.get("tick_index")
+            self._trace(
+                event_type,
+                tick_index=tick_index if isinstance(tick_index, int) else None,
+                source="validator",
+                tool_name=str(event.get("tool_name", "")) or None,
+                payload=event,
+            )
+
+    def _pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        validator = self._active_validator()
+        if validator is None:
+            return None
+        return validator.pending_write_snapshot()
+
+    def _active_pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        snapshot = self._pending_write_snapshot()
+        if snapshot is None:
+            return None
+        if snapshot.get("status") in {"consumed", "expired", "none"}:
+            return None
+        return snapshot
+
+    def _apply_pending_write_guidance(self, packet):
+        pending_write = self._active_pending_write_snapshot()
+        if pending_write is None:
+            return packet
+        status = str(pending_write.get("status", ""))
+        tool_name = str(pending_write.get("tool_name", "the write tool"))
+        if status in {"needs_summary", "mismatched_retry"}:
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": [
+                        "pending_write_summary",
+                        "explicit user confirmation",
+                    ],
+                    "ask_next": (
+                        "State the pending action and consequence, then ask "
+                        "for explicit confirmation."
+                    ),
+                    "allowed_write_tools": [],
+                    "do_not": [
+                        "Do not call a write/action tool before explicit confirmation.",
+                        "Do not call advance_stage before retrying the original write tool.",
+                    ],
+                    "exit_condition": (
+                        "The pending action has been summarized and the user "
+                        "explicitly confirmed it."
+                    ),
+                    "when_done": f"After the user confirms, retry {tool_name} directly.",
+                }
+            )
+        if status == "summarized":
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": ["explicit user confirmation"],
+                    "ask_next": "Ask the user for explicit confirmation of the pending action.",
+                    "allowed_write_tools": [],
+                    "do_not": [
+                        "Do not call a write/action tool before explicit confirmation.",
+                        "Do not call advance_stage before retrying the original write tool.",
+                    ],
+                    "exit_condition": "The user explicitly confirmed the pending action.",
+                    "when_done": f"After the user confirms, retry {tool_name} directly.",
+                }
+            )
+        if status == "confirmed":
+            return packet.model_copy(
+                update={
+                    "stage": "execute_write_action",
+                    "missing_facts": [],
+                    "ask_next": f"Retry {tool_name} now with the same confirmed arguments.",
+                    "allowed_write_tools": [tool_name],
+                    "do_not": [
+                        "Do not change the confirmed write arguments.",
+                        "Do not call advance_stage before retrying the original write tool.",
+                    ],
+                    "exit_condition": "The confirmed write tool has completed or returned an error.",
+                    "when_done": "After the tool returns, call advance_stage with the visible tool result.",
+                }
+            )
+        return packet
 
     def _record_advance_stage_guard_state(
         self,
@@ -779,6 +891,13 @@ class StageGateController:
             return None
         if blocker is not None:
             return None
+        pending_write = self._active_pending_write_snapshot()
+        if pending_write is not None:
+            status = pending_write.get("status")
+            if status in {"needs_summary", "summarized", "mismatched_retry"}:
+                return "propose_action_and_confirm"
+            if status == "confirmed":
+                return "execute_write_action"
         if current_stage not in {"execute_write_action", "verify_result_and_close"}:
             return None
         if self.last_successful_side_effecting_tool is not None:

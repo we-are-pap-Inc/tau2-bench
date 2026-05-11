@@ -499,7 +499,7 @@ def _prepare_validated_account_change(
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=0,
     )
@@ -613,6 +613,8 @@ def test_stagegate_agent_leaves_baseline_tools_unchanged(monkeypatch):
         "StageGate operating rules"
         not in adapter.connect.call_args.kwargs["system_prompt"]
     )
+    assert not hasattr(agent.stagegate_controller, "ledger")
+    assert not hasattr(agent.stagegate_controller, "validator")
 
 
 def test_stage_only_condition_has_no_ledger(monkeypatch):
@@ -1367,7 +1369,7 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=2,
     )
@@ -1551,6 +1553,218 @@ def test_missing_exchange_summary_still_blocks_write():
     assert environment.tools.write_count == 0
 
 
+def test_pending_exchange_summary_and_yes_confirmation_allows_retry():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    assert blocked.error is True
+    assert controller.validator.pending_write_snapshot()["status"] == "needs_summary"
+
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "Here's the exchange I'm set to submit. Mechanical Keyboard item "
+            "1151293680 to item 7706410293, and Smart Thermostat item "
+            "4983901480 to item 7747408585. The price difference is a refund "
+            "to the saved card ending 2478. Please reply yes to confirm."
+        ),
+        tick_id=11,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_retry_exchange"),
+        tick_id=13,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["status"] == "exchange requested"
+    assert environment.tools.write_count == 1
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
+
+
+def test_pending_exchange_summary_and_yeah_confirmation_allows_retry():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    assert blocked.error is True
+
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will exchange item 1151293680 for item 7706410293 and item "
+            "4983901480 for item 7747408585. Any price difference will be "
+            "handled on the saved card ending 2478. Please confirm to proceed."
+        ),
+        tick_id=11,
+    )
+    controller.record_agent_visible_user_transcript("Yeah.", tick_id=12)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_retry_exchange"),
+        tick_id=13,
+    )
+
+    assert result.error is False
+    assert environment.tools.write_count == 1
+
+
+def test_pending_exchange_retry_with_changed_args_blocks_as_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will exchange item 1151293680 for item 7706410293 and item "
+            "4983901480 for item 7747408585. Any price difference will be "
+            "handled on the saved card ending 2478. Please confirm to proceed."
+        ),
+        tick_id=11,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
+
+    changed_call = _exchange_tool_call("call_changed_exchange")
+    changed_call.arguments["new_item_ids"] = ["9025753381", "7747408585"]
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        changed_call,
+        tick_id=13,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["pending_write_mismatch"]
+    assert controller.last_validator_decision["reason"] == "pending_write_mismatch"
+    assert environment.tools.write_count == 0
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert "pending_write_mismatch" in event_types
+    assert "pending_write_expired" in event_types
+
+
+def test_confirmed_unconsumed_pending_write_keeps_stage_at_execute():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will exchange item 1151293680 for item 7706410293 and item "
+            "4983901480 for item 7747408585. Any price difference will be "
+            "handled on the saved card ending 2478. Please confirm to proceed."
+        ),
+        tick_id=11,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write was validated."],
+        last_action="No domain write result yet.",
+        tick_id=13,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+    assert packet["allowed_write_tools"] == ["exchange_delivered_order_items"]
+    assert "Retry exchange_delivered_order_items" in packet["ask_next"]
+
+
+def test_pending_write_trace_events_are_emitted(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    controller.record_assistant_utterance(
+        AssistantMessage.text(
+            "I will exchange item 1151293680 for item 7706410293 and item "
+            "4983901480 for item 7747408585. Any price difference will be "
+            "handled on the saved card ending 2478. Please confirm to proceed."
+        ),
+        tick_id=11,
+    )
+    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_retry_exchange"),
+        tick_id=13,
+    )
+
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert "pending_write_created" in event_types
+    assert "pending_write_summary_detected" in event_types
+    assert "pending_write_confirmed" in event_types
+    assert "pending_write_consumed" in event_types
+
+
 def test_advance_stage_cannot_verify_after_blocked_write():
     environment = _retail_exchange_environment()
     controller = StageGateController(
@@ -1579,7 +1793,7 @@ def test_advance_stage_cannot_verify_after_blocked_write():
         tick_id=11,
     )
 
-    assert packet["stage"] == "execute_write_action"
+    assert packet["stage"] in {"propose_action_and_confirm", "execute_write_action"}
     assert packet["stage"] != "verify_result_and_close"
 
     packet = _advance_stage_packet(
@@ -1592,7 +1806,7 @@ def test_advance_stage_cannot_verify_after_blocked_write():
         tick_id=12,
     )
 
-    assert packet["stage"] == "execute_write_action"
+    assert packet["stage"] in {"propose_action_and_confirm", "execute_write_action"}
 
 
 def test_verify_result_and_close_requires_successful_write_result():
@@ -1682,7 +1896,7 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=2,
     )
@@ -1731,7 +1945,7 @@ def test_service_task_ref_preserves_mock_task_write_validation():
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update service task service_task_1 to completed. "
-            "This will change the service task status."
+            "This will change the service task status. Please confirm."
         ),
         tick_id=3,
     )
@@ -1858,7 +2072,7 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=2,
     )
@@ -1954,7 +2168,7 @@ def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypa
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=0,
     )
@@ -2005,7 +2219,7 @@ def test_validator_uses_confirmation_only_after_visible_recording():
     validator.record_assistant_utterance(
         content=(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_index=2,
     )
@@ -2052,7 +2266,7 @@ def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
     validator.record_assistant_utterance(
         content=(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_index=2,
     )
@@ -2111,7 +2325,7 @@ def test_confirmation_requires_exact_identifier_mention():
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_1234 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=2,
     )
@@ -2324,7 +2538,7 @@ def test_policy_preconditions_require_all_required_visible_fields():
     validator.record_assistant_utterance(
         content=(
             "I will send payment request for customer C1 and bill B1. "
-            "This will change the bill status to awaiting payment."
+            "This will change the bill status to awaiting payment. Please confirm."
         ),
         tick_index=2,
     )

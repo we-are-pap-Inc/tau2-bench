@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -23,6 +25,15 @@ from tau2.voice.audio_native.openai.stagegate.stage_schema import (
 )
 
 ValidatorOutcome = Literal["allow", "block"]
+PendingWriteStatus = Literal[
+    "none",
+    "needs_summary",
+    "summarized",
+    "confirmed",
+    "consumed",
+    "expired",
+    "mismatched_retry",
+]
 SERVICE_TASK_REF = "service_task_ref"
 SERVICE_TASK_READ_TOOL = "get_tasks"
 SERVICE_TASK_WRITE_TOOL = "update_task_status"
@@ -175,7 +186,9 @@ CONSEQUENCE_WORDS = {
 }
 
 CONFIRMATION_PATTERNS = (
-    re.compile(r"\b(confirm|confirmed|yes|yep|yeah|correct|proceed)\b", re.I),
+    re.compile(
+        r"\b(confirm|confirmed|yes|yes please|yep|yeah|correct|proceed)\b", re.I
+    ),
     re.compile(
         r"\b(go ahead|please do|sounds good|that's right|that is right|okay,? do it)\b",
         re.I,
@@ -194,6 +207,10 @@ class ValidatorDecision(BaseModel):
     reason: str
     checks: dict[str, bool] = Field(default_factory=dict)
     corrective_packet: Optional[StagePacket] = None
+    pending_write_id: Optional[str] = None
+    args_fingerprint: Optional[str] = None
+    matched_facets: list[str] = Field(default_factory=list)
+    missing_facets: list[str] = Field(default_factory=list)
 
     @property
     def allowed(self) -> bool:
@@ -244,6 +261,50 @@ class UserConfirmationEvidence:
 
 
 @dataclass
+class PendingWriteConfirmation:
+    """Concrete side-effecting write awaiting visible summary and confirmation."""
+
+    pending_write_id: str
+    tool_name: str
+    normalized_args: dict[str, Any]
+    args_fingerprint: str
+    created_tick: Optional[int]
+    created_stage: Optional[str]
+    status: PendingWriteStatus
+    required_summary_facets: list[str]
+    summary_evidence: Optional[ActionSummaryEvidence] = None
+    confirmation_evidence: Optional[UserConfirmationEvidence] = None
+    last_block_reason: Optional[str] = None
+    matched_facets: list[str] = field(default_factory=list)
+    missing_facets: list[str] = field(default_factory=list)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return trace-safe pending-write state without raw argument values."""
+        return {
+            "pending_write_id": self.pending_write_id,
+            "tool_name": self.tool_name,
+            "args_fingerprint": self.args_fingerprint,
+            "created_tick": self.created_tick,
+            "created_stage": self.created_stage,
+            "status": self.status,
+            "required_summary_facets": list(self.required_summary_facets),
+            "matched_facets": list(self.matched_facets),
+            "missing_facets": list(self.missing_facets),
+            "summary_evidence_tick": (
+                None
+                if self.summary_evidence is None
+                else self.summary_evidence.tick_index
+            ),
+            "confirmation_evidence_tick": (
+                None
+                if self.confirmation_evidence is None
+                else self.confirmation_evidence.tick_index
+            ),
+            "last_block_reason": self.last_block_reason,
+        }
+
+
+@dataclass
 class VisibleConversationState:
     """Validator state derived only from agent-visible conversation events."""
 
@@ -258,6 +319,7 @@ class VisibleConversationState:
     last_user_confirmation: Optional[str] = None
     last_user_confirmation_tick: Optional[int] = None
     last_user_confirmation_source: Optional[EvidenceSource] = None
+    pending_write: Optional[PendingWriteConfirmation] = None
 
 
 class PreWriteValidator:
@@ -273,6 +335,7 @@ class PreWriteValidator:
         self.domain_name = normalize_domain(domain_name)
         self.tools_by_name = {tool.name: tool for tool in tools}
         self.state = VisibleConversationState()
+        self._pending_write_events: list[dict[str, object]] = []
 
     def set_domain_name(self, domain_name: Optional[str]) -> None:
         """Update the public domain name used for domain-specific rules."""
@@ -283,6 +346,8 @@ class PreWriteValidator:
         tool_call: ToolCall,
         *,
         ledger: Optional[EntityLedger] = None,
+        tick_index: Optional[int] = None,
+        current_stage: Optional[str] = None,
     ) -> ValidatorDecision:
         """Validate a domain tool call without calling the tool."""
         if not self.is_side_effecting_tool(tool_call.name):
@@ -293,7 +358,6 @@ class PreWriteValidator:
             )
 
         requirement = self.requirement_for_tool(tool_call.name)
-        matching_summary = self._matching_action_summary(tool_call, requirement)
         checks: dict[str, bool] = {
             "side_effecting_tool": True,
             "tool_arguments_complete": self._arguments_complete(tool_call),
@@ -312,15 +376,8 @@ class PreWriteValidator:
                 tool_call,
                 requirement,
             ),
-            "assistant_stated_action": self._assistant_stated_action(
-                requirement,
-                matching_summary,
-            ),
-            "user_confirmed": self._user_confirmed(
-                tool_call,
-                requirement,
-                matching_summary=matching_summary,
-            ),
+            "assistant_stated_action": False,
+            "user_confirmed": False,
         }
         reason_by_check = {
             "tool_arguments_complete": "incomplete_tool_arguments",
@@ -329,16 +386,58 @@ class PreWriteValidator:
             "exact_identifiers_verified": "missing_verified_identifier",
             "policy_state_inspected": "missing_policy_state_inspection",
             "policy_preconditions_represented": "missing_policy_precondition_state",
-            "assistant_stated_action": "missing_action_summary",
-            "user_confirmed": "missing_confirmation",
         }
         for check_name, reason in reason_by_check.items():
             if not checks[check_name]:
                 return self._block(tool_call, reason=reason, checks=checks)
+
+        mismatch = self._pending_write_mismatch(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+        )
+        if mismatch is not None:
+            return self._block(
+                tool_call,
+                reason="pending_write_mismatch",
+                checks=checks,
+                pending_write=mismatch,
+            )
+
+        pending_write = self._ensure_pending_write(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+        )
+        self._refresh_pending_write_summary(pending_write)
+        self._refresh_pending_write_confirmation(pending_write)
+        checks["assistant_stated_action"] = pending_write.summary_evidence is not None
+        checks["user_confirmed"] = pending_write.status == "confirmed"
+
+        if not checks["assistant_stated_action"]:
+            pending_write.status = "needs_summary"
+            return self._block(
+                tool_call,
+                reason="missing_action_summary",
+                checks=checks,
+                pending_write=pending_write,
+            )
+        if not checks["user_confirmed"]:
+            pending_write.status = "summarized"
+            return self._block(
+                tool_call,
+                reason="missing_confirmation",
+                checks=checks,
+                pending_write=pending_write,
+            )
         return ValidatorDecision(
             decision="allow",
             reason="validated",
             checks=checks,
+            pending_write_id=pending_write.pending_write_id,
+            args_fingerprint=pending_write.args_fingerprint,
+            matched_facets=list(pending_write.matched_facets),
+            missing_facets=list(pending_write.missing_facets),
         )
 
     def record_visible_message(
@@ -382,6 +481,10 @@ class PreWriteValidator:
                 tick_index=tick_index,
                 source=source,
             )
+            pending_write = self._active_pending_write()
+            if pending_write is not None:
+                self._refresh_pending_write_summary(pending_write)
+                self._refresh_pending_write_confirmation(pending_write)
 
     def record_user_confirmation_evidence(
         self,
@@ -409,6 +512,9 @@ class PreWriteValidator:
             self.state.last_user_confirmation = content
             self.state.last_user_confirmation_tick = tick_index
             self.state.last_user_confirmation_source = source
+            pending_write = self._active_pending_write()
+            if pending_write is not None:
+                self._refresh_pending_write_confirmation(pending_write)
         self.state.assistant_utterance_buffer = ""
 
     def record_tool_result(
@@ -491,13 +597,50 @@ class PreWriteValidator:
         )
         return any(cue in description for cue in side_effect_cues)
 
+    def pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        """Return trace-safe pending-write state, when present."""
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return None
+        return pending_write.snapshot()
+
+    def drain_pending_write_events(self) -> list[dict[str, object]]:
+        """Return and clear pending-write trace events accumulated by validator."""
+        events = list(self._pending_write_events)
+        self._pending_write_events = []
+        return events
+
+    def mark_side_effecting_write_consumed(
+        self,
+        *,
+        tool_call: ToolCall,
+        tick_index: Optional[int] = None,
+    ) -> None:
+        """Mark a successful side-effecting domain-tool result as consumed."""
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return
+        if pending_write.status != "confirmed":
+            return
+        if not self._pending_write_matches_tool_call(pending_write, tool_call):
+            return
+        pending_write.status = "consumed"
+        self._queue_pending_write_event(
+            "pending_write_consumed",
+            pending_write,
+            tick_index=tick_index,
+        )
+
     def _block(
         self,
         tool_call: ToolCall,
         *,
         reason: str,
         checks: dict[str, bool],
+        pending_write: Optional[PendingWriteConfirmation] = None,
     ) -> ValidatorDecision:
+        if pending_write is not None:
+            pending_write.last_block_reason = reason
         return ValidatorDecision(
             decision="block",
             reason=reason,
@@ -507,7 +650,305 @@ class PreWriteValidator:
                 reason=reason,
                 read_tools=self._read_tool_names(),
             ),
+            pending_write_id=None
+            if pending_write is None
+            else pending_write.pending_write_id,
+            args_fingerprint=None
+            if pending_write is None
+            else pending_write.args_fingerprint,
+            matched_facets=[]
+            if pending_write is None
+            else pending_write.matched_facets,
+            missing_facets=[]
+            if pending_write is None
+            else pending_write.missing_facets,
         )
+
+    def _active_pending_write(self) -> Optional[PendingWriteConfirmation]:
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return None
+        if pending_write.status in {"consumed", "expired", "none"}:
+            return None
+        return pending_write
+
+    def _ensure_pending_write(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+    ) -> PendingWriteConfirmation:
+        active_pending = self._active_pending_write()
+        if active_pending is not None and self._pending_write_matches_tool_call(
+            active_pending,
+            tool_call,
+        ):
+            return active_pending
+
+        pending_write = self._pending_write_from_tool_call(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+            status="needs_summary",
+        )
+        self.state.pending_write = pending_write
+        self._queue_pending_write_event(
+            "pending_write_created",
+            pending_write,
+            tick_index=tick_index,
+        )
+        return pending_write
+
+    def _pending_write_mismatch(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+    ) -> Optional[PendingWriteConfirmation]:
+        active_pending = self._active_pending_write()
+        if active_pending is None:
+            return None
+        if self._pending_write_matches_tool_call(active_pending, tool_call):
+            return None
+
+        active_pending.status = "mismatched_retry"
+        self._queue_pending_write_event(
+            "pending_write_mismatch",
+            active_pending,
+            tick_index=tick_index,
+        )
+        active_pending.status = "expired"
+        self._queue_pending_write_event(
+            "pending_write_expired",
+            active_pending,
+            tick_index=tick_index,
+        )
+        replacement = self._pending_write_from_tool_call(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+            status="needs_summary",
+        )
+        replacement.last_block_reason = "pending_write_mismatch"
+        self.state.pending_write = replacement
+        self._queue_pending_write_event(
+            "pending_write_created",
+            replacement,
+            tick_index=tick_index,
+        )
+        return replacement
+
+    def _pending_write_from_tool_call(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+        status: PendingWriteStatus,
+    ) -> PendingWriteConfirmation:
+        normalized_args = canonicalize_for_fingerprint(tool_call.arguments)
+        fingerprint = args_fingerprint(tool_call.arguments)
+        return PendingWriteConfirmation(
+            pending_write_id=f"{tool_call.name}:{fingerprint[:12]}",
+            tool_name=tool_call.name,
+            normalized_args=normalized_args,
+            args_fingerprint=fingerprint,
+            created_tick=tick_index,
+            created_stage=current_stage,
+            status=status,
+            required_summary_facets=required_summary_facets_for_tool(tool_call.name),
+        )
+
+    def _pending_write_matches_tool_call(
+        self,
+        pending_write: PendingWriteConfirmation,
+        tool_call: ToolCall,
+    ) -> bool:
+        return (
+            pending_write.tool_name == tool_call.name
+            and pending_write.args_fingerprint == args_fingerprint(tool_call.arguments)
+        )
+
+    def _refresh_pending_write_summary(
+        self,
+        pending_write: PendingWriteConfirmation,
+    ) -> None:
+        if pending_write.status in {"summarized", "confirmed", "consumed", "expired"}:
+            return
+        best_matched: list[str] = []
+        best_missing: list[str] = list(pending_write.required_summary_facets)
+        for summary in reversed(self.state.action_summaries):
+            matched, missing = self._pending_summary_facets(
+                pending_write,
+                summary.content,
+            )
+            if len(matched) > len(best_matched):
+                best_matched = matched
+                best_missing = missing
+            if not missing:
+                pending_write.summary_evidence = summary
+                pending_write.matched_facets = matched
+                pending_write.missing_facets = []
+                pending_write.status = "summarized"
+                self._queue_pending_write_event(
+                    "pending_write_summary_detected",
+                    pending_write,
+                    tick_index=summary.tick_index,
+                )
+                return
+        pending_write.matched_facets = best_matched
+        pending_write.missing_facets = best_missing
+
+    def _refresh_pending_write_confirmation(
+        self,
+        pending_write: PendingWriteConfirmation,
+    ) -> None:
+        if pending_write.status in {"confirmed", "consumed", "expired"}:
+            return
+        summary = pending_write.summary_evidence
+        if summary is None or summary.tick_index is None:
+            return
+        for confirmation in self.state.user_confirmations:
+            if confirmation.source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
+                continue
+            if confirmation.tick_index is None:
+                continue
+            if confirmation.tick_index <= summary.tick_index:
+                continue
+            pending_write.confirmation_evidence = confirmation
+            pending_write.status = "confirmed"
+            self._queue_pending_write_event(
+                "pending_write_confirmed",
+                pending_write,
+                tick_index=confirmation.tick_index,
+            )
+            return
+
+    def _pending_summary_facets(
+        self,
+        pending_write: PendingWriteConfirmation,
+        content: str,
+    ) -> tuple[list[str], list[str]]:
+        if pending_write.tool_name == "exchange_delivered_order_items":
+            matched = self._exchange_pending_summary_facets(pending_write, content)
+        else:
+            matched = self._generic_pending_summary_facets(pending_write, content)
+        required = list(pending_write.required_summary_facets)
+        missing = [facet for facet in required if facet not in matched]
+        return [facet for facet in required if facet in matched], missing
+
+    def _exchange_pending_summary_facets(
+        self,
+        pending_write: PendingWriteConfirmation,
+        content: str,
+    ) -> set[str]:
+        normalized = normalize_value(content) or ""
+        matched: set[str] = set()
+        if re.search(r"\b(exchange|exchanging|exchanged|swap|swapped)\b", normalized):
+            matched.add("action_type")
+        old_values = string_values(pending_write.normalized_args.get("item_ids"))
+        new_values = string_values(pending_write.normalized_args.get("new_item_ids"))
+        if self._summary_mentions_all_values(normalized, old_values) or (
+            len(
+                self._descriptor_tokens_for_values(set(old_values))
+                & meaningful_tokens(normalized)
+            )
+            >= 3
+        ):
+            matched.add("old_items")
+        if self._summary_mentions_all_values(normalized, new_values) or (
+            len(
+                self._descriptor_tokens_for_values(set(new_values))
+                & meaningful_tokens(normalized)
+            )
+            >= 3
+        ):
+            matched.add("new_items")
+        if self._pending_write_needs_payment_consequence(pending_write):
+            if any(word in normalized for word in CONSEQUENCE_WORDS):
+                matched.add("consequence")
+        else:
+            matched.add("consequence")
+        if summary_requests_confirmation(normalized):
+            matched.add("confirmation_request")
+        return matched
+
+    def _generic_pending_summary_facets(
+        self,
+        pending_write: PendingWriteConfirmation,
+        content: str,
+    ) -> set[str]:
+        normalized = normalize_value(content) or ""
+        matched: set[str] = set()
+        if looks_like_action_statement(content):
+            matched.add("action_type")
+            matched.add("consequence")
+        if self._summary_mentions_pending_exact_args(normalized, pending_write):
+            matched.add("record_reference")
+        if summary_requests_confirmation(normalized):
+            matched.add("confirmation_request")
+        return matched
+
+    def _summary_mentions_pending_exact_args(
+        self,
+        normalized_summary: str,
+        pending_write: PendingWriteConfirmation,
+    ) -> bool:
+        exact_args = exact_identifier_args_for_tool(pending_write.tool_name)
+        if not exact_args:
+            return True
+        for arg_name in exact_args:
+            values = self._pending_write_arg_values(pending_write, arg_name)
+            if not values:
+                return False
+            if not self._summary_mentions_all_values(normalized_summary, values):
+                return False
+        return True
+
+    def _pending_write_arg_values(
+        self,
+        pending_write: PendingWriteConfirmation,
+        arg_name: str,
+    ) -> list[str]:
+        if arg_name in pending_write.normalized_args:
+            return string_values(pending_write.normalized_args.get(arg_name))
+        if arg_name == SERVICE_TASK_REF:
+            values: list[str] = []
+            for raw_name, raw_value in pending_write.normalized_args.items():
+                if is_identifier_arg_name(raw_name):
+                    values.extend(string_values(raw_value))
+            return values
+        return []
+
+    def _summary_mentions_all_values(
+        self,
+        normalized_summary: str,
+        values: list[str],
+    ) -> bool:
+        return bool(values) and all(
+            normalized_text_mentions_value(normalized_summary, value)
+            for value in values
+        )
+
+    def _pending_write_needs_payment_consequence(
+        self,
+        pending_write: PendingWriteConfirmation,
+    ) -> bool:
+        return bool(pending_write.normalized_args.get("payment_method_id"))
+
+    def _queue_pending_write_event(
+        self,
+        event_type: str,
+        pending_write: PendingWriteConfirmation,
+        *,
+        tick_index: Optional[int],
+    ) -> None:
+        snapshot = pending_write.snapshot()
+        snapshot["event_type"] = event_type
+        snapshot["tick_index"] = tick_index
+        self._pending_write_events.append(snapshot)
 
     def _arguments_complete(self, tool_call: ToolCall) -> bool:
         tool = self.tools_by_name.get(tool_call.name)
@@ -1098,6 +1539,65 @@ def normalized_text_mentions_value(text: str, value: str) -> bool:
     )
 
 
+def canonicalize_for_fingerprint(value: Any) -> Any:
+    """Return stable, trace-safe normalized data for pending-write matching."""
+    if isinstance(value, dict):
+        return {
+            str(key): canonicalize_for_fingerprint(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, list):
+        return [canonicalize_for_fingerprint(item) for item in value]
+    if isinstance(value, str):
+        return normalize_value(value) or ""
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return normalize_value(value) or str(value)
+
+
+def args_fingerprint(arguments: dict[str, Any]) -> str:
+    """Return a stable fingerprint for pending write arguments."""
+    canonical = canonicalize_for_fingerprint(arguments)
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def required_summary_facets_for_tool(tool_name: str) -> list[str]:
+    """Return summary facets needed to confirm one pending write."""
+    if tool_name == "exchange_delivered_order_items":
+        return [
+            "action_type",
+            "old_items",
+            "new_items",
+            "consequence",
+            "confirmation_request",
+        ]
+    return [
+        "action_type",
+        "record_reference",
+        "consequence",
+        "confirmation_request",
+    ]
+
+
+def string_values(value: Any) -> list[str]:
+    """Return flattened normalized string values."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        values: list[str] = []
+        for item in value:
+            values.extend(string_values(item))
+        return values
+    if isinstance(value, dict):
+        values = []
+        for item in value.values():
+            values.extend(string_values(item))
+        return values
+    normalized = normalize_value(value)
+    return [] if normalized is None else [normalized]
+
+
 def build_corrective_packet(
     *,
     tool_call: ToolCall,
@@ -1144,15 +1644,22 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     """Return concise corrective text for the model."""
     if reason == "missing_confirmation":
         return (
-            f"Before making the change, summarize the intended {tool_call.name} "
-            "action and consequence, then ask the user for explicit confirmation. "
-            f"After the user confirms, retry {tool_call.name} directly."
+            f"State the pending {tool_call.name} action and consequence, ask "
+            "for explicit confirmation, then retry the same original write "
+            "tool directly after the user confirms."
         )
     if reason == "missing_action_summary":
         return (
-            "Restate exactly what will change and any consequence, ask for explicit "
-            f"confirmation, then retry {tool_call.name} directly after the user "
-            "confirms."
+            "State the pending action and consequence, ask for explicit "
+            "confirmation, then retry the same original write tool directly "
+            "after the user confirms."
+        )
+    if reason == "pending_write_mismatch":
+        return (
+            "The retried write differs from the confirmed pending action. "
+            "State the changed pending action and consequence, ask for explicit "
+            "confirmation, then retry the same write tool directly after the "
+            "user confirms."
         )
     if reason == "missing_policy_state_inspection":
         return (

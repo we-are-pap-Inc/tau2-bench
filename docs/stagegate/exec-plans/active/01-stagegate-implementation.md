@@ -221,6 +221,15 @@ remains validator-free; the pre-write validator is active only for
   per-run `advance_stage` loop guard defaults, stage-scoped packets, fallback
   packets, `stage_loop_guard_triggered` events, and trace summary payloads on
   `trace_summary` and `run_end`.
+- [x] Add structural pending-write confirmation state to the pre-write
+  validator. Side-effecting write attempts now create a pending write keyed by
+  tool name and stable argument fingerprint, assistant summaries and user
+  confirmations are matched to that pending write, mismatched retries are
+  blocked, and successful domain-tool results consume the pending write.
+- [x] Emit pending-write trace events for creation, summary detection,
+  confirmation, mismatched retry, consumption, and expiration.
+- [x] Gate `advance_stage` with pending-write state so unconsumed pending writes
+  cannot drift to `verify_result_and_close`.
 
 ## Tests
 
@@ -277,6 +286,11 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   no-crash/no-mutation behavior, stage-scoped missing facts, identity-stage
   exclusion of later-stage facts in retail/airline/telecom, StageGate ledger
   enrichment, and trace summary counters.
+- pending-write tests cover blocked exchange creation, summary and `Yes` retry,
+  summary and `Yeah` retry, no-order-ID exact item summaries, confirmation
+  before summary, changed-argument mismatch blocks, corrective direct-retry
+  packet text, stage guard behavior for blocked/confirmed/consumed writes,
+  pending-write trace events, and baseline/StageOnly absence of validator state.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -596,6 +610,26 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 smoke_008 exchange-summary follow-up:
   `npm run format`, `npm run check`, and `npm run lint` all failed with npm
   `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `70 passed, 2 warnings in 0.29s`.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 structural pending-write confirmation:
+  local replay of `/private/tmp/stagegate_smoke_008_stagegate_trace_events.jsonl`
+  through the updated validator allowed both attempted
+  `exchange_delivered_order_items` writes; each matched `action_type`,
+  `old_items`, `new_items`, `consequence`, and `confirmation_request`.
+- 2026-05-10 structural pending-write confirmation:
+  `make format` result: Ruff format reformatted 1 file, then final
+  `make check-all` left `329 files` unchanged with Ruff checks passing.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 structural pending-write confirmation:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -699,6 +733,14 @@ Warnings observed in the passing focused and voice test commands:
   for confirmation. This keeps the write gate tied to visible, action-specific
   evidence without requiring the assistant to repeat the order number when the
   exact item-level write is already unambiguous.
+- 2026-05-10 structural pending-write confirmation: The validator now treats
+  the attempted side-effecting write as the object being summarized and
+  confirmed. Confirmation is valid only for the matching tool name and argument
+  fingerprint; changed retries require a fresh summary and confirmation.
+- 2026-05-10 structural pending-write confirmation: `advance_stage` cannot
+  close a write-intent path while the pending write is `needs_summary`,
+  `summarized`, `confirmed`, or `mismatched_retry`; only a consumed successful
+  side-effecting domain-tool result permits closeout.
 
 ## Remaining Work
 

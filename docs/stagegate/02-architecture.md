@@ -190,13 +190,28 @@ exists, confirmation remains missing.
 Validator checks:
 
 1. Is this a write/action tool?
-2. Is identity/account/order/reservation verified?
-3. Are exact identifiers confirmed or tool-verified?
-4. Has relevant state been inspected with read tools?
-5. Are policy preconditions satisfied?
-6. Did the assistant summarize intended action and consequence?
-7. Did the user confirm after that summary?
-8. Are tool arguments complete and non-ambiguous?
+2. Are tool arguments complete and non-ambiguous?
+3. Is identity/account/order/reservation verified?
+4. Are exact identifiers confirmed or tool-verified?
+5. Has relevant state been inspected with read tools?
+6. Are policy preconditions satisfied?
+7. Is there a matching pending write keyed by the attempted tool and stable
+   argument fingerprint?
+8. Did the assistant summarize that pending action and consequence?
+9. Did the user confirm after that pending-action summary?
+
+Pending write confirmation:
+
+- A side-effecting tool attempt with satisfied non-conversation checks creates a
+  pending write record from the attempted tool name and arguments.
+- The record stores a stable argument fingerprint, required summary facets,
+  assistant summary evidence, user confirmation evidence, and status.
+- A retry is allowed only when the pending write is `confirmed` and the retried
+  tool name and argument fingerprint match.
+- A successful side-effecting domain-tool result marks the pending write
+  `consumed`; only consumed writes can satisfy write-intent closeout.
+- Changed retry arguments create a `pending_write_mismatch` block and require a
+  fresh visible summary and confirmation.
 
 Allow result:
 
@@ -208,9 +223,9 @@ Block result:
       "decision": "block",
       "reason": "missing_confirmation",
       "corrective_packet": {
-        "say_next": "Before I make that change, please confirm that you want me to cancel reservation ABC123.",
-        "allowed_next_tools": ["advance_stage"],
-        "do_not": ["Do not call the cancellation tool until the user confirms."]
+        "say_next": "State the pending action and consequence, then ask for explicit confirmation.",
+        "allowed_next_tools": [],
+        "do_not": ["Do not call advance_stage before retrying the original write tool."]
       }
     }
 
@@ -236,3 +251,12 @@ Patch the existing OpenAI audio-native adapter minimally to insert StageGate beh
 ## Trace events
 
 All StageGate behavior should emit JSONL events with `schema_version`. See `docs/stagegate/05-tracing-and-visualization.md`.
+
+Pending-write runtime events are:
+
+- `pending_write_created`
+- `pending_write_summary_detected`
+- `pending_write_confirmed`
+- `pending_write_mismatch`
+- `pending_write_consumed`
+- `pending_write_expired`
