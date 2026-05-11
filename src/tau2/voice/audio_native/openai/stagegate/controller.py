@@ -1,8 +1,9 @@
 """StageGate controller shared by the OpenAI audio-native agent and orchestrator."""
 
+import json
 import os
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from loguru import logger
 
@@ -22,12 +23,18 @@ from tau2.voice.audio_native.openai.stagegate.trace import (
     get_trace_run_id,
 )
 from tau2.voice.audio_native.openai.stagegate.validator import (
+    COMMIT_PENDING_WRITE_TOOL_NAME,
     PreWriteValidator,
     ValidatorDecision,
+    pending_write_allowed_internal_tools,
+    pending_write_disallowed_tools,
+    pending_write_next_required_steps,
+    pending_write_next_tool_call,
 )
 
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
 ADVANCE_STAGE_TOOL_NAME = "advance_stage"
+PENDING_WRITE_TOOL_NAMES = {COMMIT_PENDING_WRITE_TOOL_NAME}
 VALID_CONDITIONS = {"baseline", "stage_only", "stagegate"}
 MAX_ADVANCE_STAGE_CALLS_ENV_VAR = "TAU2_STAGEGATE_MAX_ADVANCE_STAGE_CALLS"
 MAX_REPEATED_STAGE_ENV_VAR = "TAU2_STAGEGATE_MAX_REPEATED_STAGE"
@@ -43,6 +50,8 @@ StageGate operating rules:
 - In advance_stage observed_facts, include only facts visible in the conversation, model tool arguments, or official tool results.
 - Follow each returned stage packet. Call advance_stage again only after its exit condition is met or a blocker appears.
 - Before changing account, order, reservation, plan, or service state, make sure policy prerequisites and confirmation requirements are satisfied.
+- In StageGate mode, a blocked write creates one active pending write. Tell the user that pending action and consequence, ask for confirmation, then after the user's next response call commit_pending_write. If confirmed, StageGate executes the stored original write once; do not retry the domain write directly.
+- Do not transfer to a human agent while an active pending write can still be completed through the structured pending-write tools.
 """.strip()
 
 
@@ -68,6 +77,36 @@ def advance_stage(
     return ""
 
 
+def commit_pending_write(
+    decision: Literal["confirmed", "denied", "unclear"],
+    basis: Literal[
+        "latest_user_turn",
+        "user_corrected_details",
+        "user_declined",
+        "unclear_response",
+    ],
+    notes: Optional[str] = None,
+) -> str:
+    """Commit or decline the active pending write after the user's response.
+
+    This StageGate-only orchestration tool does not modify domain state by
+    itself. It applies to the active pending write; pending_write_id is not
+    required. Use commit_pending_write after you have told the user the pending
+    action and consequence, asked for confirmation, and received the user's
+    response. If decision is confirmed, StageGate executes the stored original
+    domain write once. If denied or unclear, StageGate does not execute it.
+
+    Args:
+        decision: Whether the user confirmed, denied, or gave an unclear response.
+        basis: The event-order basis for the decision.
+        notes: Optional brief model-visible note.
+
+    Returns:
+        A structured StageGate pending-write commit result.
+    """
+    return ""
+
+
 class StageGateController:
     """Coordinates StageOnly and StageGate behavior."""
 
@@ -88,6 +127,7 @@ class StageGateController:
         self.domain_name = domain_name
         self.tools = list(tools)
         self.advance_stage_tool = Tool(advance_stage)
+        self.commit_pending_write_tool = Tool(commit_pending_write)
         self.packet_orchestrator = StagePacketOrchestrator()
         self.trace_writer = trace_writer or JsonlTraceWriter.from_env()
         self.benchmark_task_id: Optional[str] = None
@@ -124,6 +164,8 @@ class StageGateController:
         self.last_stage_packet: Optional[dict[str, object]] = None
         self.last_validator_decision: Optional[dict[str, object]] = None
         self.last_corrective_packet: Optional[dict[str, object]] = None
+        self.last_blocked_side_effecting_tool: Optional[dict[str, object]] = None
+        self.last_successful_side_effecting_tool: Optional[dict[str, object]] = None
         if self.condition == "stagegate":
             self.ledger = EntityLedger.for_domain(domain_name)
             self.validator = PreWriteValidator(
@@ -199,16 +241,29 @@ class StageGateController:
         return STAGEGATE_PROMPT_ADDITION
 
     def session_tools(self, tools: list[Tool]) -> list[Tool]:
-        """Return session tools, adding advance_stage only when active."""
+        """Return session tools, adding StageGate tools only when active."""
         if not self.enabled:
             return tools
-        if any(tool.name == ADVANCE_STAGE_TOOL_NAME for tool in tools):
-            return tools
-        return list(tools) + [self.advance_stage_tool]
+        session_tools = list(tools)
+        existing_names = {tool.name for tool in session_tools}
+        if ADVANCE_STAGE_TOOL_NAME not in existing_names:
+            session_tools.append(self.advance_stage_tool)
+            existing_names.add(ADVANCE_STAGE_TOOL_NAME)
+        if self.condition == "stagegate":
+            if COMMIT_PENDING_WRITE_TOOL_NAME not in existing_names:
+                session_tools.append(self.commit_pending_write_tool)
+                existing_names.add(COMMIT_PENDING_WRITE_TOOL_NAME)
+        return session_tools
 
     def is_advance_stage(self, tool_call: ToolCall) -> bool:
         """Whether this call targets the StageGate orchestration tool."""
         return tool_call.name == ADVANCE_STAGE_TOOL_NAME
+
+    def is_pending_write_tool(self, tool_call: ToolCall) -> bool:
+        """Whether this call targets a StageGate pending-write protocol tool."""
+        return (
+            self.condition == "stagegate" and tool_call.name in PENDING_WRITE_TOOL_NAMES
+        )
 
     def handle_advance_stage(
         self, tool_call: ToolCall, *, tick_id: Optional[int] = None
@@ -224,6 +279,10 @@ class StageGateController:
         last_action = str(args.get("last_action", ""))
         blocker = args.get("blocker")
         blocker_text = str(blocker) if blocker is not None else None
+        forced_stage = self._forced_stage_for_advance(
+            current_stage=current_stage,
+            blocker=blocker_text,
+        )
 
         self._trace(
             "advance_stage_call",
@@ -248,7 +307,9 @@ class StageGateController:
             tools=self.session_tools(self.tools),
             domain_name=self.domain_name,
             ledger=self._active_ledger(),
+            forced_stage=forced_stage,
         )
+        packet = self._apply_pending_write_guidance(packet)
         guard_reason = self._record_advance_stage_guard_state(
             packet=packet,
             blocker=blocker_text,
@@ -296,6 +357,87 @@ class StageGateController:
             content=packet.model_dump_json(),
             error=False,
         )
+
+    def handle_pending_write_tool(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> ToolMessage:
+        """Execute a StageGate-only pending-write protocol tool."""
+        validator = self._active_validator()
+        if validator is None:
+            return ToolMessage(
+                id=tool_call.id,
+                role="tool",
+                requestor=tool_call.requestor,
+                content='{"ok": false, "reason": "validator_inactive"}',
+                error=True,
+            )
+        args = tool_call.arguments
+        if tool_call.name == COMMIT_PENDING_WRITE_TOOL_NAME:
+            result = validator.commit_pending_write(
+                decision=str(args.get("decision", "unclear")),
+                basis=str(args.get("basis", "unclear_response")),
+                notes=None if args.get("notes") is None else str(args.get("notes")),
+                tick_index=tick_id,
+            )
+        else:
+            result = None
+
+        self._trace_pending_write_events(validator.drain_pending_write_events())
+        if result is None:
+            content = '{"ok": false, "reason": "unknown_pending_write_tool"}'
+            error = True
+        else:
+            content = result.model_dump_json()
+            error = not result.ok
+        self._trace(
+            "pending_write_tool_result",
+            tick_index=tick_id,
+            source="stagegate_pending_write_tool",
+            tool_name=tool_call.name,
+            tool_args=tool_call.arguments,
+            payload=json.loads(content),
+        )
+        return ToolMessage(
+            id=tool_call.id,
+            role="tool",
+            requestor=tool_call.requestor,
+            content=content,
+            error=error,
+        )
+
+    def pending_write_domain_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        requestor: Literal["assistant", "user"] = "assistant",
+    ) -> Optional[ToolCall]:
+        """Return the stored pending-write domain call after a confirmed commit."""
+        validator = self._active_validator()
+        if validator is None:
+            return None
+        return validator.pending_write_domain_tool_call(
+            tool_call_id=tool_call_id,
+            requestor=requestor,
+        )
+
+    def mark_pending_write_commit_failed(
+        self,
+        *,
+        tool_call: ToolCall,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Record that a committed pending write failed during domain execution."""
+        validator = self._active_validator()
+        if validator is None:
+            return
+        validator.mark_pending_write_commit_failed(
+            tool_call=tool_call,
+            tick_index=tick_id,
+        )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def trace_run_start(self) -> None:
         """Emit run_start with public run context."""
@@ -394,6 +536,23 @@ class StageGateController:
                 "tool_error": tool_result.error,
             },
         )
+        validator = self._active_validator()
+        if (
+            validator is not None
+            and not tool_result.error
+            and validator.is_side_effecting_tool(tool_call.name)
+        ):
+            validator.mark_side_effecting_write_consumed(
+                tool_call=tool_call,
+                tick_index=tick_id,
+            )
+            self._trace_pending_write_events(validator.drain_pending_write_events())
+            self.last_successful_side_effecting_tool = {
+                "tool_name": tool_call.name,
+                "tool_call_id": tool_call.id,
+                "tick_index": tick_id,
+            }
+            self.last_blocked_side_effecting_tool = None
         ledger = self._active_ledger()
         if ledger is None or tool_result.error:
             return
@@ -409,7 +568,6 @@ class StageGateController:
             tool_name=tool_call.name,
             tick_id=tick_id,
         )
-        validator = self._active_validator()
         if validator is not None:
             validator.record_tool_result(
                 tool_call=tool_call,
@@ -456,6 +614,7 @@ class StageGateController:
             tick_index=tick_id,
             source=EvidenceSource.ASSISTANT_UTTERANCE,
         )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def record_agent_visible_user_transcript(
         self,
@@ -463,7 +622,7 @@ class StageGateController:
         *,
         tick_id: Optional[int] = None,
     ) -> None:
-        """Record user transcript only when the adapter exposes it to the model path."""
+        """Record agent-visible user-turn ordering without parsing transcript text."""
         if transcript:
             self._trace(
                 "user_transcript_event",
@@ -474,11 +633,12 @@ class StageGateController:
         validator = self._active_validator()
         if validator is None:
             return
-        validator.record_user_confirmation_evidence(
+        validator.record_user_turn(
             content=transcript,
             tick_index=tick_id,
             source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
         )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def validate_tool_call(
         self,
@@ -496,11 +656,22 @@ class StageGateController:
             )
 
         start = time.perf_counter()
-        decision = validator.validate(tool_call, ledger=self._active_ledger())
+        decision = validator.validate(
+            tool_call,
+            ledger=self._active_ledger(),
+            tick_index=tick_id,
+            current_stage=self.final_stage,
+        )
         payload = {
             "tool_call_id": tool_call.id,
             "checks": decision.checks,
         }
+        if decision.pending_write_id is not None:
+            payload["pending_write_id"] = decision.pending_write_id
+            payload["args_fingerprint"] = decision.args_fingerprint
+            payload["matched_facets"] = decision.matched_facets
+            payload["missing_facets"] = decision.missing_facets
+        self._trace_pending_write_events(validator.drain_pending_write_events())
         if decision.corrective_packet is not None:
             payload["corrective_packet"] = decision.corrective_packet.model_dump(
                 mode="json"
@@ -511,11 +682,24 @@ class StageGateController:
             self.validator_allow_count += 1
         else:
             self.validator_block_count += 1
+            if decision.checks.get(
+                "side_effecting_tool"
+            ) is True or validator.is_side_effecting_tool(tool_call.name):
+                self.last_blocked_side_effecting_tool = {
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "tick_index": tick_id,
+                    "reason": decision.reason,
+                }
         self.last_validator_decision = {
             "tool_name": tool_call.name,
             "decision": decision.decision,
             "reason": decision.reason,
             "checks": decision.checks,
+            "pending_write_id": decision.pending_write_id,
+            "args_fingerprint": decision.args_fingerprint,
+            "matched_facets": decision.matched_facets,
+            "missing_facets": decision.missing_facets,
         }
 
         self._trace(
@@ -557,6 +741,40 @@ class StageGateController:
             requestor=tool_call.requestor,
             content=content,
             error=True,
+        )
+
+    def trace_stagegate_blocked_domain_tool(
+        self,
+        tool_call: ToolCall,
+        decision: ValidatorDecision,
+        tool_message: ToolMessage,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Trace a StageGate-intercepted domain tool that did not hit the environment."""
+        payload: dict[str, object] = {
+            "tool_call_id": tool_call.id,
+            "tool_result_id": tool_message.id,
+            "replayable_environment_action": False,
+            "environment_mutated": False,
+            "model_visible": True,
+            "reason": decision.reason,
+            "checks": decision.checks,
+        }
+        if decision.pending_write_id is not None:
+            payload["pending_write_id"] = decision.pending_write_id
+            payload["args_fingerprint"] = decision.args_fingerprint
+            payload["matched_facets"] = decision.matched_facets
+            payload["missing_facets"] = decision.missing_facets
+        self._trace(
+            "stagegate_blocked_domain_tool",
+            tick_index=tick_id,
+            source="stagegate_validator",
+            tool_name=tool_call.name,
+            tool_args=tool_call.arguments,
+            validator_decision=decision.decision,
+            validator_reason=decision.reason,
+            payload=payload,
         )
 
     def _trace(
@@ -630,6 +848,11 @@ class StageGateController:
             "last_stage_packet": self.last_stage_packet,
             "last_validator_decision": self.last_validator_decision,
             "last_corrective_packet": self.last_corrective_packet,
+            "last_blocked_side_effecting_tool": self.last_blocked_side_effecting_tool,
+            "last_successful_side_effecting_tool": (
+                self.last_successful_side_effecting_tool
+            ),
+            "pending_write": self._pending_write_snapshot(),
         }
 
     def _set_ledger_domain(self, domain_name: Optional[str]) -> None:
@@ -663,6 +886,146 @@ class StageGateController:
                 ledger_delta={str(delta["field"]): delta},
                 payload={"tool_call_id": tool_call_id},
             )
+
+    def _trace_pending_write_events(self, events: list[dict[str, object]]) -> None:
+        for event in events:
+            event_type = str(event.get("event_type", "pending_write_event"))
+            tick_index = event.get("tick_index")
+            self._trace(
+                event_type,
+                tick_index=tick_index if isinstance(tick_index, int) else None,
+                source="validator",
+                tool_name=str(event.get("tool_name", "")) or None,
+                payload=event,
+            )
+
+    def _pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        validator = self._active_validator()
+        if validator is None:
+            return None
+        return validator.pending_write_snapshot()
+
+    def _active_pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        snapshot = self._pending_write_snapshot()
+        if snapshot is None:
+            return None
+        if snapshot.get("status") in {"consumed", "expired", "none"}:
+            return None
+        return snapshot
+
+    def _apply_pending_write_guidance(self, packet):
+        pending_write = self._active_pending_write_snapshot()
+        if pending_write is None:
+            return packet
+        status = str(pending_write.get("status", ""))
+        tool_name = str(pending_write.get("tool_name", "the write tool"))
+        if status in {"needs_confirmation", "mismatched_retry"}:
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": [
+                        "pending_write_confirmation",
+                    ],
+                    "ask_next": (
+                        "Tell the user the pending action and consequence, ask "
+                        "for confirmation, wait for the user's response, then "
+                        "call commit_pending_write with decision=confirmed, "
+                        "denied, or unclear."
+                    ),
+                    "allowed_write_tools": [],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "next_tool_call": pending_write_next_tool_call(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "do_not": [
+                        "Do not call a write/action tool directly while the write is pending.",
+                        "Do not call advance_stage before commit_pending_write.",
+                        "Do not transfer to a human agent unless the user asks for human help or an unrecoverable error occurs.",
+                    ],
+                    "exit_condition": (
+                        "commit_pending_write has been called with a structured "
+                        "decision after the user's response."
+                    ),
+                    "when_done": (
+                        "If commit_pending_write is confirmed, StageGate executes "
+                        f"the stored {tool_name} arguments once."
+                    ),
+                }
+            )
+        if status == "unclear":
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": ["pending_write_unclear"],
+                    "ask_next": (
+                        "Ask one concise clarification question. After the user "
+                        "responds, call commit_pending_write again "
+                        "with confirmed, denied, or unclear."
+                    ),
+                    "allowed_write_tools": [],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "next_tool_call": pending_write_next_tool_call(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "do_not": [
+                        "Do not call a write/action tool directly while the write is unclear.",
+                        "Do not call advance_stage before commit_pending_write resolves the pending write.",
+                        "Do not transfer to a human agent unless the user asks for human help or an unrecoverable error occurs.",
+                    ],
+                    "exit_condition": "commit_pending_write returned confirmed or denied.",
+                    "when_done": (
+                        "If confirmed, StageGate executes the stored "
+                        f"{tool_name} arguments once."
+                    ),
+                }
+            )
+        if status == "denied":
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": ["pending_write_denied"],
+                    "ask_next": (
+                        "Do not retry the denied pending write. Gracefully close "
+                        "or offer alternative help that does not execute this write."
+                    ),
+                    "allowed_write_tools": [],
+                    "allowed_internal_tools": [],
+                    "disallowed_tools": [],
+                    "next_required_steps": [
+                        {
+                            "step": "do_not_retry_denied_write",
+                            "tool_name": tool_name,
+                            "instruction": "Do not retry the denied pending write.",
+                        },
+                        {
+                            "step": "non_write_resolution",
+                            "instruction": "Gracefully close or offer alternative non-write help.",
+                        },
+                    ],
+                    "do_not": [
+                        "Do not call the denied write tool.",
+                    ],
+                    "exit_condition": "The denied write is not executed.",
+                    "when_done": "Close or continue only with non-write assistance.",
+                }
+            )
+        return packet
 
     def _record_advance_stage_guard_state(
         self,
@@ -737,6 +1100,32 @@ class StageGateController:
         else:
             self.stage_sequence.append(packet.stage)
         self.last_stage_packet = packet.model_dump(mode="json")
+
+    def _forced_stage_for_advance(
+        self,
+        *,
+        current_stage: str,
+        blocker: Optional[str],
+    ) -> Optional[str]:
+        if self.condition != "stagegate":
+            return None
+        if blocker is not None:
+            return None
+        pending_write = self._active_pending_write_snapshot()
+        if pending_write is not None:
+            status = pending_write.get("status")
+            if status in {
+                "needs_confirmation",
+                "denied",
+                "unclear",
+                "mismatched_retry",
+            }:
+                return "propose_action_and_confirm"
+        if current_stage not in {"execute_write_action", "verify_result_and_close"}:
+            return None
+        if self.last_successful_side_effecting_tool is not None:
+            return None
+        return "execute_write_action"
 
 
 def _resolve_int_setting(

@@ -15,6 +15,7 @@ from tau2.data_model.simulation import RewardInfo, SimulationRun
 from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
+from tau2.evaluator.evaluator_env import FullDuplexEnvironmentEvaluator
 from tau2.orchestrator.full_duplex_orchestrator import FullDuplexOrchestrator
 from tau2.orchestrator.orchestrator import BaseOrchestrator
 from tau2.runner import batch as runner_batch
@@ -152,12 +153,220 @@ class StageGateToolkit(ToolKitBase):
         self.service_tasks[task_id]["status"] = status
         return dict(self.service_tasks[task_id])
 
+    @is_tool(ToolType.GENERIC)
+    def transfer_to_human_agents(self, summary: str) -> str:
+        """Transfer the customer to a human agent.
+
+        Args:
+            summary: A summary for the human agent.
+
+        Returns:
+            Transfer status.
+        """
+        return "Transfer successful"
+
+
+class RetailExchangeToolkit(ToolKitBase):
+    def __init__(self):
+        self.write_count = 0
+
+    @is_tool(ToolType.READ)
+    def find_user_id_by_name_zip(
+        self,
+        first_name: str,
+        last_name: str,
+        zip: str,
+    ) -> str:
+        """Find a retail user by name and ZIP.
+
+        Args:
+            first_name: User first name.
+            last_name: User last name.
+            zip: User ZIP code.
+
+        Returns:
+            User ID.
+        """
+        return "yusuf_rossi_9620"
+
+    @is_tool(ToolType.READ)
+    def get_user_details(self, user_id: str) -> dict:
+        """Get retail user details.
+
+        Args:
+            user_id: User ID.
+
+        Returns:
+            User profile details.
+        """
+        return {
+            "user_id": user_id,
+            "name": {"first_name": "Yusuf", "last_name": "Rossi"},
+            "email": "yusuf.rossi7301@example.com",
+            "address": {"zip": "19122"},
+            "payment_methods": [
+                {
+                    "payment_method_id": "credit_card_9513926",
+                    "source": "credit card ending 2478",
+                }
+            ],
+        }
+
+    @is_tool(ToolType.READ)
+    def get_order_details(self, order_id: str) -> dict:
+        """Get retail order details.
+
+        Args:
+            order_id: Order ID.
+
+        Returns:
+            Order details.
+        """
+        return {
+            "order_id": order_id,
+            "user_id": "yusuf_rossi_9620",
+            "status": "delivered",
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {
+                        "switch type": "linear",
+                        "backlight": "RGB",
+                        "size": "full size",
+                    },
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "4983901480",
+                    "options": {
+                        "compatibility": "Apple HomeKit",
+                        "color": "black",
+                    },
+                },
+            ],
+            "payment_history": [
+                {
+                    "transaction_type": "payment",
+                    "payment_method_id": "credit_card_9513926",
+                }
+            ],
+        }
+
+    @is_tool(ToolType.READ)
+    def get_product_details(self, product_id: str) -> dict:
+        """Get retail product details.
+
+        Args:
+            product_id: Product ID.
+
+        Returns:
+            Product details.
+        """
+        if product_id == "1656367028":
+            return {
+                "name": "Mechanical Keyboard",
+                "product_id": product_id,
+                "variants": {
+                    "7706410293": {
+                        "item_id": "7706410293",
+                        "options": {
+                            "switch type": "clicky",
+                            "backlight": "none",
+                            "size": "full size",
+                        },
+                        "available": True,
+                    },
+                    "9025753381": {
+                        "item_id": "9025753381",
+                        "options": {
+                            "switch type": "clicky",
+                            "backlight": "RGB",
+                            "size": "full size",
+                        },
+                        "available": False,
+                    },
+                },
+            }
+        return {
+            "name": "Smart Thermostat",
+            "product_id": product_id,
+            "variants": {
+                "7747408585": {
+                    "item_id": "7747408585",
+                    "options": {
+                        "compatibility": "Google Assistant",
+                        "color": "black",
+                    },
+                    "available": True,
+                },
+                "4983901480": {
+                    "item_id": "4983901480",
+                    "options": {
+                        "compatibility": "Apple HomeKit",
+                        "color": "black",
+                    },
+                    "available": True,
+                },
+            },
+        }
+
+    @is_tool(ToolType.WRITE)
+    def exchange_delivered_order_items(
+        self,
+        order_id: str,
+        item_ids: list[str],
+        new_item_ids: list[str],
+        payment_method_id: str,
+    ) -> dict:
+        """Exchange delivered order items.
+
+        Args:
+            order_id: Order ID.
+            item_ids: Existing delivered item IDs.
+            new_item_ids: Replacement item IDs.
+            payment_method_id: Payment method for price difference.
+
+        Returns:
+            Exchange request result.
+        """
+        self.write_count += 1
+        return {
+            "order_id": order_id,
+            "status": "exchange requested",
+            "exchange_items": item_ids,
+            "exchange_new_items": new_item_ids,
+            "exchange_payment_method_id": payment_method_id,
+        }
+
+    @is_tool(ToolType.GENERIC)
+    def transfer_to_human_agents(self, summary: str) -> str:
+        """Transfer the customer to a human agent.
+
+        Args:
+            summary: A summary for the human agent.
+
+        Returns:
+            Transfer status.
+        """
+        return "Transfer successful"
+
 
 def _environment(domain_name: str = "mock") -> Environment:
     return Environment(
         domain_name=domain_name,
         policy="Public policy.",
         tools=StageGateToolkit(),
+    )
+
+
+def _retail_exchange_environment() -> Environment:
+    return Environment(
+        domain_name="retail",
+        policy="Retail public policy.",
+        tools=RetailExchangeToolkit(),
     )
 
 
@@ -229,6 +438,41 @@ class ScriptedStageGateAgent:
                 content=None,
                 contains_speech=False,
                 tool_calls=[self.tool_call],
+            ),
+            state,
+        )
+
+
+class ScriptedSequenceStageGateAgent:
+    def __init__(self, controller: StageGateController, tool_calls: list[ToolCall]):
+        self.stagegate_controller = controller
+        self.tool_calls = list(tool_calls)
+        self.received_chunks = []
+        self.received_tool_results = []
+
+    @classmethod
+    def is_stop(cls, message):
+        return False
+
+    def get_next_chunk(
+        self,
+        state,
+        participant_chunk=None,
+        tool_results=None,
+    ):
+        self.received_chunks.append(participant_chunk)
+        self.received_tool_results.append(tool_results)
+        if not self.tool_calls:
+            return (
+                AssistantMessage(role="assistant", content=None, contains_speech=False),
+                state,
+            )
+        return (
+            AssistantMessage(
+                role="assistant",
+                content=None,
+                contains_speech=False,
+                tool_calls=[self.tool_calls.pop(0)],
             ),
             state,
         )
@@ -315,10 +559,164 @@ def _prepare_validated_account_change(
     controller.record_assistant_utterance(
         AssistantMessage.text(
             "I will update account acct_123 to premium. "
-            "This will change the account plan status."
+            "This will change the account plan status. Please confirm."
         ),
         tick_id=0,
     )
+
+
+def _exchange_tool_call(call_id: str = "call_exchange") -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name="exchange_delivered_order_items",
+        arguments={
+            "order_id": "#W2378156",
+            "item_ids": ["1151293680", "4983901480"],
+            "new_item_ids": ["7706410293", "7747408585"],
+            "payment_method_id": "credit_card_9513926",
+        },
+    )
+
+
+def _pending_write_id(controller: StageGateController) -> str:
+    snapshot = controller.validator.pending_write_snapshot()
+    assert snapshot is not None
+    return str(snapshot["pending_write_id"])
+
+
+def _step_by_name(packet: dict, step_name: str) -> dict:
+    for step in packet["next_required_steps"]:
+        if step["step"] == step_name:
+            return step
+    raise AssertionError(f"missing next_required_steps entry {step_name!r}")
+
+
+def _assert_pending_commit_steps(packet: dict) -> None:
+    _step_by_name(packet, "tell_user_pending_action")
+    _step_by_name(packet, "ask_user_to_confirm")
+    _step_by_name(packet, "wait_for_user_response")
+
+
+def _assert_confirmation_step(packet: dict) -> None:
+    confirmation_step = _step_by_name(packet, "call_tool_if_user_confirms")
+    assert confirmation_step["tool_name"] == "commit_pending_write"
+    assert confirmation_step["arguments"] == {
+        "decision": "confirmed",
+        "basis": "latest_user_turn",
+    }
+    assert "pending_write_id" not in confirmation_step["arguments"]
+
+
+def _assert_confirmation_next_tool_call(packet: dict) -> None:
+    confirmation_step = _step_by_name(packet, "call_tool_if_user_confirms")
+    assert packet["next_tool_call"] == {
+        "name": "commit_pending_write",
+        "arguments": confirmation_step["arguments"],
+        "when": "after_user_confirms",
+    }
+
+
+def _assert_retry_step(packet: dict, tool_name: str) -> None:
+    assert not any(
+        step["step"] == "retry_original_write" for step in packet["next_required_steps"]
+    )
+    assert tool_name in packet["when_done"]
+
+
+def _record_pending_summary(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+    *,
+    pending_write_id: str | None = None,
+    tick_id: int = 11,
+    action_type: str = "exchange_delivered_order_items",
+) -> ToolMessage:
+    return ToolMessage(
+        id=f"call_record_summary_{tick_id}",
+        role="tool",
+        content=json.dumps(
+            {
+                "ok": True,
+                "reason": "summary_is_verbal_before_commit_pending_write",
+                "action_type": action_type,
+            }
+        ),
+        error=False,
+    )
+
+
+def _record_pending_confirmation(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+    *,
+    pending_write_id: str | None = None,
+    decision: str = "confirmed",
+    basis: str = "latest_user_turn",
+    user_tick_id: int = 12,
+    tool_tick_id: int = 13,
+) -> ToolMessage:
+    controller.record_agent_visible_user_transcript(
+        "user response event",
+        tick_id=user_tick_id,
+    )
+    return orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id=f"call_commit_pending_write_{tool_tick_id}",
+            name="commit_pending_write",
+            arguments={
+                "decision": decision,
+                "basis": basis,
+            },
+        ),
+        tick_id=tool_tick_id,
+    )
+
+
+def _prepare_validated_retail_exchange(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+) -> None:
+    for tick_id, tool_call in enumerate(
+        [
+            ToolCall(
+                id="call_find_user",
+                name="find_user_id_by_name_zip",
+                arguments={
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
+            ),
+            ToolCall(
+                id="call_user",
+                name="get_user_details",
+                arguments={"user_id": "yusuf_rossi_9620"},
+            ),
+            ToolCall(
+                id="call_order",
+                name="get_order_details",
+                arguments={"order_id": "#W2378156"},
+            ),
+            ToolCall(
+                id="call_keyboard",
+                name="get_product_details",
+                arguments={"product_id": "1656367028"},
+            ),
+            ToolCall(
+                id="call_thermostat",
+                name="get_product_details",
+                arguments={"product_id": "4896585277"},
+            ),
+        ],
+        start=1,
+    ):
+        result = orchestrator._execute_stagegate_tool_call(
+            controller,
+            tool_call,
+            tick_id=tick_id,
+        )
+        assert result.error is False
 
 
 def test_stagegate_agent_adds_advance_stage_only_when_enabled(monkeypatch):
@@ -370,6 +768,8 @@ def test_stagegate_agent_leaves_baseline_tools_unchanged(monkeypatch):
         "StageGate operating rules"
         not in adapter.connect.call_args.kwargs["system_prompt"]
     )
+    assert not hasattr(agent.stagegate_controller, "ledger")
+    assert not hasattr(agent.stagegate_controller, "validator")
 
 
 def test_stage_only_condition_has_no_ledger(monkeypatch):
@@ -408,16 +808,49 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
     )
     agent.get_init_state()
 
-    tool_names = [tool.name for tool in adapter.connect.call_args.kwargs["tools"]]
+    tools = adapter.connect.call_args.kwargs["tools"]
+    tool_names = [tool.name for tool in tools]
     system_prompt = adapter.connect.call_args.kwargs["system_prompt"]
-    assert tool_names == ["_test_tool", "advance_stage"]
+    assert tool_names == [
+        "_test_tool",
+        "advance_stage",
+        "commit_pending_write",
+    ]
+    tool_schema_by_name = {tool.name: tool.params.model_json_schema() for tool in tools}
+    assert "pending_write_id" not in tool_schema_by_name["commit_pending_write"].get(
+        "required", []
+    )
     assert "StageGate operating rules" in system_prompt
     assert (
         "call advance_stage before the first customer-specific domain tool call"
         in system_prompt
     )
+    assert "commit_pending_write" in system_prompt
+    assert "executes the stored original write once" in system_prompt
     assert hasattr(agent.stagegate_controller, "ledger")
     assert hasattr(agent.stagegate_controller, "validator")
+
+
+def test_pending_write_tool_descriptions_explain_active_handle():
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy="Policy.",
+        tools=[Tool(_test_tool)],
+        domain_name="mock",
+    )
+
+    description = controller.commit_pending_write_tool.openai_schema["function"][
+        "description"
+    ]
+
+    normalized_description = " ".join(description.split())
+    assert "active pending write" in normalized_description
+    assert "pending_write_id is not required" in normalized_description
+    assert (
+        "after you have told the user the pending action and consequence"
+        in normalized_description
+    )
+    assert "executes the stored original domain write once" in normalized_description
 
 
 def test_entity_ledger_initializes_domain_slots_and_serializes():
@@ -429,6 +862,10 @@ def test_entity_ledger_initializes_domain_slots_and_serializes():
         "phone",
         "order_id",
         "item_id",
+        "order_item_ids",
+        "candidate_replacement_item_ids",
+        "selected_old_item_ids",
+        "selected_new_item_ids",
         "return_reason",
         "refund_or_exchange_intent",
         "address",
@@ -528,7 +965,8 @@ def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
     )
 
     assert retail_ledger.slots["customer_name"].status is LedgerStatus.MISSING
-    assert retail_ledger.slots["item_id"].value == "item_1"
+    assert retail_ledger.slots["item_id"].status is LedgerStatus.MISSING
+    assert retail_ledger.slots["candidate_replacement_item_ids"].value == ["item_1"]
 
     telecom_ledger = EntityLedger.for_domain("telecom")
     telecom_ledger.update_from_tool_result(
@@ -546,6 +984,54 @@ def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
 
     assert telecom_ledger.slots["customer_name"].status is LedgerStatus.MISSING
     assert telecom_ledger.slots["plan_name"].value == "Unlimited Plus"
+
+
+def test_retail_order_and_item_reads_fill_item_id_compatibility_slot():
+    order_ledger = EntityLedger.for_domain("retail")
+    order_ledger.update_from_tool_result(
+        tool_name="get_order_details",
+        content=json.dumps(
+            {
+                "order_id": "#W2378156",
+                "items": [
+                    {"item_id": "1151293680", "name": "Mechanical Keyboard"},
+                    {"item_id": "4983901480", "name": "Smart Thermostat"},
+                ],
+                "fulfillments": [
+                    {"item_ids": ["1151293680", "4983901480"]},
+                ],
+            }
+        ),
+        event_id="call_order",
+        tick_index=1,
+    )
+
+    assert order_ledger.slots["item_id"].status is LedgerStatus.TOOL_VERIFIED
+    assert order_ledger.slots["item_id"].value == ["1151293680", "4983901480"]
+    assert order_ledger.slots["order_item_ids"].value == [
+        "1151293680",
+        "4983901480",
+    ]
+
+    item_ledger = EntityLedger.for_domain("retail")
+    item_ledger.update_from_tool_result(
+        tool_name="get_item_details",
+        content=json.dumps(
+            {
+                "item_id": "1151293680",
+                "options": {
+                    "switch type": "linear",
+                    "backlight": "RGB",
+                    "size": "full size",
+                },
+            }
+        ),
+        event_id="call_item",
+        tick_index=2,
+    )
+
+    assert item_ledger.slots["item_id"].status is LedgerStatus.TOOL_VERIFIED
+    assert item_ledger.slots["item_id"].value == "1151293680"
 
 
 def test_errored_tool_results_do_not_update_ledger():
@@ -1095,7 +1581,7 @@ def test_validator_never_mutates_domain_state_when_blocking():
     assert orchestrator.num_errors == 1
 
 
-def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
+def test_pending_write_creation_blocks_first_write(monkeypatch, tmp_path):
     trace_path = tmp_path / "trace_events.jsonl"
     monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
     environment = _environment()
@@ -1116,13 +1602,6 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_id=2,
-    )
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1139,10 +1618,1169 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
     assert result.error is True
     assert packet["stage"] == "propose_action_and_confirm"
     assert packet["missing_facts"] == ["missing_confirmation"]
+    assert "commit_pending_write" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_pending_commit_steps(packet)
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "update_account")
+    assert (
+        "StageGate will execute the stored update_account arguments once"
+        in packet["when_done"]
+    )
     assert environment.tools.write_count == 0
-    assert events[-2]["event_type"] == "validator_check"
-    assert events[-1]["event_type"] == "validator_block"
+    assert "pending_write_created" in [event["event_type"] for event in events]
+    assert events[-2]["event_type"] == "validator_block"
+    assert events[-2]["validator_reason"] == "missing_confirmation"
+    assert events[-1]["event_type"] == "stagegate_blocked_domain_tool"
     assert events[-1]["validator_reason"] == "missing_confirmation"
+    assert events[-1]["payload"]["replayable_environment_action"] is False
+    assert events[-1]["payload"]["environment_mutated"] is False
+
+
+def test_stagegate_blocked_write_is_internal_and_not_replayable(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _visibility_orchestrator(
+        environment,
+        controller,
+        user_chunks=[UserMessage.text("Yes, I confirm.")],
+    )
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+
+    tick = orchestrator.ticks[-1]
+    assert tick.agent_tool_calls == []
+    assert tick.agent_tool_results == []
+    assert [call.name for call in tick.agent_internal_tool_calls] == ["update_account"]
+    assert tick.agent_internal_tool_results[0].error is True
+    assert (
+        json.loads(tick.agent_internal_tool_results[0].content)["schema_version"]
+        == "stagegate.stage_packet.v1"
+    )
+    assert orchestrator.pending_agent_tool_results is not None
+
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    assert not any(
+        getattr(message, "tool_calls", None)
+        and any(call.name == "update_account" for call in message.tool_calls)
+        for message in replay_messages
+    )
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert "model_function_call" in event_types
+    assert "validator_block" in event_types
+    assert "stagegate_blocked_domain_tool" in event_types
+    assert not any(
+        event["event_type"] == "domain_tool_call"
+        and event["tool_name"] == "update_account"
+        for event in events
+    )
+    assert not any(
+        event["event_type"] == "domain_tool_result"
+        and event["tool_name"] == "update_account"
+        for event in events
+    )
+
+
+def test_allowed_retry_is_replayable_after_stagegate_confirmation():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_write",
+                name="update_account",
+                arguments={"account_id": "acct_123", "plan_name": "premium"},
+            ),
+            ToolCall(
+                id="call_commit",
+                name="commit_pending_write",
+                arguments={"decision": "confirmed", "basis": "latest_user_turn"},
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser(
+        [UserMessage.text("Please do."), UserMessage.text("confirmed")]
+    )
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text(
+        "Please confirm the account change."
+    )
+    orchestrator.current_user_chunk = UserMessage.text("I want the premium plan.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_commit_replay")
+    orchestrator.simulation_id = "sim_commit_replay"
+    _prepare_validated_account_change(orchestrator, controller)
+
+    orchestrator.step()
+    first_tick = orchestrator.ticks[-1]
+    assert first_tick.agent_tool_calls == []
+    assert first_tick.agent_internal_tool_calls[0].name == "update_account"
+    assert environment.tools.write_count == 0
+
+    controller.record_agent_visible_user_transcript("confirmed", tick_id=1)
+    orchestrator.step()
+    second_tick = orchestrator.ticks[-1]
+    assert [call.name for call in second_tick.agent_tool_calls] == ["update_account"]
+    assert [call.name for call in second_tick.agent_internal_tool_calls] == [
+        "commit_pending_write"
+    ]
+    assert second_tick.agent_tool_results[0].error is False
+    assert environment.tools.write_count == 1
+
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    replayed_environment = _environment()
+    replayed_environment.set_state(None, None, replay_messages)
+    assert replayed_environment.tools.write_count == 1
+
+
+def test_stagegate_internal_tools_are_not_replayable_domain_actions():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_stage",
+                name="advance_stage",
+                arguments={
+                    "current_stage": "understand_intent",
+                    "observed_facts": [],
+                    "last_action": "started",
+                },
+            ),
+            ToolCall(
+                id="call_commit",
+                name="commit_pending_write",
+                arguments={
+                    "decision": "unclear",
+                    "basis": "unclear_response",
+                },
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser(
+        [UserMessage.text("Hi."), UserMessage.text("Still here.")]
+    )
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need help.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_internal_tools")
+    orchestrator.simulation_id = "sim_internal_tools"
+
+    orchestrator.step()
+    orchestrator.step()
+
+    assert [
+        call.name
+        for tick in orchestrator.ticks
+        for call in tick.agent_internal_tool_calls
+    ] == ["advance_stage", "commit_pending_write"]
+    assert [
+        call.name for tick in orchestrator.ticks for call in tick.agent_tool_calls
+    ] == []
+    assert (
+        FullDuplexEnvironmentEvaluator.ticks_to_message_history(orchestrator.ticks)
+        == []
+    )
+
+
+def test_stage_only_advance_stage_is_not_replayable_domain_action():
+    environment = _environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_stage",
+                name="advance_stage",
+                arguments={
+                    "current_stage": "understand_intent",
+                    "observed_facts": [],
+                    "last_action": "started",
+                },
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser([UserMessage.text("Hi.")])
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need help.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_stage_only_internal")
+    orchestrator.simulation_id = "sim_stage_only_internal"
+
+    orchestrator.step()
+
+    assert not hasattr(controller, "ledger")
+    assert not hasattr(controller, "validator")
+    assert orchestrator.ticks[-1].agent_tool_calls == []
+    assert [call.name for call in orchestrator.ticks[-1].agent_internal_tool_calls] == [
+        "advance_stage"
+    ]
+    assert (
+        FullDuplexEnvironmentEvaluator.ticks_to_message_history(orchestrator.ticks)
+        == []
+    )
+
+
+def test_successful_stagegate_exchange_serializes_only_allowed_exchange():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    orchestrator.agent = ScriptedSequenceStageGateAgent(
+        controller,
+        [
+            ToolCall(
+                id="call_find_user",
+                name="find_user_id_by_name_zip",
+                arguments={
+                    "first_name": "Yusuf",
+                    "last_name": "Rossi",
+                    "zip": "19122",
+                },
+            ),
+            ToolCall(
+                id="call_user",
+                name="get_user_details",
+                arguments={"user_id": "yusuf_rossi_9620"},
+            ),
+            ToolCall(
+                id="call_order",
+                name="get_order_details",
+                arguments={"order_id": "#W2378156"},
+            ),
+            ToolCall(
+                id="call_keyboard",
+                name="get_product_details",
+                arguments={"product_id": "1656367028"},
+            ),
+            ToolCall(
+                id="call_thermostat",
+                name="get_product_details",
+                arguments={"product_id": "4896585277"},
+            ),
+            _exchange_tool_call("call_exchange_blocked"),
+            ToolCall(
+                id="call_commit",
+                name="commit_pending_write",
+                arguments={
+                    "decision": "confirmed",
+                    "basis": "latest_user_turn",
+                },
+            ),
+        ],
+    )
+    orchestrator.user = ScriptedUser([UserMessage.text("continue") for _ in range(7)])
+    orchestrator.agent_state = SimpleNamespace()
+    orchestrator.user_state = SimpleNamespace()
+    orchestrator.current_agent_chunk = AssistantMessage.text("Hello.")
+    orchestrator.current_user_chunk = UserMessage.text("I need an exchange.")
+    orchestrator.pending_agent_tool_results = None
+    orchestrator.pending_user_tool_results = None
+    orchestrator.ticks = []
+    orchestrator.tick_duration_seconds = None
+    orchestrator.step_count = 0
+    orchestrator.done = False
+    orchestrator.termination_reason = None
+    orchestrator.task = SimpleNamespace(id="task_exchange_serialization")
+    orchestrator.simulation_id = "sim_exchange_serialization"
+
+    for _ in range(6):
+        orchestrator.step()
+    controller.record_agent_visible_user_transcript("Yes.", tick_id=6)
+    orchestrator.step()
+
+    canonical_tool_names = [
+        call.name for tick in orchestrator.ticks for call in tick.agent_tool_calls
+    ]
+    assert canonical_tool_names == [
+        "find_user_id_by_name_zip",
+        "get_user_details",
+        "get_order_details",
+        "get_product_details",
+        "get_product_details",
+        "exchange_delivered_order_items",
+    ]
+    assert [
+        call.name
+        for tick in orchestrator.ticks
+        for call in tick.agent_internal_tool_calls
+    ] == [
+        "exchange_delivered_order_items",
+        "commit_pending_write",
+    ]
+    assert environment.tools.write_count == 1
+
+    replayed_environment = _retail_exchange_environment()
+    replay_messages = FullDuplexEnvironmentEvaluator.ticks_to_message_history(
+        orchestrator.ticks
+    )
+    replayed_environment.set_state(None, None, replay_messages)
+    assert replayed_environment.tools.write_count == 1
+
+
+def test_commit_pending_write_unclear_without_transcript_parsing():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    assert blocked.error is True
+
+    commit_result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="unclear",
+        basis="unclear_response",
+        user_tick_id=11,
+        tool_tick_id=12,
+    )
+
+    assert commit_result.error is False
+    assert json.loads(commit_result.content)["reason"] == "commit_unclear"
+    assert controller.validator.pending_write_snapshot()["status"] == "unclear"
+    assert environment.tools.write_count == 0
+
+
+def test_commit_pending_write_confirmed_executes_after_user_turn():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    commit_result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    assert commit_result.error is False
+    assert json.loads(commit_result.content)["status"] == "exchange requested"
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
+    assert environment.tools.write_count == 1
+
+
+def test_commit_pending_write_with_no_pending_write_returns_not_found():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_commit_no_pending",
+            name="commit_pending_write",
+            arguments={"decision": "confirmed", "basis": "latest_user_turn"},
+        ),
+        tick_id=1,
+    )
+
+    assert result.error is True
+    assert json.loads(result.content)["reason"] == "pending_write_not_found"
+
+
+def test_commit_pending_write_confirmed_replays_stored_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["status"] == "exchange requested"
+    assert environment.tools.write_count == 1
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
+
+
+def test_commit_pending_write_before_later_user_turn_does_not_execute():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_commit_too_early",
+            name="commit_pending_write",
+            arguments={"decision": "confirmed", "basis": "latest_user_turn"},
+        ),
+        tick_id=12,
+    )
+
+    assert result.error is True
+    assert (
+        json.loads(result.content)["reason"] == "missing_user_turn_after_pending_write"
+    )
+    assert (
+        controller.validator.pending_write_snapshot()["status"] == "needs_confirmation"
+    )
+    assert environment.tools.write_count == 0
+
+
+def test_denied_or_unclear_pending_write_does_not_allow_write():
+    for decision, reason in (
+        ("denied", "pending_write_denied"),
+        ("unclear", "pending_write_unclear"),
+    ):
+        environment = _retail_exchange_environment()
+        controller = StageGateController(
+            condition="stagegate",
+            domain_policy=environment.get_policy(),
+            tools=environment.get_tools(),
+            domain_name=environment.get_domain_name(),
+        )
+        orchestrator = _orchestrator_shell(environment)
+        _prepare_validated_retail_exchange(orchestrator, controller)
+
+        orchestrator._execute_stagegate_tool_call(
+            controller,
+            _exchange_tool_call("call_initial_exchange"),
+            tick_id=10,
+        )
+        _record_pending_summary(orchestrator, controller, tick_id=11)
+        _record_pending_confirmation(
+            orchestrator,
+            controller,
+            decision=decision,
+            basis="user_declined" if decision == "denied" else "unclear_response",
+            user_tick_id=12,
+            tool_tick_id=13,
+        )
+
+        result = orchestrator._execute_stagegate_tool_call(
+            controller,
+            _exchange_tool_call("call_retry_exchange"),
+            tick_id=14,
+        )
+
+        packet = json.loads(result.content)
+        assert result.error is True
+        assert controller.last_validator_decision["reason"] == reason
+        assert packet["missing_facts"] == [reason]
+        assert environment.tools.write_count == 0
+
+
+def test_unclear_pending_write_keeps_protocol_active_for_clarification():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="unclear",
+        basis="unclear_response",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write can close."],
+        last_action="No confirmed pending write yet.",
+        tick_id=14,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["missing_facts"] == ["pending_write_unclear"]
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    clarification_step = _step_by_name(packet, "ask_one_clarification")
+    assert "clarification" in clarification_step["instruction"]
+    assert packet["next_tool_call"] == {
+        "name": "commit_pending_write",
+        "arguments": {
+            "decision": "confirmed",
+            "basis": "latest_user_turn",
+        },
+        "when": "after_user_confirms",
+    }
+
+    transfer = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_unclear_path",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User response was unclear."},
+        ),
+        tick_id=15,
+    )
+    transfer_packet = json.loads(transfer.content)
+    assert transfer.error is True
+    assert transfer_packet["missing_facts"] == ["transfer_blocked_pending_write"]
+
+    repeated_without_user = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="confirmed",
+        basis="latest_user_turn",
+        user_tick_id=12,
+        tool_tick_id=16,
+    )
+    assert repeated_without_user.error is True
+    assert json.loads(repeated_without_user.content)["reason"] == (
+        "missing_user_turn_after_unclear_commit"
+    )
+
+    clarified = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="confirmed",
+        basis="latest_user_turn",
+        user_tick_id=17,
+        tool_tick_id=18,
+    )
+    assert clarified.error is False
+    assert json.loads(clarified.content)["status"] == "exchange requested"
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
+
+
+def test_denied_pending_write_allows_non_write_resolution_path():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="denied",
+        basis="user_declined",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write can close."],
+        last_action="User declined the pending write.",
+        tick_id=14,
+    )
+    transfer = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_denied_path",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User declined the pending write."},
+        ),
+        tick_id=15,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["missing_facts"] == ["pending_write_denied"]
+    assert packet["next_required_steps"][0]["step"] == "do_not_retry_denied_write"
+    assert packet["disallowed_tools"] == []
+    assert transfer.error is False
+
+
+def test_missing_exchange_summary_still_blocks_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    controller.record_agent_visible_user_transcript("user response event", tick_id=10)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=11,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert "commit_pending_write" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_pending_commit_steps(packet)
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+    assert "stored exchange_delivered_order_items arguments once" in packet["when_done"]
+    assert "advance_stage" not in packet["when_done"]
+    assert environment.tools.write_count == 0
+
+
+def test_transfer_to_human_blocked_during_resolvable_pending_write(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer",
+            name="transfer_to_human_agents",
+            arguments={"summary": "Cannot complete the pending write protocol."},
+        ),
+        tick_id=11,
+    )
+
+    packet = json.loads(result.content)
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert result.error is True
+    assert packet["missing_facts"] == ["transfer_blocked_pending_write"]
+    assert "commit_pending_write" in packet["ask_next"]
+    assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_pending_commit_steps(packet)
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+    assert "transfer_blocked_pending_write" in event_types
+    assert environment.tools.write_count == 0
+
+
+def test_transfer_to_human_allowed_without_resolvable_pending_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    no_pending = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_no_pending",
+            name="transfer_to_human_agents",
+            arguments={"summary": "Out of scope."},
+        ),
+        tick_id=1,
+    )
+    assert no_pending.error is False
+    assert no_pending.content == "Transfer successful"
+
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="denied",
+        basis="user_declined",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+    denied_pending = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_denied",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User declined the pending write."},
+        ),
+        tick_id=14,
+    )
+
+    assert denied_pending.error is False
+    assert denied_pending.content == "Transfer successful"
+
+
+def test_pending_exchange_summary_and_confirmation_allows_retry():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    assert blocked.error is True
+    assert (
+        controller.validator.pending_write_snapshot()["status"] == "needs_confirmation"
+    )
+    result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    assert result.error is False
+    assert json.loads(result.content)["status"] == "exchange requested"
+    assert environment.tools.write_count == 1
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
+
+
+def test_pending_exchange_retry_with_changed_args_blocks_as_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+
+    changed_call = _exchange_tool_call("call_changed_exchange")
+    changed_call.arguments["new_item_ids"] = ["9025753381", "7747408585"]
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        changed_call,
+        tick_id=11,
+    )
+
+    packet = json.loads(result.content)
+    assert result.error is True
+    assert packet["missing_facts"] == ["pending_write_mismatch"]
+    assert controller.last_validator_decision["reason"] == "pending_write_mismatch"
+    assert environment.tools.write_count == 0
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert "pending_write_mismatch" in event_types
+    assert "pending_write_expired" in event_types
+
+
+def test_advance_stage_needs_confirmation_repeats_required_protocol_steps():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims confirmation happened."],
+        last_action="No structured pending write summary yet.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["allowed_write_tools"] == []
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_pending_commit_steps(packet)
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+
+
+def test_advance_stage_unclear_repeats_commit_steps():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="unclear",
+        basis="unclear_response",
+        user_tick_id=11,
+        tool_tick_id=12,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims confirmation happened."],
+        last_action="Pending write response was unclear.",
+        tick_id=13,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["missing_facts"] == ["pending_write_unclear"]
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["allowed_write_tools"] == []
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_confirmation_next_tool_call(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+
+
+def test_needs_confirmation_pending_write_does_not_reach_verify_close():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write was validated."],
+        last_action="No domain write result yet.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["allowed_write_tools"] == []
+    assert packet["allowed_internal_tools"] == ["commit_pending_write"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_confirmation_next_tool_call(packet)
+    assert "commit_pending_write" in packet["ask_next"]
+
+
+def test_pending_write_trace_events_are_emitted(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert "pending_write_created" in event_types
+    assert "pending_write_commit_requested" in event_types
+    assert "pending_write_committed" in event_types
+    assert "pending_write_consumed" in event_types
+
+
+def test_advance_stage_cannot_verify_after_blocked_write():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call(),
+        tick_id=10,
+    )
+    assert blocked.error is True
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=[
+            "Model claims action summary and confirmation are satisfied.",
+        ],
+        last_action="Validated prerequisite action summary and confirmation.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] in {"propose_action_and_confirm", "execute_write_action"}
+    assert packet["stage"] != "verify_result_and_close"
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=[
+            "Model still claims the blocked write completed.",
+        ],
+        last_action="Attempting to close without a domain tool result.",
+        tick_id=12,
+    )
+
+    assert packet["stage"] in {"propose_action_and_confirm", "execute_write_action"}
+
+
+def test_verify_result_and_close_requires_successful_write_result():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=["User confirmed a write action."],
+        last_action="Ready to verify.",
+        tick_id=1,
+    )
+
+    assert packet["stage"] == "execute_write_action"
+
+
+def test_retail_item_id_product_list_ambiguity_not_surfaced_at_close():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+    assert result.error is False
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="execute_write_action",
+        observed_facts=["Exchange tool succeeded."],
+        last_action="exchange_delivered_order_items returned exchange requested",
+        tick_id=15,
+    )
+
+    assert packet["stage"] == "verify_result_and_close"
+    assert not any(
+        fact.startswith("item_id:")
+        or fact.startswith("candidate_replacement_item_ids:")
+        for fact in packet["ambiguous_facts"]
+    )
 
 
 def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
@@ -1167,30 +2805,28 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     assert read_result.error is False
     assert json.loads(read_result.content)["account_id"] == "acct_123"
 
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
-
-    result = orchestrator._execute_stagegate_tool_call(
+    initial = orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_write",
+            id="call_initial_write",
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=2,
+    )
+    assert initial.error is True
+    result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=4,
+        tool_tick_id=5,
     )
 
     content = json.loads(result.content)
     assert result.error is False
     assert content["plan_name"] == "premium"
     assert environment.tools.write_count == 1
-    assert orchestrator.num_errors == 0
+    assert orchestrator.num_errors == 1
 
 
 def test_service_task_ref_preserves_mock_task_write_validation():
@@ -1216,23 +2852,21 @@ def test_service_task_ref_preserves_mock_task_write_validation():
     assert user_result.error is False
     assert task_result.error is False
 
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update service task service_task_1 to completed. "
-            "This will change the service task status."
-        ),
-        tick_id=3,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=4)
-
-    result = orchestrator._execute_stagegate_tool_call(
+    initial = orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_update_task",
+            id="call_initial_update_task",
             name="update_task_status",
             arguments={"task_id": "service_task_1", "status": "completed"},
         ),
-        tick_id=5,
+        tick_id=3,
+    )
+    assert initial.error is True
+    result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=5,
+        tool_tick_id=6,
     )
 
     content = json.loads(result.content)
@@ -1264,10 +2898,10 @@ def test_clean_user_message_content_is_rejected_as_runtime_evidence():
         slot.status is not LedgerStatus.USER_CONFIRMED
         for slot in controller.ledger.slots.values()
     )
-    assert controller.validator.state.last_user_confirmation is None
+    assert controller.validator.state.latest_user_turn_tick is None
 
 
-def test_same_tick_user_confirmation_cannot_satisfy_validator():
+def test_same_tick_user_turn_cannot_satisfy_pending_confirmation():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1285,15 +2919,18 @@ def test_same_tick_user_confirmation_cannot_satisfy_validator():
     orchestrator.step()
 
     tick = orchestrator.ticks[-1]
-    packet = json.loads(tick.agent_tool_results[0].content)
+    packet = json.loads(tick.agent_internal_tool_results[0].content)
     assert tick.user_chunk.content == "Yes, I confirm."
     assert orchestrator.agent.received_chunks[-1].content == "I want the premium plan."
-    assert tick.agent_tool_results[0].error is True
+    assert tick.agent_tool_calls == []
+    assert tick.agent_tool_results == []
+    assert tick.agent_internal_tool_calls[0].name == "update_account"
+    assert tick.agent_internal_tool_results[0].error is True
     assert packet["missing_facts"] == ["missing_confirmation"]
     assert environment.tools.write_count == 0
 
 
-def test_next_tick_clean_user_content_does_not_satisfy_validator():
+def test_next_tick_clean_user_content_does_not_confirm_without_internal_tool():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1309,14 +2946,20 @@ def test_next_tick_clean_user_content_does_not_satisfy_validator():
     _prepare_validated_account_change(orchestrator, controller)
 
     orchestrator.step()
-    first_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    first_tick = orchestrator.ticks[-1]
+    first_tick_result = first_tick.agent_internal_tool_results[0]
+    assert first_tick.agent_tool_calls == []
+    assert first_tick.agent_tool_results == []
     assert first_tick_result.error is True
     assert environment.tools.write_count == 0
 
     orchestrator.step()
 
-    second_tick_result = orchestrator.ticks[-1].agent_tool_results[0]
+    second_tick = orchestrator.ticks[-1]
+    second_tick_result = second_tick.agent_internal_tool_results[0]
     assert orchestrator.agent.received_chunks[-1].content == "Yes, I confirm."
+    assert second_tick.agent_tool_calls == []
+    assert second_tick.agent_tool_results == []
     assert second_tick_result.error is True
     assert json.loads(second_tick_result.content)["missing_facts"] == [
         "missing_confirmation"
@@ -1324,7 +2967,7 @@ def test_next_tick_clean_user_content_does_not_satisfy_validator():
     assert environment.tools.write_count == 0
 
 
-def test_agent_visible_user_transcript_satisfies_confirmation():
+def test_user_turn_event_alone_does_not_satisfy_confirmation():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1343,14 +2986,7 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=2)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1359,12 +2995,12 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=3,
     )
 
-    assert result.error is False
-    assert json.loads(result.content)["plan_name"] == "premium"
-    assert environment.tools.write_count == 1
+    assert result.error is True
+    assert json.loads(result.content)["missing_facts"] == ["missing_confirmation"]
+    assert environment.tools.write_count == 0
 
 
 def test_openai_adapter_records_input_transcription_event(monkeypatch):
@@ -1404,7 +3040,7 @@ def test_openai_adapter_records_input_transcription_event(monkeypatch):
     assert "Yes, I confirm." not in "\n".join(debug_messages)
 
 
-def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypatch):
+def test_agent_wires_provider_user_transcript_to_user_turn_order(monkeypatch):
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stagegate")
     environment = _environment()
     adapter = MagicMock()
@@ -1439,13 +3075,6 @@ def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypa
         ),
         tick_index=0,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_id=0,
-    )
     state = agent.get_init_state()
 
     agent.get_next_chunk(
@@ -1460,11 +3089,12 @@ def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypa
         )
     )
 
-    assert controller.validator.state.last_user_confirmation == "Yes, I confirm."
-    assert decision.decision == "allow"
+    assert controller.validator.state.latest_user_turn_tick == 1
+    assert decision.decision == "block"
+    assert decision.reason == "missing_confirmation"
 
 
-def test_validator_uses_confirmation_only_after_visible_recording():
+def test_validator_commit_requires_later_user_turn():
     environment = _environment()
     validator = PreWriteValidator(
         domain_name="mock",
@@ -1490,28 +3120,37 @@ def test_validator_uses_confirmation_only_after_visible_recording():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_index=2,
-    )
-
-    before_delivery = validator.validate(write_call)
-    validator.record_user_confirmation_evidence(
-        content="Yes, I confirm.",
+    before_commit = validator.validate(write_call, tick_index=2)
+    before_user_turn = validator.commit_pending_write(
+        decision="confirmed",
+        basis="latest_user_turn",
         tick_index=3,
+    )
+    validator.record_user_turn(
+        content="Yes, I confirm.",
+        tick_index=4,
         source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
-    after_delivery = validator.validate(write_call)
+    commit_result = validator.commit_pending_write(
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=5,
+    )
+    committed_tool_call = validator.pending_write_domain_tool_call(
+        tool_call_id="call_committed"
+    )
 
-    assert before_delivery.decision == "block"
-    assert before_delivery.reason == "missing_confirmation"
-    assert after_delivery.decision == "allow"
+    assert before_commit.decision == "block"
+    assert before_commit.reason == "missing_confirmation"
+    assert before_user_turn.ok is False
+    assert before_user_turn.reason == "missing_user_turn_after_pending_write"
+    assert commit_result.ok is True
+    assert commit_result.reason == "commit_confirmed"
+    assert committed_tool_call is not None
+    assert committed_tool_call.name == "update_account"
 
 
-def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
+def test_model_tool_argument_text_cannot_satisfy_user_turn_order():
     environment = _environment()
     validator = PreWriteValidator(
         domain_name="mock",
@@ -1537,21 +3176,23 @@ def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_index=2,
-    )
+    first_decision = validator.validate(write_call, tick_index=2)
+    assert first_decision.pending_write_id is not None
     validator.record_user_confirmation_evidence(
         content="Yes, I confirm.",
-        tick_index=3,
+        tick_index=4,
         source=EvidenceSource.MODEL_TOOL_ARGUMENT,
+    )
+    commit_result = validator.commit_pending_write(
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=5,
     )
 
     decision = validator.validate(write_call)
 
+    assert commit_result.ok is False
+    assert commit_result.reason == "missing_user_turn_after_pending_write"
     assert decision.decision == "block"
     assert decision.reason == "missing_confirmation"
 
@@ -1577,7 +3218,28 @@ def test_forbidden_oracle_evidence_sources_are_rejected_at_runtime():
         )
 
 
-def test_confirmation_requires_exact_identifier_mention():
+def test_validator_source_has_no_semantic_transcript_regex():
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (
+        repo_root / "src/tau2/voice/audio_native/openai/stagegate/validator.py"
+    ).read_text(encoding="utf-8")
+
+    forbidden_tokens = [
+        "CONFIRMATION_PATTERNS",
+        "looks_like_user_confirmation",
+        "looks_like_action_statement",
+        "summary_requests_confirmation",
+        "_exchange_summary_matches_tool_call",
+        "_action_summary_matches_tool_call",
+        "re.compile",
+        "re.search",
+        "re.findall",
+    ]
+
+    assert all(token not in source for token in forbidden_tokens)
+
+
+def test_commit_pending_write_requires_valid_structured_decision():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1596,70 +3258,34 @@ def test_confirmation_requires_exact_identifier_mention():
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_1234 to premium. "
-            "This will change the account plan status."
-        ),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        ToolCall(
-            id="call_write",
-            name="update_account",
-            arguments={"account_id": "acct_123", "plan_name": "premium"},
-        ),
-        tick_id=4,
-    )
-
-    packet = json.loads(result.content)
-    assert result.error is True
-    assert packet["missing_facts"] == ["missing_confirmation"]
-    assert environment.tools.write_count == 0
-
-
-def test_action_statement_requires_consequence():
-    environment = _environment()
-    controller = StageGateController(
-        condition="stagegate",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-        domain_name=environment.get_domain_name(),
-    )
-    orchestrator = _orchestrator_shell(environment)
-
     orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_read",
-            name="get_account",
-            arguments={"account_id": "acct_123"},
-        ),
-        tick_id=1,
-    )
-    controller.record_assistant_utterance(
-        AssistantMessage.text("I will update account acct_123 to premium."),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        ToolCall(
-            id="call_write",
+            id="call_initial_write",
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=2,
     )
 
-    packet = json.loads(result.content)
-    assert result.error is True
-    assert packet["missing_facts"] == ["missing_action_summary"]
-    assert environment.tools.write_count == 0
+    invalid_commit = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_bad_commit",
+            name="commit_pending_write",
+            arguments={
+                "decision": "maybe",
+                "basis": "latest_user_turn",
+            },
+        ),
+        tick_id=3,
+    )
+
+    assert invalid_commit.error is True
+    assert json.loads(invalid_commit.content)["reason"] == "invalid_commit_decision"
+    assert controller.validator.pending_write_snapshot()["status"] == (
+        "needs_confirmation"
+    )
 
 
 def test_read_only_tools_not_overblocked():
@@ -1809,18 +3435,6 @@ def test_policy_preconditions_require_all_required_visible_fields():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will send payment request for customer C1 and bill B1. "
-            "This will change the bill status to awaiting payment."
-        ),
-        tick_index=2,
-    )
-    validator.record_user_confirmation_evidence(
-        content="Yes, I confirm.",
-        tick_index=3,
-        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
-    )
     write_call = ToolCall(
         id="call_payment",
         name="send_payment_request",
@@ -1854,10 +3468,27 @@ def test_policy_preconditions_require_all_required_visible_fields():
         tick_index=4,
     )
 
-    allowed = validator.validate(write_call)
+    pending_block = validator.validate(write_call, tick_index=5)
+    assert pending_block.pending_write_id is not None
+    validator.record_user_turn(
+        content="Yes, I confirm.",
+        tick_index=7,
+        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
+    )
+    commit = validator.commit_pending_write(
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=8,
+    )
 
-    assert allowed.decision == "allow"
-    assert allowed.reason == "validated"
+    committed_call = validator.pending_write_domain_tool_call(
+        tool_call_id="call_committed_payment"
+    )
+
+    assert commit.ok is True
+    assert committed_call is not None
+    assert committed_call.name == "send_payment_request"
+    assert committed_call.arguments == write_call.arguments
 
 
 def test_trace_event_uses_canonical_schema():

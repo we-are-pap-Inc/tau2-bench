@@ -7,6 +7,7 @@ communication between agent and user.
 
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Optional, TypeVar, Union
 
 from loguru import logger
@@ -35,6 +36,16 @@ from tau2.voice.utils.transcript_utils import compute_proportional_user_transcri
 # Type variables for generic full-duplex orchestrator
 StreamingAgentT = TypeVar("StreamingAgentT", bound=FullDuplexAgent)
 StreamingUserT = TypeVar("StreamingUserT", bound=FullDuplexUser)
+
+
+@dataclass(frozen=True)
+class _ToolExecutionRecord:
+    result: ToolMessage
+    replayable_environment_action: bool
+    replay_tool_call: Optional[ToolCall] = None
+    replay_tool_result: Optional[ToolMessage] = None
+    internal_tool_call: Optional[ToolCall] = None
+    internal_tool_result: Optional[ToolMessage] = None
 
 
 class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, Tick]):
@@ -118,6 +129,12 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         # - User audio continuity is maintained
         self.pending_agent_tool_results: Optional[Message] = None
         self.pending_user_tool_results: Optional[Message] = None
+        self._last_replayable_tool_call_ids: set[str] = set()
+        self._last_internal_tool_call_ids: set[str] = set()
+        self._last_replayable_tool_calls: list[ToolCall] = []
+        self._last_replayable_tool_results: list[ToolMessage] = []
+        self._last_internal_tool_calls: list[ToolCall] = []
+        self._last_internal_tool_results: list[ToolMessage] = []
 
         # Tick-based trajectory structure
         self.ticks: list[Tick] = []
@@ -331,9 +348,35 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             pending_tool_results=self.pending_user_tool_results,
             tick_id=tick_id,
         )
+        user_replayable_tool_call_ids = set(self._last_replayable_tool_call_ids)
+        user_internal_tool_call_ids = set(self._last_internal_tool_call_ids)
         tick.user_chunk = deepcopy(user_chunk)
-        tick.user_tool_calls = [deepcopy(tc) for tc in user_tool_calls]
-        tick.user_tool_results = [deepcopy(r) for r in user_tool_results]
+        if self._last_replayable_tool_calls or self._last_internal_tool_calls:
+            tick.user_tool_calls = deepcopy(self._last_replayable_tool_calls)
+            tick.user_tool_results = deepcopy(self._last_replayable_tool_results)
+            tick.user_internal_tool_calls = deepcopy(self._last_internal_tool_calls)
+            tick.user_internal_tool_results = deepcopy(self._last_internal_tool_results)
+        else:
+            tick.user_tool_calls = [
+                deepcopy(tc)
+                for tc in user_tool_calls
+                if tc.id in user_replayable_tool_call_ids
+            ]
+            tick.user_tool_results = [
+                deepcopy(r)
+                for r in user_tool_results
+                if r.id in user_replayable_tool_call_ids
+            ]
+            tick.user_internal_tool_calls = [
+                deepcopy(tc)
+                for tc in user_tool_calls
+                if tc.id in user_internal_tool_call_ids
+            ]
+            tick.user_internal_tool_results = [
+                deepcopy(r)
+                for r in user_tool_results
+                if r.id in user_internal_tool_call_ids
+            ]
         self.pending_user_tool_results = (
             self._wrap_tool_results(user_tool_results) if user_tool_results else None
         )
@@ -352,9 +395,37 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
             pending_tool_results=self.pending_agent_tool_results,
             tick_id=tick_id,
         )
+        agent_replayable_tool_call_ids = set(self._last_replayable_tool_call_ids)
+        agent_internal_tool_call_ids = set(self._last_internal_tool_call_ids)
         tick.agent_chunk = deepcopy(agent_chunk)
-        tick.agent_tool_calls = [deepcopy(tc) for tc in agent_tool_calls]
-        tick.agent_tool_results = [deepcopy(r) for r in agent_tool_results]
+        if self._last_replayable_tool_calls or self._last_internal_tool_calls:
+            tick.agent_tool_calls = deepcopy(self._last_replayable_tool_calls)
+            tick.agent_tool_results = deepcopy(self._last_replayable_tool_results)
+            tick.agent_internal_tool_calls = deepcopy(self._last_internal_tool_calls)
+            tick.agent_internal_tool_results = deepcopy(
+                self._last_internal_tool_results
+            )
+        else:
+            tick.agent_tool_calls = [
+                deepcopy(tc)
+                for tc in agent_tool_calls
+                if tc.id in agent_replayable_tool_call_ids
+            ]
+            tick.agent_tool_results = [
+                deepcopy(r)
+                for r in agent_tool_results
+                if r.id in agent_replayable_tool_call_ids
+            ]
+            tick.agent_internal_tool_calls = [
+                deepcopy(tc)
+                for tc in agent_tool_calls
+                if tc.id in agent_internal_tool_call_ids
+            ]
+            tick.agent_internal_tool_results = [
+                deepcopy(r)
+                for r in agent_tool_results
+                if r.id in agent_internal_tool_call_ids
+            ]
         self.pending_agent_tool_results = (
             self._wrap_tool_results(agent_tool_results) if agent_tool_results else None
         )
@@ -462,6 +533,12 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         # Handle tool calls: execute now, deliver results next tick
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolMessage] = []
+        self._last_replayable_tool_call_ids = set()
+        self._last_internal_tool_call_ids = set()
+        self._last_replayable_tool_calls = []
+        self._last_replayable_tool_results = []
+        self._last_internal_tool_calls = []
+        self._last_internal_tool_results = []
 
         if new_chunk and new_chunk.is_tool_call():
             tool_calls = list(new_chunk.tool_calls)
@@ -484,13 +561,44 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                         tick_id=tick_id,
                     )
             if stagegate_controller is not None:
-                results = [
-                    self._execute_stagegate_tool_call(
+                execution_records = [
+                    self._execute_stagegate_tool_call_record(
                         stagegate_controller,
                         tool_call,
                         tick_id=tick_id,
                     )
                     for tool_call in tool_calls
+                ]
+                results = [record.result for record in execution_records]
+                self._last_replayable_tool_call_ids = {
+                    tool_call.id
+                    for tool_call, record in zip(tool_calls, execution_records)
+                    if record.replayable_environment_action
+                }
+                self._last_internal_tool_call_ids = {
+                    tool_call.id
+                    for tool_call, record in zip(tool_calls, execution_records)
+                    if not record.replayable_environment_action
+                }
+                self._last_replayable_tool_calls = [
+                    record.replay_tool_call
+                    for record in execution_records
+                    if record.replay_tool_call is not None
+                ]
+                self._last_replayable_tool_results = [
+                    record.replay_tool_result
+                    for record in execution_records
+                    if record.replay_tool_result is not None
+                ]
+                self._last_internal_tool_calls = [
+                    record.internal_tool_call
+                    for record in execution_records
+                    if record.internal_tool_call is not None
+                ]
+                self._last_internal_tool_results = [
+                    record.internal_tool_result
+                    for record in execution_records
+                    if record.internal_tool_result is not None
                 ]
             elif stagegate_trace_controller is not None:
                 results = [
@@ -501,8 +609,14 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                     )
                     for tool_call in tool_calls
                 ]
+                self._last_replayable_tool_call_ids = {
+                    tool_call.id for tool_call in tool_calls
+                }
             else:
                 results = self._execute_tool_calls(tool_calls)
+                self._last_replayable_tool_call_ids = {
+                    tool_call.id for tool_call in tool_calls
+                }
             tool_results = list(results)
 
             for tc, result in zip(tool_calls, results):
@@ -583,10 +697,82 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         *,
         tick_id: Optional[int] = None,
     ) -> ToolMessage:
+        return self._execute_stagegate_tool_call_record(
+            stagegate_controller,
+            tool_call,
+            tick_id=tick_id,
+        ).result
+
+    def _execute_stagegate_tool_call_record(
+        self,
+        stagegate_controller,
+        tool_call: ToolCall,
+        *,
+        tick_id: Optional[int] = None,
+    ) -> _ToolExecutionRecord:
         if stagegate_controller.is_advance_stage(tool_call):
-            return stagegate_controller.handle_advance_stage(
+            result = stagegate_controller.handle_advance_stage(
                 tool_call,
                 tick_id=tick_id,
+            )
+            return _ToolExecutionRecord(
+                result=result,
+                replayable_environment_action=False,
+                internal_tool_call=tool_call,
+                internal_tool_result=result,
+            )
+        if stagegate_controller.is_pending_write_tool(tool_call):
+            protocol_result = stagegate_controller.handle_pending_write_tool(
+                tool_call,
+                tick_id=tick_id,
+            )
+            if protocol_result.error:
+                self.num_errors += 1
+                return _ToolExecutionRecord(
+                    result=protocol_result,
+                    replayable_environment_action=False,
+                    internal_tool_call=tool_call,
+                    internal_tool_result=protocol_result,
+                )
+
+            pending_domain_call = stagegate_controller.pending_write_domain_tool_call(
+                tool_call_id=tool_call.id,
+                requestor=tool_call.requestor,
+            )
+            if pending_domain_call is None:
+                return _ToolExecutionRecord(
+                    result=protocol_result,
+                    replayable_environment_action=False,
+                    internal_tool_call=tool_call,
+                    internal_tool_result=protocol_result,
+                )
+
+            stagegate_controller.trace_domain_tool_call(
+                pending_domain_call,
+                tick_id=tick_id,
+            )
+            tool_start = time.perf_counter()
+            tool_result = self.environment.get_response(pending_domain_call)
+            latency_ms = round((time.perf_counter() - tool_start) * 1000, 3)
+            stagegate_controller.trace_domain_tool_result(
+                pending_domain_call,
+                tool_result,
+                tick_id=tick_id,
+                latency_ms=latency_ms,
+            )
+            if tool_result.error:
+                self.num_errors += 1
+                stagegate_controller.mark_pending_write_commit_failed(
+                    tool_call=pending_domain_call,
+                    tick_id=tick_id,
+                )
+            return _ToolExecutionRecord(
+                result=tool_result,
+                replayable_environment_action=True,
+                replay_tool_call=pending_domain_call,
+                replay_tool_result=tool_result,
+                internal_tool_call=tool_call,
+                internal_tool_result=protocol_result,
             )
 
         validator_decision = stagegate_controller.validate_tool_call(
@@ -595,9 +781,21 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         )
         if not validator_decision.allowed:
             self.num_errors += 1
-            return stagegate_controller.blocked_tool_message(
+            blocked_message = stagegate_controller.blocked_tool_message(
                 tool_call,
                 validator_decision,
+            )
+            stagegate_controller.trace_stagegate_blocked_domain_tool(
+                tool_call,
+                validator_decision,
+                blocked_message,
+                tick_id=tick_id,
+            )
+            return _ToolExecutionRecord(
+                result=blocked_message,
+                replayable_environment_action=False,
+                internal_tool_call=tool_call,
+                internal_tool_result=blocked_message,
             )
 
         stagegate_controller.trace_domain_tool_call(tool_call, tick_id=tick_id)
@@ -612,7 +810,12 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         )
         if tool_result.error:
             self.num_errors += 1
-        return tool_result
+        return _ToolExecutionRecord(
+            result=tool_result,
+            replayable_environment_action=True,
+            replay_tool_call=tool_call,
+            replay_tool_result=tool_result,
+        )
 
     def _execute_trace_only_tool_call(
         self,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import re
+import hashlib
+import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -23,6 +25,15 @@ from tau2.voice.audio_native.openai.stagegate.stage_schema import (
 )
 
 ValidatorOutcome = Literal["allow", "block"]
+PendingWriteStatus = Literal[
+    "none",
+    "needs_confirmation",
+    "denied",
+    "unclear",
+    "consumed",
+    "expired",
+    "mismatched_retry",
+]
 SERVICE_TASK_REF = "service_task_ref"
 SERVICE_TASK_READ_TOOL = "get_tasks"
 SERVICE_TASK_WRITE_TOOL = "update_task_status"
@@ -102,7 +113,16 @@ SIDE_EFFECTING_TOOLS_BY_DOMAIN = {
 NON_SIDE_EFFECTING_TOOL_NAMES = {
     "advance_stage",
     "calculate",
+    "commit_pending_write",
     "transfer_to_human_agents",
+}
+ADVANCE_STAGE_TOOL_NAME = "advance_stage"
+COMMIT_PENDING_WRITE_TOOL_NAME = "commit_pending_write"
+TRANSFER_TOOL_NAME = "transfer_to_human_agents"
+TRANSFER_BLOCKING_PENDING_WRITE_STATUSES = {
+    "needs_confirmation",
+    "unclear",
+    "mismatched_retry",
 }
 
 IDENTITY_READ_TOOLS_BY_DOMAIN = {
@@ -135,41 +155,6 @@ INSPECTION_TOOLS_BY_EXACT_ARG = {
     "user_id": {"get_user_details"},
 }
 
-ACTION_WORDS = {
-    "book",
-    "cancel",
-    "change",
-    "create",
-    "disable",
-    "enable",
-    "exchange",
-    "modify",
-    "refund",
-    "resume",
-    "return",
-    "send",
-    "suspend",
-    "update",
-}
-
-CONSEQUENCE_WORDS = {
-    "charge",
-    "cost",
-    "fee",
-    "paid",
-    "payment",
-    "refund",
-    "request",
-    "status",
-}
-
-CONFIRMATION_PATTERNS = (
-    re.compile(r"\b(confirm|confirmed|yes|yep|yeah|correct|proceed)\b", re.I),
-    re.compile(r"\b(go ahead|sounds good|that's right|that is right)\b", re.I),
-)
-
-NEGATIVE_CONFIRMATION_PATTERN = re.compile(r"\b(no|don't|do not|stop|wait)\b", re.I)
-
 
 class ValidatorDecision(BaseModel):
     """A StageGate validator decision for one model tool call."""
@@ -178,6 +163,10 @@ class ValidatorDecision(BaseModel):
     reason: str
     checks: dict[str, bool] = Field(default_factory=dict)
     corrective_packet: Optional[StagePacket] = None
+    pending_write_id: Optional[str] = None
+    args_fingerprint: Optional[str] = None
+    matched_facets: list[str] = Field(default_factory=list)
+    missing_facets: list[str] = Field(default_factory=list)
 
     @property
     def allowed(self) -> bool:
@@ -210,17 +199,61 @@ class InspectionRecord:
 
 
 @dataclass
+class PendingWriteConfirmation:
+    """Concrete side-effecting write awaiting structured summary and confirmation."""
+
+    pending_write_id: str
+    tool_name: str
+    original_args: dict[str, Any]
+    normalized_args: dict[str, Any]
+    args_fingerprint: str
+    created_tick: Optional[int]
+    created_stage: Optional[str]
+    status: PendingWriteStatus
+    confirmation_recorded_tick: Optional[int] = None
+    commit_recorded_tick: Optional[int] = None
+    last_block_reason: Optional[str] = None
+    confirmation_basis: Optional[str] = None
+    commit_decision: Optional[str] = None
+    commit_basis: Optional[str] = None
+
+    def snapshot(self) -> dict[str, object]:
+        """Return trace-safe pending-write state without raw argument values."""
+        return {
+            "pending_write_id": self.pending_write_id,
+            "tool_name": self.tool_name,
+            "original_tool_name": self.tool_name,
+            "args_fingerprint": self.args_fingerprint,
+            "created_tick": self.created_tick,
+            "created_stage": self.created_stage,
+            "status": self.status,
+            "confirmation_recorded_tick": self.confirmation_recorded_tick,
+            "commit_recorded_tick": self.commit_recorded_tick,
+            "commit_tick": self.commit_recorded_tick,
+            "last_block_reason": self.last_block_reason,
+            "confirmation_basis": self.confirmation_basis,
+            "commit_decision": self.commit_decision,
+            "commit_basis": self.commit_basis,
+        }
+
+
+@dataclass
 class VisibleConversationState:
     """Validator state derived only from agent-visible conversation events."""
 
     read_inspections: list[InspectionRecord] = field(default_factory=list)
     verified_identifiers: dict[str, set[str]] = field(default_factory=dict)
-    last_action_statement: Optional[str] = None
-    last_action_statement_tick: Optional[int] = None
-    last_action_statement_source: Optional[EvidenceSource] = None
-    last_user_confirmation: Optional[str] = None
-    last_user_confirmation_tick: Optional[int] = None
-    last_user_confirmation_source: Optional[EvidenceSource] = None
+    latest_user_turn_tick: Optional[int] = None
+    user_turn_ticks: list[int] = field(default_factory=list)
+    pending_write: Optional[PendingWriteConfirmation] = None
+
+
+class PendingWriteToolResult(BaseModel):
+    """Result for a StageGate internal pending-write protocol tool call."""
+
+    ok: bool
+    reason: str
+    pending_write: Optional[dict[str, object]] = None
 
 
 class PreWriteValidator:
@@ -236,6 +269,7 @@ class PreWriteValidator:
         self.domain_name = normalize_domain(domain_name)
         self.tools_by_name = {tool.name: tool for tool in tools}
         self.state = VisibleConversationState()
+        self._pending_write_events: list[dict[str, object]] = []
 
     def set_domain_name(self, domain_name: Optional[str]) -> None:
         """Update the public domain name used for domain-specific rules."""
@@ -246,8 +280,18 @@ class PreWriteValidator:
         tool_call: ToolCall,
         *,
         ledger: Optional[EntityLedger] = None,
+        tick_index: Optional[int] = None,
+        current_stage: Optional[str] = None,
     ) -> ValidatorDecision:
         """Validate a domain tool call without calling the tool."""
+        if tool_call.name == TRANSFER_TOOL_NAME:
+            transfer_block = self._transfer_block_for_pending_write(
+                tool_call,
+                tick_index=tick_index,
+            )
+            if transfer_block is not None:
+                return transfer_block
+
         if not self.is_side_effecting_tool(tool_call.name):
             return ValidatorDecision(
                 decision="allow",
@@ -274,8 +318,10 @@ class PreWriteValidator:
                 tool_call,
                 requirement,
             ),
-            "assistant_stated_action": self._assistant_stated_action(requirement),
-            "user_confirmed": self._user_confirmed(tool_call, requirement),
+            "pending_write_exists": False,
+            "pending_write_needs_confirmation": False,
+            "pending_write_committed": False,
+            "pending_write_consumed": False,
         }
         reason_by_check = {
             "tool_arguments_complete": "incomplete_tool_arguments",
@@ -284,16 +330,56 @@ class PreWriteValidator:
             "exact_identifiers_verified": "missing_verified_identifier",
             "policy_state_inspected": "missing_policy_state_inspection",
             "policy_preconditions_represented": "missing_policy_precondition_state",
-            "assistant_stated_action": "missing_action_summary",
-            "user_confirmed": "missing_confirmation",
         }
         for check_name, reason in reason_by_check.items():
             if not checks[check_name]:
                 return self._block(tool_call, reason=reason, checks=checks)
-        return ValidatorDecision(
-            decision="allow",
-            reason="validated",
+
+        mismatch = self._pending_write_mismatch(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+        )
+        if mismatch is not None:
+            return self._block(
+                tool_call,
+                reason="pending_write_mismatch",
+                checks=checks,
+                pending_write=mismatch,
+            )
+
+        pending_write = self._ensure_pending_write(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+        )
+        checks["pending_write_exists"] = True
+        checks["pending_write_needs_confirmation"] = (
+            pending_write.status == "needs_confirmation"
+        )
+        checks["pending_write_committed"] = pending_write.commit_decision == "confirmed"
+        checks["pending_write_consumed"] = pending_write.status == "consumed"
+
+        if pending_write.status == "denied":
+            return self._block(
+                tool_call,
+                reason="pending_write_denied",
+                checks=checks,
+                pending_write=pending_write,
+            )
+        if pending_write.status == "unclear":
+            return self._block(
+                tool_call,
+                reason="pending_write_unclear",
+                checks=checks,
+                pending_write=pending_write,
+            )
+        pending_write.status = "needs_confirmation"
+        return self._block(
+            tool_call,
+            reason="missing_confirmation",
             checks=checks,
+            pending_write=pending_write,
         )
 
     def record_visible_message(
@@ -303,13 +389,12 @@ class PreWriteValidator:
         content: Optional[str],
         tick_index: Optional[int] = None,
     ) -> None:
-        """Record legacy assistant text; user text requires explicit evidence."""
+        """Reject transcript text as validator evidence for pending writes."""
         if role == "assistant":
-            self.record_assistant_utterance(content=content, tick_index=tick_index)
             return
         raise ValueError(
             "UserMessage.content from audio-native chunks is simulator gold text; "
-            "use record_user_confirmation_evidence with AGENT_VISIBLE_TRANSCRIPT."
+            "use record_user_turn with AGENT_VISIBLE_TRANSCRIPT ordering only."
         )
 
     def record_assistant_utterance(
@@ -319,18 +404,31 @@ class PreWriteValidator:
         tick_index: Optional[int] = None,
         source: EvidenceSource | str = EvidenceSource.ASSISTANT_UTTERANCE,
     ) -> None:
-        """Record assistant-visible action summaries from model output."""
-        if not content:
-            return
+        """Accept assistant transcript events without using text for validation."""
         source = ensure_runtime_evidence_source(source)
         if source is not EvidenceSource.ASSISTANT_UTTERANCE:
             raise ValueError(
                 "assistant action evidence must use ASSISTANT_UTTERANCE source"
             )
-        if looks_like_action_statement(content):
-            self.state.last_action_statement = content
-            self.state.last_action_statement_tick = tick_index
-            self.state.last_action_statement_source = source
+
+    def record_user_turn(
+        self,
+        *,
+        content: Optional[str],
+        tick_index: Optional[int] = None,
+        source: EvidenceSource | str,
+    ) -> None:
+        """Record user-turn ordering without parsing transcript semantics."""
+        source = ensure_runtime_evidence_source(source)
+        if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
+            return
+        if tick_index is not None:
+            self.state.latest_user_turn_tick = tick_index
+            self.state.user_turn_ticks.append(tick_index)
+            self.state.user_turn_ticks = self.state.user_turn_ticks[-50:]
+            pending_write = self._active_pending_write()
+            if pending_write is not None:
+                return
 
     def record_user_confirmation_evidence(
         self,
@@ -339,16 +437,12 @@ class PreWriteValidator:
         tick_index: Optional[int] = None,
         source: EvidenceSource | str,
     ) -> None:
-        """Record user confirmation only from model-path transcript evidence."""
-        if not content:
-            return
-        source = ensure_runtime_evidence_source(source)
-        if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
-            return
-        if looks_like_user_confirmation(content):
-            self.state.last_user_confirmation = content
-            self.state.last_user_confirmation_tick = tick_index
-            self.state.last_user_confirmation_source = source
+        """Backward-compatible wrapper that records only user-turn ordering."""
+        self.record_user_turn(
+            content=content,
+            tick_index=tick_index,
+            source=source,
+        )
 
     def record_tool_result(
         self,
@@ -430,13 +524,193 @@ class PreWriteValidator:
         )
         return any(cue in description for cue in side_effect_cues)
 
+    def pending_write_snapshot(self) -> Optional[dict[str, object]]:
+        """Return trace-safe pending-write state, when present."""
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return None
+        return pending_write.snapshot()
+
+    def drain_pending_write_events(self) -> list[dict[str, object]]:
+        """Return and clear pending-write trace events accumulated by validator."""
+        events = list(self._pending_write_events)
+        self._pending_write_events = []
+        return events
+
+    def commit_pending_write(
+        self,
+        *,
+        decision: str,
+        basis: str,
+        notes: Optional[str] = None,
+        tick_index: Optional[int] = None,
+    ) -> PendingWriteToolResult:
+        """Record the model's structured commit decision for the active write."""
+        if decision not in {"confirmed", "denied", "unclear"}:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="invalid_commit_decision",
+                pending_write=self.pending_write_snapshot(),
+            )
+        if basis not in {
+            "latest_user_turn",
+            "user_corrected_details",
+            "user_declined",
+            "unclear_response",
+        }:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="invalid_commit_basis",
+                pending_write=self.pending_write_snapshot(),
+            )
+        pending_write = self._active_pending_write()
+        if pending_write is None:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_not_found",
+                pending_write=self.pending_write_snapshot(),
+            )
+        self._queue_pending_write_event(
+            "pending_write_commit_requested",
+            pending_write,
+            tick_index=tick_index,
+            extra={"decision": decision, "basis": basis},
+        )
+        if not self._user_turn_after_pending_write_seen(pending_write):
+            return PendingWriteToolResult(
+                ok=False,
+                reason="missing_user_turn_after_pending_write",
+                pending_write=pending_write.snapshot(),
+            )
+        if (
+            pending_write.status == "unclear"
+            and pending_write.commit_recorded_tick is not None
+            and not any(
+                tick > pending_write.commit_recorded_tick
+                for tick in self.state.user_turn_ticks
+            )
+        ):
+            return PendingWriteToolResult(
+                ok=False,
+                reason="missing_user_turn_after_unclear_commit",
+                pending_write=pending_write.snapshot(),
+            )
+
+        pending_write.commit_recorded_tick = tick_index
+        pending_write.commit_decision = decision
+        pending_write.commit_basis = basis
+        pending_write.confirmation_recorded_tick = tick_index
+        pending_write.confirmation_basis = basis
+
+        if decision == "unclear":
+            pending_write.status = "unclear"
+            self._queue_pending_write_event(
+                "pending_write_unclear",
+                pending_write,
+                tick_index=tick_index,
+                extra={"decision": decision, "basis": basis},
+            )
+            return PendingWriteToolResult(
+                ok=True,
+                reason="commit_unclear",
+                pending_write=pending_write.snapshot(),
+            )
+        if decision == "denied":
+            pending_write.status = "denied"
+            self._queue_pending_write_event(
+                "pending_write_denied",
+                pending_write,
+                tick_index=tick_index,
+                extra={"decision": decision, "basis": basis},
+            )
+            return PendingWriteToolResult(
+                ok=True,
+                reason="commit_denied",
+                pending_write=pending_write.snapshot(),
+            )
+
+        pending_write.status = "needs_confirmation"
+        self._queue_pending_write_event(
+            "pending_write_committed",
+            pending_write,
+            tick_index=tick_index,
+            extra={"decision": decision, "basis": basis},
+        )
+        return PendingWriteToolResult(
+            ok=True,
+            reason="commit_confirmed",
+            pending_write=pending_write.snapshot(),
+        )
+
+    def pending_write_domain_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        requestor: Literal["assistant", "user"] = "assistant",
+    ) -> Optional[ToolCall]:
+        """Return the stored original domain write for a confirmed commit."""
+        pending_write = self._active_pending_write()
+        if pending_write is None:
+            return None
+        if pending_write.commit_decision != "confirmed":
+            return None
+        return ToolCall(
+            id=tool_call_id,
+            name=pending_write.tool_name,
+            arguments=deepcopy(pending_write.original_args),
+            requestor=requestor,
+        )
+
+    def mark_pending_write_commit_failed(
+        self,
+        *,
+        tool_call: ToolCall,
+        tick_index: Optional[int] = None,
+    ) -> None:
+        """Trace a committed pending write whose environment execution errored."""
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return
+        if not self._pending_write_matches_tool_call(pending_write, tool_call):
+            return
+        pending_write.last_block_reason = "pending_write_commit_failed"
+        self._queue_pending_write_event(
+            "pending_write_commit_failed",
+            pending_write,
+            tick_index=tick_index,
+        )
+
+    def mark_side_effecting_write_consumed(
+        self,
+        *,
+        tool_call: ToolCall,
+        tick_index: Optional[int] = None,
+    ) -> None:
+        """Mark a successful side-effecting domain-tool result as consumed."""
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return
+        if pending_write.commit_decision != "confirmed":
+            return
+        if not self._pending_write_matches_tool_call(pending_write, tool_call):
+            return
+        pending_write.status = "consumed"
+        self._queue_pending_write_event(
+            "pending_write_consumed",
+            pending_write,
+            tick_index=tick_index,
+        )
+
     def _block(
         self,
         tool_call: ToolCall,
         *,
         reason: str,
         checks: dict[str, bool],
+        pending_write: Optional[PendingWriteConfirmation] = None,
     ) -> ValidatorDecision:
+        if pending_write is not None:
+            pending_write.last_block_reason = reason
         return ValidatorDecision(
             decision="block",
             reason=reason,
@@ -445,8 +719,180 @@ class PreWriteValidator:
                 tool_call=tool_call,
                 reason=reason,
                 read_tools=self._read_tool_names(),
+                pending_write_tool_name=None
+                if pending_write is None
+                else pending_write.tool_name,
             ),
+            pending_write_id=None
+            if pending_write is None
+            else pending_write.pending_write_id,
+            args_fingerprint=None
+            if pending_write is None
+            else pending_write.args_fingerprint,
         )
+
+    def _active_pending_write(self) -> Optional[PendingWriteConfirmation]:
+        pending_write = self.state.pending_write
+        if pending_write is None:
+            return None
+        if pending_write.status in {"consumed", "expired", "none"}:
+            return None
+        return pending_write
+
+    def _transfer_block_for_pending_write(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+    ) -> Optional[ValidatorDecision]:
+        pending_write = self._active_pending_write()
+        if pending_write is None:
+            return None
+        if pending_write.status not in TRANSFER_BLOCKING_PENDING_WRITE_STATUSES:
+            return None
+
+        self._queue_pending_write_event(
+            "transfer_blocked_pending_write",
+            pending_write,
+            tick_index=tick_index,
+        )
+        return self._block(
+            tool_call,
+            reason="transfer_blocked_pending_write",
+            checks={
+                "side_effecting_tool": False,
+                "pending_write_exists": True,
+                "pending_write_needs_confirmation": pending_write.status
+                == "needs_confirmation",
+                "pending_write_committed": pending_write.commit_decision == "confirmed",
+                "pending_write_consumed": False,
+            },
+            pending_write=pending_write,
+        )
+
+    def _ensure_pending_write(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+    ) -> PendingWriteConfirmation:
+        active_pending = self._active_pending_write()
+        if active_pending is not None and self._pending_write_matches_tool_call(
+            active_pending,
+            tool_call,
+        ):
+            return active_pending
+
+        pending_write = self._pending_write_from_tool_call(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+            status="needs_confirmation",
+        )
+        self.state.pending_write = pending_write
+        self._queue_pending_write_event(
+            "pending_write_created",
+            pending_write,
+            tick_index=tick_index,
+        )
+        return pending_write
+
+    def _pending_write_mismatch(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+    ) -> Optional[PendingWriteConfirmation]:
+        active_pending = self._active_pending_write()
+        if active_pending is None:
+            return None
+        if self._pending_write_matches_tool_call(active_pending, tool_call):
+            return None
+
+        active_pending.status = "mismatched_retry"
+        self._queue_pending_write_event(
+            "pending_write_mismatch",
+            active_pending,
+            tick_index=tick_index,
+        )
+        active_pending.status = "expired"
+        self._queue_pending_write_event(
+            "pending_write_expired",
+            active_pending,
+            tick_index=tick_index,
+        )
+        replacement = self._pending_write_from_tool_call(
+            tool_call,
+            tick_index=tick_index,
+            current_stage=current_stage,
+            status="needs_confirmation",
+        )
+        replacement.last_block_reason = "pending_write_mismatch"
+        self.state.pending_write = replacement
+        self._queue_pending_write_event(
+            "pending_write_created",
+            replacement,
+            tick_index=tick_index,
+        )
+        return replacement
+
+    def _pending_write_from_tool_call(
+        self,
+        tool_call: ToolCall,
+        *,
+        tick_index: Optional[int],
+        current_stage: Optional[str],
+        status: PendingWriteStatus,
+    ) -> PendingWriteConfirmation:
+        normalized_args = canonicalize_for_fingerprint(tool_call.arguments)
+        fingerprint = args_fingerprint(tool_call.arguments)
+        return PendingWriteConfirmation(
+            pending_write_id=f"{tool_call.name}:{fingerprint[:12]}",
+            tool_name=tool_call.name,
+            original_args=deepcopy(tool_call.arguments),
+            normalized_args=normalized_args,
+            args_fingerprint=fingerprint,
+            created_tick=tick_index,
+            created_stage=current_stage,
+            status=status,
+        )
+
+    def _pending_write_matches_tool_call(
+        self,
+        pending_write: PendingWriteConfirmation,
+        tool_call: ToolCall,
+    ) -> bool:
+        return (
+            pending_write.tool_name == tool_call.name
+            and pending_write.args_fingerprint == args_fingerprint(tool_call.arguments)
+        )
+
+    def _user_turn_after_pending_write_seen(
+        self,
+        pending_write: PendingWriteConfirmation,
+    ) -> bool:
+        if pending_write.created_tick is None:
+            return bool(self.state.user_turn_ticks)
+        return any(
+            tick > pending_write.created_tick for tick in self.state.user_turn_ticks
+        )
+
+    def _queue_pending_write_event(
+        self,
+        event_type: str,
+        pending_write: PendingWriteConfirmation,
+        *,
+        tick_index: Optional[int],
+        extra: Optional[dict[str, object]] = None,
+    ) -> None:
+        snapshot = pending_write.snapshot()
+        snapshot["event_type"] = event_type
+        snapshot["tick_index"] = tick_index
+        if extra:
+            snapshot.update(extra)
+        self._pending_write_events.append(snapshot)
 
     def _arguments_complete(self, tool_call: ToolCall) -> bool:
         tool = self.tools_by_name.get(tool_call.name)
@@ -517,35 +963,6 @@ class PreWriteValidator:
             for inspection in self.state.read_inspections
         )
 
-    def _assistant_stated_action(self, requirement: ActionRequirement) -> bool:
-        if not requirement.requires_action_statement:
-            return True
-        return self.state.last_action_statement is not None
-
-    def _user_confirmed(
-        self,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-    ) -> bool:
-        if not requirement.requires_user_confirmation:
-            return True
-        if (
-            self.state.last_action_statement_tick is None
-            or self.state.last_user_confirmation_tick is None
-        ):
-            return False
-        if (
-            self.state.last_user_confirmation_source
-            is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT
-        ):
-            return False
-        if (
-            self.state.last_user_confirmation_tick
-            < self.state.last_action_statement_tick
-        ):
-            return False
-        return self._action_statement_mentions_exact_args(tool_call, requirement)
-
     def _is_value_verified(
         self,
         arg_name: str,
@@ -560,7 +977,7 @@ class PreWriteValidator:
             return True
         if self._ledger_verifies_value(arg_name, normalized, ledger):
             return True
-        return self._last_confirmed_action_mentions(normalized)
+        return False
 
     def _ledger_verifies_value(
         self,
@@ -584,31 +1001,6 @@ class PreWriteValidator:
             if any(normalize_value(value) == normalized for value in slot_values):
                 return True
         return False
-
-    def _last_confirmed_action_mentions(self, normalized_value: str) -> bool:
-        if self.state.last_action_statement is None:
-            return False
-        statement = normalize_value(self.state.last_action_statement)
-        if statement is None:
-            return False
-        return normalized_text_mentions_value(statement, normalized_value)
-
-    def _action_statement_mentions_exact_args(
-        self,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-    ) -> bool:
-        for arg_name in requirement.exact_args:
-            values = list(self._tool_argument_values(tool_call, arg_name))
-            if not values:
-                return False
-            for value in values:
-                normalized = normalize_value(value)
-                if normalized is not None and not self._last_confirmed_action_mentions(
-                    normalized
-                ):
-                    return False
-        return True
 
     def _inspection_matches_tool_call(
         self,
@@ -876,18 +1268,131 @@ def precondition_field_present(keys: set[str], field: str) -> bool:
     return bool(keys & aliases)
 
 
-def normalized_text_mentions_value(text: str, value: str) -> bool:
-    """Return whether normalized text contains value as a distinct token."""
-    if not value:
-        return False
-    return (
-        re.search(
-            rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])",
-            text,
-            flags=re.I,
-        )
-        is not None
-    )
+def canonicalize_for_fingerprint(value: Any) -> Any:
+    """Return stable, trace-safe normalized data for pending-write matching."""
+    if isinstance(value, dict):
+        return {
+            str(key): canonicalize_for_fingerprint(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, list):
+        return [canonicalize_for_fingerprint(item) for item in value]
+    if isinstance(value, str):
+        return normalize_value(value) or ""
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return normalize_value(value) or str(value)
+
+
+def args_fingerprint(arguments: dict[str, Any]) -> str:
+    """Return a stable fingerprint for pending write arguments."""
+    canonical = canonicalize_for_fingerprint(arguments)
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def pending_write_next_required_steps(
+    *,
+    tool_name: str,
+    status: str,
+) -> list[dict[str, object]]:
+    """Return model-actionable pending-write protocol steps for a status."""
+    commit_args: dict[str, object] = {
+        "decision": "confirmed",
+        "basis": "latest_user_turn",
+    }
+    commit_step = {
+        "step": "call_tool_if_user_confirms",
+        "tool_name": COMMIT_PENDING_WRITE_TOOL_NAME,
+        "arguments": commit_args,
+        "instruction": (
+            "If the user confirms, commit the active pending write. StageGate "
+            "will execute the stored original write arguments."
+        ),
+    }
+    no_advance_step = {
+        "step": "do_not_advance_stage",
+        "tool_name": ADVANCE_STAGE_TOOL_NAME,
+        "instruction": "Do not call advance_stage before commit_pending_write.",
+    }
+    no_transfer_step = {
+        "step": "do_not_transfer",
+        "tool_name": TRANSFER_TOOL_NAME,
+        "instruction": (
+            "Do not transfer unless the user explicitly asks for a human or an "
+            "unrecoverable error occurs."
+        ),
+    }
+
+    if status in {"needs_confirmation", "mismatched_retry"}:
+        return [
+            {
+                "step": "tell_user_pending_action",
+                "instruction": "Tell the user the pending action and consequence.",
+            },
+            {
+                "step": "ask_user_to_confirm",
+                "instruction": "Ask the user to confirm.",
+            },
+            {
+                "step": "wait_for_user_response",
+                "instruction": "Wait for the user's response.",
+            },
+            commit_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    if status == "unclear":
+        return [
+            {
+                "step": "ask_one_clarification",
+                "instruction": "Ask one concise clarification question about whether the user confirms the pending action.",
+            },
+            {
+                "step": "wait_for_user_response",
+                "instruction": "Wait for the user's clarified response.",
+            },
+            commit_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    return []
+
+
+def pending_write_allowed_internal_tools(*, status: str) -> list[str]:
+    """Return StageGate tools allowed for the active pending-write status."""
+    if status in {"needs_confirmation", "unclear", "mismatched_retry"}:
+        return [COMMIT_PENDING_WRITE_TOOL_NAME]
+    return []
+
+
+def pending_write_disallowed_tools(*, status: str) -> list[str]:
+    """Return tools the model should not call while pending write is active."""
+    if status in {
+        "needs_confirmation",
+        "unclear",
+        "mismatched_retry",
+    }:
+        return [ADVANCE_STAGE_TOOL_NAME, TRANSFER_TOOL_NAME]
+    return []
+
+
+def pending_write_next_tool_call(
+    *,
+    tool_name: str,
+    status: str,
+) -> Optional[dict[str, object]]:
+    """Return the next concrete tool call the model should make, if any."""
+    if status in {"needs_confirmation", "unclear", "mismatched_retry"}:
+        return {
+            "name": COMMIT_PENDING_WRITE_TOOL_NAME,
+            "arguments": {
+                "decision": "confirmed",
+                "basis": "latest_user_turn",
+            },
+            "when": "after_user_confirms",
+        }
+    return None
 
 
 def build_corrective_packet(
@@ -895,22 +1400,73 @@ def build_corrective_packet(
     tool_call: ToolCall,
     reason: str,
     read_tools: list[str],
+    pending_write_tool_name: Optional[str] = None,
 ) -> StagePacket:
     """Build a corrective StageGate packet for a blocked tool call."""
+    protocol_tool_name = pending_write_tool_name or tool_call.name
+    protocol_status_by_reason = {
+        "missing_confirmation": "needs_confirmation",
+        "pending_write_mismatch": "mismatched_retry",
+        "pending_write_unclear": "unclear",
+        "transfer_blocked_pending_write": "needs_confirmation",
+    }
+    protocol_status = protocol_status_by_reason.get(reason)
+    do_not = [
+        f"Do not call {tool_call.name} again directly while the write is pending.",
+        "Do not call advance_stage before commit_pending_write.",
+    ]
+    if protocol_status is not None:
+        do_not.append(
+            "Do not transfer to a human agent unless the user asks for human help "
+            "or an unrecoverable error occurs."
+        )
+
     return StagePacket(
         stage=stage_for_reason(reason),
         objective="Recover the missing prerequisite before executing a write/action tool.",
         known_facts={},
         missing_facts=[reason],
         ambiguous_facts=[],
-        ask_next=corrective_instruction(tool_call=tool_call, reason=reason),
-        allowed_read_tools=read_tools,
-        allowed_write_tools=[],
-        do_not=[
-            f"Do not call {tool_call.name} again until the missing prerequisite is satisfied."
+        ask_next=corrective_instruction(
+            tool_name=protocol_tool_name,
+            reason=reason,
+        ),
+        allowed_read_tools=[
+            tool_name
+            for tool_name in read_tools
+            if not (
+                reason == "transfer_blocked_pending_write"
+                and tool_name == TRANSFER_TOOL_NAME
+            )
         ],
-        exit_condition="The missing prerequisite is visible in conversation, ledger, or official read-tool state.",
-        when_done="Call advance_stage or retry the original tool only after the corrective step is complete.",
+        allowed_write_tools=[],
+        allowed_internal_tools=[]
+        if protocol_status is None
+        else pending_write_allowed_internal_tools(status=protocol_status),
+        disallowed_tools=[]
+        if protocol_status is None
+        else pending_write_disallowed_tools(status=protocol_status),
+        next_required_steps=[]
+        if protocol_status is None
+        else pending_write_next_required_steps(
+            tool_name=protocol_tool_name,
+            status=protocol_status,
+        ),
+        next_tool_call=None
+        if protocol_status is None
+        else pending_write_next_tool_call(
+            tool_name=protocol_tool_name,
+            status=protocol_status,
+        ),
+        do_not=do_not,
+        exit_condition=(
+            "commit_pending_write has been called with a structured decision after "
+            "a later user turn."
+        ),
+        when_done=(
+            "If commit_pending_write is called with decision=confirmed, StageGate "
+            f"will execute the stored {protocol_tool_name} arguments once."
+        ),
     )
 
 
@@ -931,17 +1487,41 @@ def stage_for_reason(reason: str) -> str:
     return "propose_action_and_confirm"
 
 
-def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
+def corrective_instruction(*, tool_name: str, reason: str) -> str:
     """Return concise corrective text for the model."""
     if reason == "missing_confirmation":
         return (
-            f"Before making the change, summarize the intended {tool_call.name} "
-            "action and consequence, then ask the user for explicit confirmation."
+            "Tell the user the pending action and consequence, ask for "
+            "confirmation, wait for the user's response, then call "
+            'commit_pending_write({"decision": "confirmed", '
+            '"basis": "latest_user_turn"}) if confirmed. Use decision=denied '
+            "or unclear when appropriate. Do not retry the original domain write "
+            "directly; StageGate executes the stored write after a confirmed commit."
         )
-    if reason == "missing_action_summary":
+    if reason == "pending_write_mismatch":
         return (
-            "Tell the user exactly what will change and any consequence before "
-            "asking for confirmation."
+            "A different write was attempted while another pending write was "
+            "active. Tell the user the changed pending action and consequence, "
+            "ask for confirmation, then call commit_pending_write with "
+            "decision=confirmed, denied, or unclear after the user responds."
+        )
+    if reason == "transfer_blocked_pending_write":
+        return (
+            "A resolvable pending write is active. Do not transfer yet. Follow "
+            "the active pending-write protocol: tell the user the pending action "
+            "and consequence, ask for confirmation, wait for the user response, "
+            "then call commit_pending_write."
+        )
+    if reason == "pending_write_denied":
+        return (
+            "The user declined the pending write. Do not retry the write unless "
+            "a changed pending action is started and committed through "
+            "commit_pending_write."
+        )
+    if reason == "pending_write_unclear":
+        return (
+            "The user response was unclear. Ask for clarification, then call "
+            "commit_pending_write again after the next user response."
         )
     if reason == "missing_policy_state_inspection":
         return (
@@ -950,29 +1530,12 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     if reason == "missing_policy_precondition_state":
         return "Inspect the policy-relevant state needed to establish the precondition first."
     if reason == "missing_verified_identifier":
-        return "Verify the exact identifier with a read tool or explicit user confirmation."
+        return "Verify the exact identifier with an official read tool."
     if reason == "missing_verified_identity":
         return "Authenticate or verify the account identity with an official read tool first."
     if reason == "ambiguous_tool_arguments":
         return "Ask one clarification question to resolve the ambiguous tool argument."
     return "Collect the missing required tool argument before retrying."
-
-
-def looks_like_action_statement(content: str) -> bool:
-    """Detect a visible assistant statement of intended action and consequence."""
-    normalized = normalize_value(content)
-    if normalized is None:
-        return False
-    has_action = any(word in normalized for word in ACTION_WORDS)
-    has_consequence = any(word in normalized for word in CONSEQUENCE_WORDS)
-    return has_action and has_consequence
-
-
-def looks_like_user_confirmation(content: str) -> bool:
-    """Detect an affirmative user confirmation from visible transcript text."""
-    if NEGATIVE_CONFIRMATION_PATTERN.search(content):
-        return False
-    return any(pattern.search(content) for pattern in CONFIRMATION_PATTERNS)
 
 
 def is_empty_value(value: Any) -> bool:

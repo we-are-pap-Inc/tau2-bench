@@ -132,6 +132,10 @@ Retail:
 - phone
 - order_id
 - item_id
+- order_item_ids
+- candidate_replacement_item_ids
+- selected_old_item_ids
+- selected_new_item_ids
 - return_reason
 - refund_or_exchange_intent
 - address
@@ -180,19 +184,78 @@ The validator admits only typed runtime evidence:
 `SIMULATOR_GOLD_TEXT` and `POSTHOC_ORACLE` are forbidden in runtime StageGate
 state. In audio-native runs, clean `UserMessage.content` from the simulator is
 not agent-visible when the model receives only `user_audio`, so it must not
-update the ledger or satisfy confirmation. If no agent-visible user transcript
-exists, confirmation remains missing.
+update the ledger or satisfy confirmation. Agent-visible user transcript events
+may establish only user-turn ordering; the validator does not parse transcript
+text for consent or action summaries.
 
 Validator checks:
 
 1. Is this a write/action tool?
-2. Is identity/account/order/reservation verified?
-3. Are exact identifiers confirmed or tool-verified?
-4. Has relevant state been inspected with read tools?
-5. Are policy preconditions satisfied?
-6. Did the assistant summarize intended action and consequence?
-7. Did the user confirm after that summary?
-8. Are tool arguments complete and non-ambiguous?
+2. Are tool arguments complete and non-ambiguous?
+3. Is identity/account/order/reservation verified?
+4. Are exact identifiers confirmed or tool-verified?
+5. Has relevant state been inspected with read tools?
+6. Are policy preconditions satisfied?
+7. Is there a matching pending write keyed by the attempted tool and stable
+   argument fingerprint?
+8. Has a later user turn occurred after the pending write was created?
+9. Has the model called `commit_pending_write` with a structured decision for
+   the active pending write?
+
+Pending write confirmation:
+
+- A side-effecting tool attempt with satisfied non-conversation checks creates
+  a pending write record from the attempted tool name and arguments.
+- The record stores the original tool name and arguments, a stable argument
+  fingerprint, commit decision/tick, user-turn ordering state, and status.
+- The validator does not regex-match assistant or user transcript text. The
+  agent must explicitly call the StageGate internal tool `commit_pending_write`
+  after summarizing the pending write to the user, asking for confirmation, and
+  receiving a later user response.
+- There is at most one active pending write. The model-facing commit tool
+  applies to that active pending write and does not require a pending write ID.
+- Corrective and active-pending packets include `next_required_steps` with exact
+  instructions for telling the user the pending action/consequence, asking for
+  confirmation, waiting for the user response, and calling
+  `commit_pending_write`.
+- Corrective and active-pending packets also include `next_tool_call`, a single
+  immediate tool-call affordance for the next structured step.
+- If `commit_pending_write(decision="confirmed")` is structurally valid,
+  StageGate executes the stored original domain write once through the normal
+  environment path.
+- A successful side-effecting domain-tool result marks the pending write
+  `consumed`; only consumed writes can satisfy write-intent closeout.
+- `denied` keeps the write blocked and permits graceful close or alternative
+  non-write assistance. `unclear` keeps the protocol active, asks one
+  clarification, and allows another structured commit decision after a
+  later user turn.
+- `transfer_to_human_agents` is blocked while a resolvable active pending write
+  is `needs_confirmation`, `unclear`, or `mismatched_retry`. Transfer is allowed
+  with no active pending write, or after the active pending write is `denied`,
+  `consumed`, or `expired`.
+
+## Trajectory and Replay Boundary
+
+StageGate separates model-visible scaffold behavior from replayable benchmark
+environment actions:
+
+- `model_requested_domain_tool`: the model attempted a domain tool call. This is
+  trace-visible, but it is not automatically an environment execution.
+- `stagegate_blocked_domain_tool`: StageGate intercepted the requested domain
+  write before `Environment.get_response()`. The model still receives the
+  corrective tool output, but the blocked call/result is stored only in
+  internal tick fields and is excluded from replay.
+- `environment_domain_tool_result`: the domain tool actually executed through
+  the environment. Only these results are serialized into the canonical
+  replayable tool-call/result fields.
+
+The canonical `Tick.agent_tool_calls`, `Tick.user_tool_calls`, and matching
+result fields contain only real environment executions. StageGate-internal
+control tools (`advance_stage`, `commit_pending_write`) and StageGate-blocked
+domain writes are stored in internal tick fields for auditability and
+model-visible continuity, but are ignored by replay/evaluation conversion. When
+`commit_pending_write` is confirmed, the stored original domain write is the
+canonical replayable environment action.
 
 Allow result:
 
@@ -204,9 +267,18 @@ Block result:
       "decision": "block",
       "reason": "missing_confirmation",
       "corrective_packet": {
-        "say_next": "Before I make that change, please confirm that you want me to cancel reservation ABC123.",
-        "allowed_next_tools": ["advance_stage"],
-        "do_not": ["Do not call the cancellation tool until the user confirms."]
+        "say_next": "Tell the user the pending action and consequence, ask for explicit confirmation, then after the user responds call commit_pending_write with a structured decision.",
+        "next_required_steps": [
+          {"step": "tell_user_pending_action"},
+          {"step": "ask_user_to_confirm"},
+          {"step": "wait_for_user_response"},
+          {"step": "call_tool_if_user_confirms", "tool_name": "commit_pending_write", "arguments": {"decision": "confirmed", "basis": "latest_user_turn"}}
+        ],
+        "next_tool_call": {"name": "commit_pending_write", "arguments": {"decision": "confirmed", "basis": "latest_user_turn"}, "when": "after_user_confirms"},
+        "allowed_internal_tools": ["commit_pending_write"],
+        "disallowed_tools": ["advance_stage", "transfer_to_human_agents"],
+        "allowed_next_tools": [],
+        "do_not": ["Do not call advance_stage before commit_pending_write.", "Do not transfer while the active pending write is still resolvable."]
       }
     }
 
@@ -232,3 +304,16 @@ Patch the existing OpenAI audio-native adapter minimally to insert StageGate beh
 ## Trace events
 
 All StageGate behavior should emit JSONL events with `schema_version`. See `docs/stagegate/05-tracing-and-visualization.md`.
+
+Pending-write runtime events are:
+
+- `pending_write_created`
+- `pending_write_commit_requested`
+- `pending_write_committed`
+- `pending_write_denied`
+- `pending_write_unclear`
+- `pending_write_mismatch`
+- `pending_write_consumed`
+- `pending_write_commit_failed`
+- `transfer_blocked_pending_write`
+- `stagegate_blocked_domain_tool`

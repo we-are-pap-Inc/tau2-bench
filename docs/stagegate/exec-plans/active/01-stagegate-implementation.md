@@ -135,6 +135,11 @@ agent.
   an error `ToolMessage` containing a corrective stage packet and do not touch
   domain state. Baseline plus passive JSONL tracing stays on the normal domain
   tool execution path.
+- `src/tau2/data_model/message.py` and the full-duplex orchestrator keep
+  replayable environment tool calls/results separate from StageGate-internal
+  tool calls/results. StageGate-blocked domain writes and StageGate control
+  tools remain model-visible and trace-visible, but they are stored in internal
+  tick fields and excluded from replay/evaluation message-history conversion.
 - `src/tau2/voice/audio_native/openai/__init__.py` lazy-loads provider and
   adapter classes so importing the StageOnly package does not make core
   τ-bench imports require voice-only dependencies.
@@ -221,6 +226,33 @@ remains validator-free; the pre-write validator is active only for
   per-run `advance_stage` loop guard defaults, stage-scoped packets, fallback
   packets, `stage_loop_guard_triggered` events, and trace summary payloads on
   `trace_summary` and `run_end`.
+- [x] Replace transcript-pattern confirmation with a structured pending-write
+  protocol. Side-effecting write attempts now create a pending write keyed by
+  tool name and stable argument fingerprint; the model must call
+  `record_pending_write_summary` and `record_pending_write_confirmation` before
+  the same fingerprinted retry is allowed.
+- [x] Make pending-write tools operate on the single active pending write so the
+  model-facing protocol does not require copying an opaque pending-write ID.
+- [x] Block `transfer_to_human_agents` while a resolvable active pending write is
+  waiting for summary, structured confirmation, or direct retry.
+- [x] Add `next_required_steps`, `allowed_internal_tools`, and
+  `disallowed_tools` to corrective and active-pending packets so the model sees
+  the pending-write protocol as a mechanical checklist instead of prose.
+- [x] Add `next_tool_call` to pending-write packets so the model sees one
+  immediate structured tool-call affordance in addition to the checklist.
+- [x] Keep denied and unclear decisions structural: denied blocks the write and
+  allows non-write resolution; unclear keeps the protocol active, blocks
+  transfer, and requires a later user turn before recording another decision.
+- [x] Emit pending-write trace events for creation, structured summary record,
+  structured confirmation/denial/unclear decisions, mismatched retry, and
+  consumption.
+- [x] Gate `advance_stage` with pending-write state so unconsumed pending writes
+  cannot drift to `verify_result_and_close`.
+- [x] Separate model-visible StageGate blocked/control tool outputs from the
+  canonical replayable environment action trajectory. Only actual
+  `Environment.get_response()` executions are serialized into canonical
+  `Tick.*_tool_calls` / `Tick.*_tool_results`; blocked writes and StageGate
+  internal tools are stored in internal tick fields and remain trace-visible.
 
 ## Tests
 
@@ -277,6 +309,18 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   no-crash/no-mutation behavior, stage-scoped missing facts, identity-stage
   exclusion of later-stage facts in retail/airline/telecom, StageGate ledger
   enrichment, and trace summary counters.
+- pending-write tests cover blocked exchange creation, structured summary
+  recording, structured confirmation after a later user turn, same-fingerprint
+  retry allow, changed-argument mismatch blocks, denied/unclear decisions
+  blocking retry, corrective direct-retry packet text, stage guard behavior for
+  blocked/confirmed/consumed writes, pending-write trace events,
+  baseline/StageOnly absence of validator state, and absence of semantic
+  transcript regex in the validator source.
+- trajectory/replay tests cover StageGate-blocked writes as internal
+  non-replayable outputs, model-visible corrective packets, replayable allowed
+  retries, StageGate internal tools excluded from domain action replay, the
+  successful exchange sequence containing only the final allowed exchange write,
+  and trace visibility for the blocked write.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -543,6 +587,152 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-09 task-ID isolation and final-run hygiene fix:
   `python3 scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
   result: passed.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after final formatting: `64 passed, 2 warnings in 0.17s`.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `make format`
+  result after final formatting: Ruff format left 329 files unchanged.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `make check-all`
+  result: Ruff check passed and Ruff format left 329 files unchanged.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `git diff --check`
+  result: passed with no whitespace errors.
+- 2026-05-10 smoke_007 confirmation-validator triage:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/stagegate --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 smoke_008 post-patch smoke:
+  `uv run --with modal modal run modal_tau3_voice_stagegate.py --batch-id smoke_008 --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git --repo-ref e595172fad05c15dc95e35adb35431f54c328d48 --mode smoke`
+  completed all three Modal jobs. Baseline result: reward `1.0`,
+  termination `user_stop`. StageOnly result: reward `1.0`, termination
+  `user_stop`. StageGate result: reward `0.0`, termination `max_steps`.
+- 2026-05-10 smoke_008 post-patch smoke:
+  `uv run --with modal modal run modal_tau3_voice_stagegate.py --batch-id smoke_008 --collect-completed`
+  result: completed manifest written with 3 runs at
+  `/runs/smoke_008/batch_manifest_completed.json`.
+- 2026-05-10 smoke_008 post-patch smoke:
+  StageGate trace replay against the updated local validator showed the live
+  exchange summaries would now match the attempted write at ticks `1000` and
+  `1368`, with user confirmations at ticks `1127` and `1383`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q -k 'exchange_summary or confirmation_before_exchange_summary or missing_exchange_summary'`
+  result: `5 passed, 60 deselected, 2 warnings in 0.07s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `65 passed, 2 warnings in 0.17s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `make format` result: Ruff format left `329 files` unchanged.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `make check-all` result: Ruff check passed and Ruff format left
+  `329 files` unchanged.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `git diff --check` result: passed with no whitespace errors.
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/stagegate --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 smoke_008 exchange-summary follow-up:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `70 passed, 2 warnings in 0.29s`.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 structural pending-write confirmation:
+  local replay of `/private/tmp/stagegate_smoke_008_stagegate_trace_events.jsonl`
+  through the updated validator allowed both attempted
+  `exchange_delivered_order_items` writes; each matched `action_type`,
+  `old_items`, `new_items`, `consequence`, and `confirmation_request`.
+- 2026-05-10 structural pending-write confirmation:
+  `make format` result: Ruff format reformatted 1 file, then final
+  `make check-all` left `329 files` unchanged with Ruff checks passing.
+- 2026-05-10 structural pending-write confirmation:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 structural pending-write confirmation:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after formatting: `70 passed, 2 warnings in 0.25s`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 structured pending-write protocol:
+  `make format` result: `2 files reformatted, 327 files left unchanged`;
+  `make check-all` result: `All checks passed!` and `329 files left unchanged`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 structured pending-write protocol:
+  local smoke_008 trace replay against
+  `/private/tmp/stagegate_smoke_008_stagegate_trace_events.jsonl` shows direct
+  replay blocks as `missing_action_summary` because the historical trace lacks
+  the new internal protocol events. Injecting the structured
+  `record_pending_write_summary` / later user turn /
+  `record_pending_write_confirmation` sequence for the same fingerprint returns
+  `allow` / `validated`.
+- 2026-05-10 structured pending-write protocol:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 active pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `73 passed, 2 warnings in 0.35s`.
+- 2026-05-10 active pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 active pending-write protocol:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-10 active pending-write protocol:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 active pending-write affordance hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `78 passed, 2 warnings in 0.33s`.
+- 2026-05-10 active pending-write affordance hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 active pending-write affordance hardening:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-10 active pending-write affordance hardening:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-11 pending-write `next_tool_call` affordance:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `78 passed, 2 warnings in 0.24s`.
+- 2026-05-11 pending-write `next_tool_call` affordance:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.09s`.
+- 2026-05-11 pending-write `next_tool_call` affordance:
+  `make check-all` result: `All checks passed!` and `329 files left unchanged`.
+- 2026-05-11 pending-write `next_tool_call` affordance:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `83 passed, 2 warnings in 0.42s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run --extra voice --extra dev python -m pytest tests/test_environment.py -q`
+  result: `9 passed, 2 warnings in 0.01s`.
+- 2026-05-11 trajectory/replay compatibility:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-11 trajectory/replay compatibility:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -623,6 +813,55 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
   treats slash-separated hint terms such as `payment/refund` as alternatives
   instead of requiring both terms to appear.
+- 2026-05-10 smoke_007/smoke_008 transcript-pattern triage is superseded: the
+  validator no longer aggregates transcript text or matches natural-language
+  summaries/confirmations. Transcript events establish ordering only.
+- 2026-05-10 smoke_007 triage: `advance_stage` is not allowed to advance from
+  `execute_write_action` to `verify_result_and_close` in StageGate unless a
+  side-effecting domain tool has actually returned successfully. Model-supplied
+  `observed_facts` cannot override the validator's blocked-write state.
+- 2026-05-10 smoke_007 triage: Retail item identifiers are split into semantic
+  slots for order items, candidate replacements, selected old items, and
+  selected new items. Product variant lists are not surfaced as user-facing
+  `item_id` ambiguities in closeout packets.
+- 2026-05-10 smoke_008 follow-up is superseded: exchange-specific transcript
+  summary matching has been removed in favor of the structured pending-write
+  protocol.
+- 2026-05-10 structural pending-write confirmation: The validator now treats
+  the attempted side-effecting write as the object being summarized and
+  confirmed. Confirmation is valid only for the matching tool name and argument
+  fingerprint; changed retries require a fresh summary and confirmation.
+- 2026-05-10 structural pending-write confirmation: `advance_stage` cannot
+  close a write-intent path while the pending write is `needs_summary`,
+  `summarized`, `confirmed`, or `mismatched_retry`; only a consumed successful
+  side-effecting domain-tool result permits closeout.
+- 2026-05-10 structured pending-write protocol: The validator no longer parses
+  assistant or user transcript text for summary or consent. The only write
+  confirmation path is a StageGate-only internal protocol:
+  `record_pending_write_summary`, a later user-turn event, then
+  `record_pending_write_confirmation`.
+- 2026-05-10 smoke_009 triage: the runtime correctly created
+  `pending_write=needs_summary`, but the model-facing affordance failed because
+  the model believed the pending-write record step required an unavailable ID
+  and transferred to a human. Pending-write recorder tools now resolve the
+  active pending write by default, and transfer is blocked while that active
+  write remains structurally resolvable.
+- 2026-05-11 smoke_010 replay triage: the live pending-write protocol
+  succeeded, but the first StageGate-blocked exchange was serialized as a
+  replayable environment action. Replay then executed that blocked call against
+  a clean environment and compared the real exchange result with the stored
+  StageGate corrective packet. Canonical full-duplex tool-call/result fields
+  now contain only actual environment executions; blocked writes and internal
+  StageGate tools are stored separately and ignored by replay.
+- 2026-05-11 smoke_011 simplification: the active pending-write protocol still
+  required too much realtime choreography: summarize tool, confirmation tool,
+  then manual retry of the original write. StageGate now exposes a single
+  `commit_pending_write` internal tool. A first side-effecting write creates an
+  active `needs_confirmation` pending write; after a later user response, a
+  confirmed commit executes the stored original domain write exactly once
+  through the normal environment path. Denied and unclear decisions do not
+  mutate domain state. The old summary/confirmation tools are not registered in
+  StageGate sessions.
 
 ## Remaining Work
 

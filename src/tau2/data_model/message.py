@@ -650,6 +650,12 @@ class Tick(BaseModel):
         user_tool_calls: Tool calls made by the user during this tick.
         agent_tool_results: Tool results from agent's tool calls during this tick.
         user_tool_results: Tool results from user's tool calls during this tick.
+        agent_internal_tool_calls: Agent-visible scaffold/internal tool calls that
+            did not execute the benchmark environment and are excluded from replay.
+        user_internal_tool_calls: User-visible scaffold/internal tool calls that
+            did not execute the benchmark environment and are excluded from replay.
+        agent_internal_tool_results: Results for agent internal tool calls.
+        user_internal_tool_results: Results for user internal tool calls.
         user_transcript: Proportional user input transcription (filled by post-processing).
     """
 
@@ -661,6 +667,10 @@ class Tick(BaseModel):
     user_tool_calls: list[ToolCall] = Field(default_factory=list)
     agent_tool_results: list[ToolMessage] = Field(default_factory=list)
     user_tool_results: list[ToolMessage] = Field(default_factory=list)
+    agent_internal_tool_calls: list[ToolCall] = Field(default_factory=list)
+    user_internal_tool_calls: list[ToolCall] = Field(default_factory=list)
+    agent_internal_tool_results: list[ToolMessage] = Field(default_factory=list)
+    user_internal_tool_results: list[ToolMessage] = Field(default_factory=list)
     user_transcript: Optional[str] = None
 
     # --- Timing metadata ---
