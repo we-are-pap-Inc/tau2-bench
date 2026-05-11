@@ -853,6 +853,15 @@ Warnings observed in the passing focused and voice test commands:
   StageGate corrective packet. Canonical full-duplex tool-call/result fields
   now contain only actual environment executions; blocked writes and internal
   StageGate tools are stored separately and ignored by replay.
+- 2026-05-11 smoke_011 simplification: the active pending-write protocol still
+  required too much realtime choreography: summarize tool, confirmation tool,
+  then manual retry of the original write. StageGate now exposes a single
+  `commit_pending_write` internal tool. A first side-effecting write creates an
+  active `needs_confirmation` pending write; after a later user response, a
+  confirmed commit executes the stored original domain write exactly once
+  through the normal environment path. Denied and unclear decisions do not
+  mutate domain state. The old summary/confirmation tools are not registered in
+  StageGate sessions.
 
 ## Remaining Work
 

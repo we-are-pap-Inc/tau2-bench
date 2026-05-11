@@ -23,6 +23,7 @@ from tau2.voice.audio_native.openai.stagegate.trace import (
     get_trace_run_id,
 )
 from tau2.voice.audio_native.openai.stagegate.validator import (
+    COMMIT_PENDING_WRITE_TOOL_NAME,
     PreWriteValidator,
     ValidatorDecision,
     pending_write_allowed_internal_tools,
@@ -33,12 +34,7 @@ from tau2.voice.audio_native.openai.stagegate.validator import (
 
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
 ADVANCE_STAGE_TOOL_NAME = "advance_stage"
-RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME = "record_pending_write_summary"
-RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME = "record_pending_write_confirmation"
-PENDING_WRITE_TOOL_NAMES = {
-    RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME,
-    RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME,
-}
+PENDING_WRITE_TOOL_NAMES = {COMMIT_PENDING_WRITE_TOOL_NAME}
 VALID_CONDITIONS = {"baseline", "stage_only", "stagegate"}
 MAX_ADVANCE_STAGE_CALLS_ENV_VAR = "TAU2_STAGEGATE_MAX_ADVANCE_STAGE_CALLS"
 MAX_REPEATED_STAGE_ENV_VAR = "TAU2_STAGEGATE_MAX_REPEATED_STAGE"
@@ -54,7 +50,7 @@ StageGate operating rules:
 - In advance_stage observed_facts, include only facts visible in the conversation, model tool arguments, or official tool results.
 - Follow each returned stage packet. Call advance_stage again only after its exit condition is met or a blocker appears.
 - Before changing account, order, reservation, plan, or service state, make sure policy prerequisites and confirmation requirements are satisfied.
-- In StageGate mode, a blocked write creates one active pending write. After you verbally summarize that exact pending write and ask for confirmation, call record_pending_write_summary; no pending_write_id is needed. After the user's next response, call record_pending_write_confirmation; no pending_write_id is needed. If confirmed, retry the same original domain write tool directly with unchanged arguments.
+- In StageGate mode, a blocked write creates one active pending write. Tell the user that pending action and consequence, ask for confirmation, then after the user's next response call commit_pending_write. If confirmed, StageGate executes the stored original write once; do not retry the domain write directly.
 - Do not transfer to a human agent while an active pending write can still be completed through the structured pending-write tools.
 """.strip()
 
@@ -81,38 +77,7 @@ def advance_stage(
     return ""
 
 
-def record_pending_write_summary(
-    summary_presented: bool,
-    action_type: str,
-    consequence_presented: bool,
-    confirmation_requested: bool,
-    notes: Optional[str] = None,
-    pending_write_id: Optional[str] = None,
-) -> str:
-    """Record that the assistant summarized a pending write and asked confirmation.
-
-    This StageGate-only orchestration tool does not modify domain state.
-    This applies to the active pending write. pending_write_id is not required.
-    Use record_pending_write_summary after you have told the user the pending
-    action and consequence and asked for confirmation. If the user later
-    confirms, record that response with record_pending_write_confirmation and
-    retry the same original write tool directly.
-
-    Args:
-        summary_presented: Whether the assistant presented the pending write summary.
-        action_type: The structured action type the assistant summarized.
-        consequence_presented: Whether the consequence was included.
-        confirmation_requested: Whether explicit user confirmation was requested.
-        notes: Optional brief model-visible note.
-        pending_write_id: Optional trace/debug handle for the active pending write.
-
-    Returns:
-        A structured StageGate pending-write protocol result.
-    """
-    return ""
-
-
-def record_pending_write_confirmation(
+def commit_pending_write(
     decision: Literal["confirmed", "denied", "unclear"],
     basis: Literal[
         "latest_user_turn",
@@ -121,24 +86,23 @@ def record_pending_write_confirmation(
         "unclear_response",
     ],
     notes: Optional[str] = None,
-    pending_write_id: Optional[str] = None,
 ) -> str:
-    """Record the assistant's structured decision after the user's response.
+    """Commit or decline the active pending write after the user's response.
 
-    This StageGate-only orchestration tool does not modify domain state.
-    This applies to the active pending write. pending_write_id is not required.
-    Use record_pending_write_confirmation after the user responds to that
-    confirmation request. If confirmed, retry the same original write tool
-    directly.
+    This StageGate-only orchestration tool does not modify domain state by
+    itself. It applies to the active pending write; pending_write_id is not
+    required. Use commit_pending_write after you have told the user the pending
+    action and consequence, asked for confirmation, and received the user's
+    response. If decision is confirmed, StageGate executes the stored original
+    domain write once. If denied or unclear, StageGate does not execute it.
 
     Args:
         decision: Whether the user confirmed, denied, or gave an unclear response.
         basis: The event-order basis for the decision.
         notes: Optional brief model-visible note.
-        pending_write_id: Optional trace/debug handle for the active pending write.
 
     Returns:
-        A structured StageGate pending-write protocol result.
+        A structured StageGate pending-write commit result.
     """
     return ""
 
@@ -163,8 +127,7 @@ class StageGateController:
         self.domain_name = domain_name
         self.tools = list(tools)
         self.advance_stage_tool = Tool(advance_stage)
-        self.pending_write_summary_tool = Tool(record_pending_write_summary)
-        self.pending_write_confirmation_tool = Tool(record_pending_write_confirmation)
+        self.commit_pending_write_tool = Tool(commit_pending_write)
         self.packet_orchestrator = StagePacketOrchestrator()
         self.trace_writer = trace_writer or JsonlTraceWriter.from_env()
         self.benchmark_task_id: Optional[str] = None
@@ -287,13 +250,9 @@ class StageGateController:
             session_tools.append(self.advance_stage_tool)
             existing_names.add(ADVANCE_STAGE_TOOL_NAME)
         if self.condition == "stagegate":
-            for internal_tool in (
-                self.pending_write_summary_tool,
-                self.pending_write_confirmation_tool,
-            ):
-                if internal_tool.name not in existing_names:
-                    session_tools.append(internal_tool)
-                    existing_names.add(internal_tool.name)
+            if COMMIT_PENDING_WRITE_TOOL_NAME not in existing_names:
+                session_tools.append(self.commit_pending_write_tool)
+                existing_names.add(COMMIT_PENDING_WRITE_TOOL_NAME)
         return session_tools
 
     def is_advance_stage(self, tool_call: ToolCall) -> bool:
@@ -416,27 +375,8 @@ class StageGateController:
                 error=True,
             )
         args = tool_call.arguments
-        if tool_call.name == RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME:
-            result = validator.record_pending_write_summary(
-                pending_write_id=(
-                    None
-                    if args.get("pending_write_id") is None
-                    else str(args.get("pending_write_id"))
-                ),
-                summary_presented=bool(args.get("summary_presented", False)),
-                action_type=str(args.get("action_type", "")),
-                consequence_presented=bool(args.get("consequence_presented", False)),
-                confirmation_requested=bool(args.get("confirmation_requested", False)),
-                notes=None if args.get("notes") is None else str(args.get("notes")),
-                tick_index=tick_id,
-            )
-        elif tool_call.name == RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME:
-            result = validator.record_pending_write_confirmation(
-                pending_write_id=(
-                    None
-                    if args.get("pending_write_id") is None
-                    else str(args.get("pending_write_id"))
-                ),
+        if tool_call.name == COMMIT_PENDING_WRITE_TOOL_NAME:
+            result = validator.commit_pending_write(
                 decision=str(args.get("decision", "unclear")),
                 basis=str(args.get("basis", "unclear_response")),
                 notes=None if args.get("notes") is None else str(args.get("notes")),
@@ -467,6 +407,37 @@ class StageGateController:
             content=content,
             error=error,
         )
+
+    def pending_write_domain_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        requestor: Literal["assistant", "user"] = "assistant",
+    ) -> Optional[ToolCall]:
+        """Return the stored pending-write domain call after a confirmed commit."""
+        validator = self._active_validator()
+        if validator is None:
+            return None
+        return validator.pending_write_domain_tool_call(
+            tool_call_id=tool_call_id,
+            requestor=requestor,
+        )
+
+    def mark_pending_write_commit_failed(
+        self,
+        *,
+        tool_call: ToolCall,
+        tick_id: Optional[int] = None,
+    ) -> None:
+        """Record that a committed pending write failed during domain execution."""
+        validator = self._active_validator()
+        if validator is None:
+            return
+        validator.mark_pending_write_commit_failed(
+            tool_call=tool_call,
+            tick_index=tick_id,
+        )
+        self._trace_pending_write_events(validator.drain_pending_write_events())
 
     def trace_run_start(self) -> None:
         """Emit run_start with public run context."""
@@ -948,20 +919,18 @@ class StageGateController:
             return packet
         status = str(pending_write.get("status", ""))
         tool_name = str(pending_write.get("tool_name", "the write tool"))
-        if status in {"needs_summary", "mismatched_retry"}:
+        if status in {"needs_confirmation", "mismatched_retry"}:
             return packet.model_copy(
                 update={
                     "stage": "propose_action_and_confirm",
                     "missing_facts": [
-                        "pending_write_summary",
                         "pending_write_confirmation",
                     ],
                     "ask_next": (
-                        "State the pending action and consequence, ask for "
-                        "explicit confirmation, then call "
-                        "record_pending_write_summary with summary_presented=true, "
-                        f"action_type={tool_name!r}, consequence_presented=true, "
-                        "and confirmation_requested=true."
+                        "Tell the user the pending action and consequence, ask "
+                        "for confirmation, wait for the user's response, then "
+                        "call commit_pending_write with decision=confirmed, "
+                        "denied, or unclear."
                     ),
                     "allowed_write_tools": [],
                     "allowed_internal_tools": pending_write_allowed_internal_tools(
@@ -977,80 +946,18 @@ class StageGateController:
                         status=status,
                     ),
                     "do_not": [
-                        "Do not call a write/action tool before structured confirmation.",
-                        "Do not call advance_stage before retrying the original write tool.",
-                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
+                        "Do not call a write/action tool directly while the write is pending.",
+                        "Do not call advance_stage before commit_pending_write.",
+                        "Do not transfer to a human agent unless the user asks for human help or an unrecoverable error occurs.",
                     ],
                     "exit_condition": (
-                        "The pending action has been summarized through "
-                        "record_pending_write_summary and the next user response "
-                        "has been recorded through record_pending_write_confirmation."
+                        "commit_pending_write has been called with a structured "
+                        "decision after the user's response."
                     ),
                     "when_done": (
-                        "After record_pending_write_confirmation returns confirmed, "
-                        f"retry {tool_name} directly."
+                        "If commit_pending_write is confirmed, StageGate executes "
+                        f"the stored {tool_name} arguments once."
                     ),
-                }
-            )
-        if status == "summarized":
-            return packet.model_copy(
-                update={
-                    "stage": "propose_action_and_confirm",
-                    "missing_facts": ["pending_write_confirmation"],
-                    "ask_next": (
-                        "Wait for or ask for the user's response, then call "
-                        "record_pending_write_confirmation with confirmed, denied, "
-                        "or unclear. If the user confirms, use decision=confirmed "
-                        "and basis=latest_user_turn."
-                    ),
-                    "allowed_write_tools": [],
-                    "allowed_internal_tools": pending_write_allowed_internal_tools(
-                        status=status
-                    ),
-                    "disallowed_tools": pending_write_disallowed_tools(status=status),
-                    "next_required_steps": pending_write_next_required_steps(
-                        tool_name=tool_name,
-                        status=status,
-                    ),
-                    "next_tool_call": pending_write_next_tool_call(
-                        tool_name=tool_name,
-                        status=status,
-                    ),
-                    "do_not": [
-                        "Do not call a write/action tool before structured confirmation.",
-                        "Do not call advance_stage before retrying the original write tool.",
-                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
-                    ],
-                    "exit_condition": "record_pending_write_confirmation returned confirmed.",
-                    "when_done": f"If confirmed, retry {tool_name} directly.",
-                }
-            )
-        if status == "confirmed":
-            return packet.model_copy(
-                update={
-                    "stage": "execute_write_action",
-                    "missing_facts": [],
-                    "ask_next": f"Retry {tool_name} now with the same confirmed arguments.",
-                    "allowed_write_tools": [tool_name],
-                    "allowed_internal_tools": pending_write_allowed_internal_tools(
-                        status=status
-                    ),
-                    "disallowed_tools": pending_write_disallowed_tools(status=status),
-                    "next_required_steps": pending_write_next_required_steps(
-                        tool_name=tool_name,
-                        status=status,
-                    ),
-                    "next_tool_call": pending_write_next_tool_call(
-                        tool_name=tool_name,
-                        status=status,
-                    ),
-                    "do_not": [
-                        "Do not change the confirmed write arguments.",
-                        "Do not call advance_stage before retrying the original write tool.",
-                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
-                    ],
-                    "exit_condition": "The confirmed write tool has completed or returned an error.",
-                    "when_done": "After the tool returns, call advance_stage with the visible tool result.",
                 }
             )
         if status == "unclear":
@@ -1060,7 +967,7 @@ class StageGateController:
                     "missing_facts": ["pending_write_unclear"],
                     "ask_next": (
                         "Ask one concise clarification question. After the user "
-                        "responds, call record_pending_write_confirmation again "
+                        "responds, call commit_pending_write again "
                         "with confirmed, denied, or unclear."
                     ),
                     "allowed_write_tools": [],
@@ -1077,12 +984,15 @@ class StageGateController:
                         status=status,
                     ),
                     "do_not": [
-                        "Do not retry the unclear write tool before structured confirmation.",
-                        "Do not call advance_stage before resolving the pending write.",
-                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
+                        "Do not call a write/action tool directly while the write is unclear.",
+                        "Do not call advance_stage before commit_pending_write resolves the pending write.",
+                        "Do not transfer to a human agent unless the user asks for human help or an unrecoverable error occurs.",
                     ],
-                    "exit_condition": "record_pending_write_confirmation returned confirmed or denied.",
-                    "when_done": f"If confirmed, retry {tool_name} directly.",
+                    "exit_condition": "commit_pending_write returned confirmed or denied.",
+                    "when_done": (
+                        "If confirmed, StageGate executes the stored "
+                        f"{tool_name} arguments once."
+                    ),
                 }
             )
         if status == "denied":
@@ -1205,15 +1115,12 @@ class StageGateController:
         if pending_write is not None:
             status = pending_write.get("status")
             if status in {
-                "needs_summary",
-                "summarized",
+                "needs_confirmation",
                 "denied",
                 "unclear",
                 "mismatched_retry",
             }:
                 return "propose_action_and_confirm"
-            if status == "confirmed":
-                return "execute_write_action"
         if current_stage not in {"execute_write_action", "verify_result_and_close"}:
             return None
         if self.last_successful_side_effecting_tool is not None:
