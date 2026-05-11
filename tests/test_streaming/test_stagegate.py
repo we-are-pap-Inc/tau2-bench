@@ -565,6 +565,10 @@ def _assert_summary_step(packet: dict, tool_name: str) -> None:
         "confirmation_requested": True,
     }
     assert "pending_write_id" not in summary_step["arguments"]
+    assert packet["next_tool_call"] == {
+        "name": "record_pending_write_summary",
+        "arguments": summary_step["arguments"],
+    }
 
 
 def _assert_confirmation_step(packet: dict) -> None:
@@ -575,6 +579,15 @@ def _assert_confirmation_step(packet: dict) -> None:
         "basis": "latest_user_turn",
     }
     assert "pending_write_id" not in confirmation_step["arguments"]
+
+
+def _assert_confirmation_next_tool_call(packet: dict) -> None:
+    confirmation_step = _step_by_name(packet, "call_tool_if_user_confirms")
+    assert packet["next_tool_call"] == {
+        "name": "record_pending_write_confirmation",
+        "arguments": confirmation_step["arguments"],
+        "when": "after_user_confirms",
+    }
 
 
 def _assert_retry_step(packet: dict, tool_name: str) -> None:
@@ -1815,6 +1828,14 @@ def test_unclear_pending_write_keeps_protocol_active_for_clarification():
     ]
     clarification_step = _step_by_name(packet, "ask_one_clarification")
     assert "clarification" in clarification_step["instruction"]
+    assert packet["next_tool_call"] == {
+        "name": "record_pending_write_confirmation",
+        "arguments": {
+            "decision": "confirmed",
+            "basis": "latest_user_turn",
+        },
+        "when": "after_user_confirms",
+    }
 
     transfer = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -2199,6 +2220,7 @@ def test_advance_stage_summarized_repeats_confirmation_recording_steps():
         "transfer_to_human_agents",
     ]
     _assert_confirmation_step(packet)
+    _assert_confirmation_next_tool_call(packet)
     _assert_retry_step(packet, "exchange_delivered_order_items")
 
 
@@ -2242,6 +2264,10 @@ def test_confirmed_unconsumed_pending_write_keeps_stage_at_execute():
         "transfer_to_human_agents",
     ]
     assert packet["next_required_steps"][0]["step"] == "retry_original_write"
+    assert packet["next_tool_call"] == {
+        "name": "exchange_delivered_order_items",
+        "arguments": {"same_as_original_write_arguments": True},
+    }
     assert "Retry exchange_delivered_order_items" in packet["ask_next"]
 
 

@@ -28,6 +28,7 @@ from tau2.voice.audio_native.openai.stagegate.validator import (
     pending_write_allowed_internal_tools,
     pending_write_disallowed_tools,
     pending_write_next_required_steps,
+    pending_write_next_tool_call,
 )
 
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
@@ -937,6 +938,10 @@ class StageGateController:
                         tool_name=tool_name,
                         status=status,
                     ),
+                    "next_tool_call": pending_write_next_tool_call(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
                         "Do not call a write/action tool before structured confirmation.",
                         "Do not call advance_stage before retrying the original write tool.",
@@ -973,6 +978,10 @@ class StageGateController:
                         tool_name=tool_name,
                         status=status,
                     ),
+                    "next_tool_call": pending_write_next_tool_call(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
                         "Do not call a write/action tool before structured confirmation.",
                         "Do not call advance_stage before retrying the original write tool.",
@@ -994,6 +1003,10 @@ class StageGateController:
                     ),
                     "disallowed_tools": pending_write_disallowed_tools(status=status),
                     "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "next_tool_call": pending_write_next_tool_call(
                         tool_name=tool_name,
                         status=status,
                     ),
@@ -1022,6 +1035,10 @@ class StageGateController:
                     ),
                     "disallowed_tools": pending_write_disallowed_tools(status=status),
                     "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
+                    "next_tool_call": pending_write_next_tool_call(
                         tool_name=tool_name,
                         status=status,
                     ),

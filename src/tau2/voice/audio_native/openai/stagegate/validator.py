@@ -1456,6 +1456,39 @@ def pending_write_disallowed_tools(*, status: str) -> list[str]:
     return []
 
 
+def pending_write_next_tool_call(
+    *,
+    tool_name: str,
+    status: str,
+) -> Optional[dict[str, object]]:
+    """Return the next concrete tool call the model should make, if any."""
+    if status in {"needs_summary", "mismatched_retry"}:
+        return {
+            "name": RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME,
+            "arguments": {
+                "summary_presented": True,
+                "action_type": tool_name,
+                "consequence_presented": True,
+                "confirmation_requested": True,
+            },
+        }
+    if status in {"summarized", "unclear"}:
+        return {
+            "name": RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME,
+            "arguments": {
+                "decision": "confirmed",
+                "basis": "latest_user_turn",
+            },
+            "when": "after_user_confirms",
+        }
+    if status == "confirmed":
+        return {
+            "name": tool_name,
+            "arguments": {"same_as_original_write_arguments": True},
+        }
+    return None
+
+
 def build_corrective_packet(
     *,
     tool_call: ToolCall,
@@ -1511,6 +1544,12 @@ def build_corrective_packet(
         next_required_steps=[]
         if protocol_status is None
         else pending_write_next_required_steps(
+            tool_name=protocol_tool_name,
+            status=protocol_status,
+        ),
+        next_tool_call=None
+        if protocol_status is None
+        else pending_write_next_tool_call(
             tool_name=protocol_tool_name,
             status=protocol_status,
         ),

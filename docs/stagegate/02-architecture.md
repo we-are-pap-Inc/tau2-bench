@@ -217,6 +217,8 @@ Pending write confirmation:
 - Corrective and active-pending packets include `next_required_steps` with exact
   structured calls for `record_pending_write_summary`,
   `record_pending_write_confirmation`, and the direct retry.
+- Corrective and active-pending packets also include `next_tool_call`, a single
+  immediate tool-call affordance for the next structured step.
 - A retry is allowed only when the pending write is `confirmed` and the retried
   tool name and argument fingerprint match.
 - A successful side-effecting domain-tool result marks the pending write
@@ -251,6 +253,7 @@ Block result:
           {"step": "call_tool_if_user_confirms", "tool_name": "record_pending_write_confirmation", "arguments": {"decision": "confirmed", "basis": "latest_user_turn"}},
           {"step": "retry_original_write", "tool_name": "<write_tool>"}
         ],
+        "next_tool_call": {"name": "record_pending_write_summary", "arguments": {"summary_presented": true, "action_type": "<write_tool>", "consequence_presented": true, "confirmation_requested": true}},
         "allowed_internal_tools": ["record_pending_write_summary"],
         "disallowed_tools": ["advance_stage", "transfer_to_human_agents"],
         "allowed_next_tools": [],
