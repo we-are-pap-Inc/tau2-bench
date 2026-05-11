@@ -103,9 +103,10 @@ agent.
 - `src/tau2/voice/audio_native/openai/stagegate/trace.py`
   provides `JsonlTraceWriter.from_env()` controlled by `TAU2_TRACE_JSONL`.
 - `src/tau2/voice/audio_native/openai/stagegate/orchestrator.py`
-  provides `StagePacketOrchestrator`, which builds deterministic packets from
-  `advance_stage` arguments, public tool names, and, for StageGate only, the
-  typed entity ledger.
+  provides `StagePacketOrchestrator`, which builds deterministic, stage-scoped
+  packets from `advance_stage` arguments, public domain name, public tool
+  names, and, for StageGate only, the typed entity ledger. Packets expose only
+  stage-relevant missing facts rather than every missing domain slot.
 - `src/tau2/voice/audio_native/openai/stagegate/ledger.py`
   defines `LedgerStatus`, `LedgerEvidence`, `LedgerSlot`, and `EntityLedger`,
   with domain slots for retail, airline, and telecom.
@@ -120,8 +121,9 @@ agent.
   `session_tools()`, `is_advance_stage()`, `handle_advance_stage()`, ledger
   ownership when `condition="stagegate"`, ledger updates from visible events,
   validator ownership when `condition="stagegate"`, explicit assistant
-  utterance and agent-visible user transcript recording, and `ledger_update` /
-  validator trace events.
+  utterance and agent-visible user transcript recording, `advance_stage` loop
+  guard state, trace summary counters, and `ledger_update` / validator trace
+  events.
 - `src/tau2/agent/discrete_time_audio_native_agent.py` wires the controller
   into OpenAI audio-native session setup without changing baseline behavior.
 - `src/tau2/orchestrator/full_duplex_orchestrator.py` records assistant
@@ -215,6 +217,10 @@ remains validator-free; the pre-write validator is active only for
 - [x] Add `scripts/stagegate_final_run_hygiene.py` to reject final-run manifests
   with task filters, non-regular speech, missing condition/domain coverage, or
   inconsistent settings across conditions.
+- [x] Add Milestone 7.5 StageGate hardening before paid voice smoke tests:
+  per-run `advance_stage` loop guard defaults, stage-scoped packets, fallback
+  packets, `stage_loop_guard_triggered` events, and trace summary payloads on
+  `trace_summary` and `run_end`.
 
 ## Tests
 
@@ -266,6 +272,11 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
 - read-only tools are not overblocked;
 - validator leakage guards show no task objective, expected final DB,
   user-simulator private state, evaluator result, or task-ID routing inputs.
+- StageGate hardening tests cover max `advance_stage` call guard, repeated
+  stage guard, repeated blocker guard, guard trace emission, fallback packet
+  no-crash/no-mutation behavior, stage-scoped missing facts, identity-stage
+  exclusion of later-stage facts in retail/airline/telecom, StageGate ledger
+  enrichment, and trace summary counters.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -352,6 +363,26 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 sensitive logging follow-up:
   `make check-all` result: `All checks passed!` and
   `329 files left unchanged`.
+- 2026-05-10 Milestone 7.5 hardening:
+  `uv run --extra dev --extra voice python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after stage packet and loop guard changes:
+  `55 passed, 2 warnings in 0.12s`.
+- 2026-05-10 Milestone 7.5 hardening:
+  `uv run --extra dev --extra voice python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `30 passed, 2 warnings in 0.09s`.
+- 2026-05-10 Milestone 7.5 hardening:
+  `make format` result: `2 files reformatted, 327 files left unchanged`.
+- 2026-05-10 Milestone 7.5 hardening:
+  `make check-all` result: `All checks passed!` and
+  `329 files left unchanged`.
+- 2026-05-10 Milestone 7.5 review follow-up:
+  `uv run --extra dev --extra voice python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after fixing StageOnly observed-fact hint matching:
+  `56 passed, 2 warnings in 0.14s`.
+- 2026-05-10 Milestone 7.5 review follow-up:
+  `uv run --extra dev --extra voice python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after treating slash-separated hint options as alternatives:
+  `57 passed, 2 warnings in 0.16s`.
 
 - `uv run pytest tests/test_streaming/test_stagegate.py -q` initially could
   not collect in the freshly created core-only environment. Direct import
@@ -573,11 +604,30 @@ Warnings observed in the passing focused and voice test commands:
 - 2026-05-09 cleanup review pass: Exact identifier mentions in the assistant's
   visible action summary use token-boundary matching so a neighboring ID cannot
   satisfy confirmation for the requested mutable record.
+- 2026-05-10 Milestone 7.5 hardening: StageOnly and StageGate now guard
+  repeated `advance_stage` calls without returning tool errors or mutating
+  domain state. The guard returns a final fallback stage packet and records
+  `stage_loop_guard_triggered`.
+- 2026-05-10 Milestone 7.5 hardening: Stage packets are scoped by stage and
+  public domain name. Identity/authentication packets intentionally avoid
+  asking for later-stage payment, fee, address, plan, device, or change facts
+  unless the user already raised them.
+- 2026-05-10 Milestone 7.5 hardening: Runtime trace summaries remain oracle-free
+  and include stage-call counts, validator allow/block counts, ledger update
+  count, final stage, stage sequence, last stage packet, and last validator or
+  corrective packet.
+- 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
+  now uses word-boundary tokenization, stopword filtering, and full-token
+  alternative matching. This prevents short words such as `or`, `and`, and `if`
+  from matching unrelated words and suppressing required stage hints.
+- 2026-05-10 Milestone 7.5 review follow-up: StageOnly observed-fact matching
+  treats slash-separated hint terms such as `payment/refund` as alternatives
+  instead of requiring both terms to appear.
 
 ## Remaining Work
 
 - Run a later one-task OpenAI audio-native smoke with credentials and runtime
-  budget available.
+  budget available after all Milestone 7.5 verification commands pass.
 
 ## Outcomes & Retrospective
 
