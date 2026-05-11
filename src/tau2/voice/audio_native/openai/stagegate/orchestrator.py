@@ -408,6 +408,50 @@ class StagePacketOrchestrator:
             ),
         )
 
+    def apply_entity_repair_guidance(
+        self,
+        *,
+        packet: StagePacket,
+        repair_snapshot: dict[str, object],
+    ) -> StagePacket:
+        """Return a packet that routes to concrete failed-lookup repair."""
+        value = str(repair_snapshot.get("normalized_value", "the failed value"))
+        source_tool = str(repair_snapshot.get("source_tool") or "the lookup tool")
+        return packet.model_copy(
+            update={
+                "stage": str(
+                    repair_snapshot.get("preferred_stage")
+                    or "collect_required_exact_entities"
+                ),
+                "objective": "Repair the failed exact entity lookup before continuing.",
+                "missing_facts": [
+                    "entity_repair_required",
+                    str(repair_snapshot.get("field", "identifier")),
+                ],
+                "ambiguous_facts": [],
+                "ask_next": entity_repair_ask_next(repair_snapshot),
+                "allowed_write_tools": [],
+                "disallowed_tools": ["transfer_to_human_agents"],
+                "next_required_steps": entity_repair_next_required_steps(
+                    repair_snapshot
+                ),
+                "next_tool_call": None,
+                "do_not": [
+                    f"Do not call {source_tool} again with {value}.",
+                    "Do not guess another exact identifier.",
+                    "Do not transfer to a human agent while this lookup can still be repaired.",
+                ],
+                "exit_condition": (
+                    "The failed identifier is corrected by the user or recovered "
+                    "from official authenticated context."
+                ),
+                "when_done": (
+                    "Use the corrected value or official context in the next "
+                    "read-tool call, then call advance_stage with the result."
+                ),
+            }
+        )
+
     def _known_facts(self, observed_facts: list[str]) -> dict[str, dict[str, str]]:
         return {
             f"observed_fact_{idx}": {"value": fact, "source": "advance_stage_args"}
@@ -893,6 +937,8 @@ class StagePacketOrchestrator:
         )
 
     def _fallback_ask_next(self, packet: StagePacket) -> str:
+        if packet.missing_facts and packet.missing_facts[0] == "entity_repair_required":
+            return packet.ask_next
         if packet.ambiguous_facts:
             return f"Ask one concise clarification question for {packet.ambiguous_facts[0]}."
         if packet.missing_facts:
@@ -945,4 +991,55 @@ def retail_replacement_progress_do_not_rules() -> list[str]:
         "Do not enumerate more product variants once a valid candidate has been selected.",
         "Do not ask another clarification if fallback preference resolved the choice.",
         "Do not call advance_stage before attempting the write after confirmation.",
+    ]
+
+
+def entity_repair_ask_next(repair_snapshot: dict[str, object]) -> str:
+    """Return concrete model-facing repair guidance for a failed lookup."""
+    field = str(repair_snapshot.get("field", "identifier"))
+    if field in {"customer_name", "passenger_name"}:
+        return (
+            "Ask the user to spell the name one character at a time. Use the "
+            "latest corrected name candidate unless that lookup also fails."
+        )
+    if field == "order_id":
+        return (
+            "Ask the user to spell the order ID one character at a time. If "
+            "authenticated user context is available, inspect that user's orders "
+            "rather than guessing another order ID."
+        )
+    return (
+        f"Ask the user to spell the {field} one character at a time, then retry "
+        "only with the corrected exact value."
+    )
+
+
+def entity_repair_next_required_steps(
+    repair_snapshot: dict[str, object],
+) -> list[dict[str, object]]:
+    """Return structured repair steps for failed lookup state."""
+    field = str(repair_snapshot.get("field", "identifier"))
+    source_tool = str(repair_snapshot.get("source_tool") or "the lookup tool")
+    value = str(repair_snapshot.get("normalized_value", "the failed value"))
+    return [
+        {
+            "step": "do_not_retry_failed_lookup",
+            "tool_name": source_tool,
+            "value": value,
+            "instruction": "Do not retry the same lookup with the same failed value.",
+        },
+        {
+            "step": "repair_exact_entity",
+            "field": field,
+            "instruction": (
+                f"Ask the user to spell the {field} one character at a time."
+            ),
+        },
+        {
+            "step": "use_official_context_if_available",
+            "instruction": (
+                "If authenticated context already exposes the relevant records, "
+                "recover from that official context instead of guessing."
+            ),
+        },
     ]

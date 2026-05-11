@@ -187,6 +187,8 @@ class RetailExchangeToolkit(ToolKitBase):
         Returns:
             User ID.
         """
+        if first_name.strip().lower() == "ayesuf":
+            raise ValueError("User not found")
         return "yusuf_rossi_9620"
 
     @is_tool(ToolType.READ)
@@ -222,6 +224,8 @@ class RetailExchangeToolkit(ToolKitBase):
         Returns:
             Order details.
         """
+        if order_id == "#W404":
+            raise ValueError("Order not found")
         return {
             "order_id": order_id,
             "user_id": "yusuf_rossi_9620",
@@ -575,6 +579,14 @@ def _exchange_tool_call(call_id: str = "call_exchange") -> ToolCall:
             "new_item_ids": ["7706410293", "7747408585"],
             "payment_method_id": "credit_card_9513926",
         },
+    )
+
+
+def _failed_order_lookup_call(call_id: str = "call_failed_order") -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name="get_order_details",
+        arguments={"order_id": "#W404"},
     )
 
 
@@ -1050,7 +1062,7 @@ def test_retail_order_and_item_reads_fill_item_id_compatibility_slot():
     assert item_ledger.slots["item_id"].value == "1151293680"
 
 
-def test_errored_tool_results_do_not_update_ledger():
+def test_errored_lookup_results_mark_failed_without_verifying_ledger():
     environment = _environment(domain_name="telecom")
     controller = StageGateController(
         condition="stagegate",
@@ -1074,7 +1086,10 @@ def test_errored_tool_results_do_not_update_ledger():
         tick_id=4,
     )
 
-    assert controller.ledger.slots["account_id"].status is LedgerStatus.MISSING
+    slot = controller.ledger.slots["account_id"]
+    assert slot.status is LedgerStatus.FAILED_LOOKUP
+    assert slot.normalized_value == "cust_123"
+    assert "account_id" not in controller.ledger.known_facts()
 
 
 def test_ledger_contradiction_surfaces_as_ambiguous_stage_fact():
@@ -1125,6 +1140,162 @@ def test_ledger_contradiction_surfaces_as_ambiguous_stage_fact():
         packet["ask_next"]
         == "Ask one concise clarification question for account_id: cust_123, cust_999."
     )
+
+
+def test_corrected_customer_name_supersedes_earlier_low_confidence_name():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_ayesuf",
+            name="find_user_id_by_name_zip",
+            arguments={
+                "first_name": "Ayesuf",
+                "last_name": "Rossi",
+                "zip": "19122",
+            },
+        ),
+        tick_id=1,
+    )
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_yusuf",
+            name="find_user_id_by_name_zip",
+            arguments={
+                "first_name": "Yusuf",
+                "last_name": "Rossi",
+                "zip": "19122",
+            },
+        ),
+        tick_id=2,
+    )
+
+    slot = controller.ledger.slots["customer_name"]
+    assert slot.normalized_value == "yusuf rossi"
+    assert slot.status is LedgerStatus.HEARD_NOT_CONFIRMED
+    assert slot.alternatives == []
+    assert slot.candidates[0].status is LedgerStatus.INVALIDATED_BY_CORRECTION
+    assert "customer_name: ayesuf rossi, yusuf rossi" not in (
+        controller.ledger.ambiguous_facts()
+    )
+
+
+def test_tool_verified_customer_name_dominates_hypothesized_name():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_model_function_call(
+        ToolCall(
+            id="call_ayesuf",
+            name="find_user_id_by_name_zip",
+            arguments={
+                "first_name": "Ayesuf",
+                "last_name": "Rossi",
+                "zip": "19122",
+            },
+        ),
+        tick_id=1,
+    )
+    controller.trace_domain_tool_result(
+        ToolCall(
+            id="call_user",
+            name="get_user_details",
+            arguments={"user_id": "yusuf_rossi_9620"},
+        ),
+        ToolMessage(
+            id="call_user",
+            role="tool",
+            content=json.dumps(environment.tools.get_user_details("yusuf_rossi_9620")),
+            error=False,
+        ),
+        tick_id=2,
+    )
+
+    slot = controller.ledger.slots["customer_name"]
+    assert slot.normalized_value == "yusuf rossi"
+    assert slot.status is LedgerStatus.TOOL_VERIFIED
+    assert slot.alternatives == []
+    assert slot.candidates[0].status is LedgerStatus.SUPERSEDED
+
+
+def test_failed_order_lookup_marks_order_id_failed_lookup(monkeypatch, tmp_path):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _failed_order_lookup_call(),
+        tick_id=1,
+    )
+
+    slot = controller.ledger.slots["order_id"]
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert result.error is True
+    assert slot.status is LedgerStatus.FAILED_LOOKUP
+    assert slot.normalized_value == "#w404"
+    assert controller.ledger.entity_repair_snapshot()["field"] == "order_id"
+    assert "ledger_value_failed_lookup" in event_types
+
+
+def test_repeated_failed_order_lookup_is_blocked_and_not_recommended(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    first = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _failed_order_lookup_call("call_failed_order_first"),
+        tick_id=1,
+    )
+    repeated = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _failed_order_lookup_call("call_failed_order_second"),
+        tick_id=2,
+    )
+
+    packet = json.loads(repeated.content)
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert first.error is True
+    assert repeated.error is True
+    assert packet["missing_facts"][0] == "repeated_failed_lookup_blocked"
+    assert "spell the order ID one character at a time" in packet["ask_next"]
+    assert any(
+        "Do not call get_order_details again" in rule for rule in packet["do_not"]
+    )
+    assert "repeated_failed_lookup_blocked" in event_types
 
 
 def test_ledger_update_trace_events_are_emitted(monkeypatch, tmp_path):
@@ -1320,6 +1491,112 @@ def test_guard_fallback_does_not_execute_domain_tool():
     assert json.loads(result.content)["allowed_write_tools"] == []
     assert environment.tools.write_count == 0
     environment.get_response.assert_not_called()
+
+
+def test_stagegate_understand_intent_repairs_after_domain_tool_call():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_find_user",
+            name="find_user_id_by_name_zip",
+            arguments={
+                "first_name": "Yusuf",
+                "last_name": "Rossi",
+                "zip": "19122",
+            },
+        ),
+        tick_id=1,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        observed_facts=["Lookup was attempted."],
+        last_action="find_user_id_by_name_zip returned user id",
+        tick_id=2,
+    )
+
+    assert result.error is False
+    assert packet["stage"] == "identify_or_authenticate"
+
+
+def test_stagegate_unknown_stage_repairs_after_domain_tool_call():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    result = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_get_order",
+            name="get_order_details",
+            arguments={"order_id": "#W2378156"},
+        ),
+        tick_id=1,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="authenticate_user",
+        observed_facts=["Order lookup was attempted."],
+        last_action="get_order_details returned order details",
+        tick_id=2,
+    )
+
+    assert result.error is False
+    assert packet["stage"] == "inspect_state_with_read_tools"
+
+
+def test_loop_guard_in_understand_intent_routes_to_entity_repair():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+        max_advance_stage_calls_per_sim=10,
+        max_repeated_same_stage=1,
+        max_repeated_same_blocker=10,
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _failed_order_lookup_call(),
+        tick_id=1,
+    )
+    first_packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        observed_facts=["Order lookup failed."],
+        last_action="get_order_details returned order not found",
+        tick_id=2,
+    )
+    guarded_packet = _advance_stage_packet(
+        controller,
+        current_stage="understand_intent",
+        observed_facts=["Order lookup still failed."],
+        last_action="get_order_details returned order not found",
+        tick_id=3,
+    )
+
+    assert first_packet["stage"] == "collect_required_exact_entities"
+    assert guarded_packet["stage"] == "collect_required_exact_entities"
+    assert guarded_packet["missing_facts"][0] == "entity_repair_required"
+    assert "spell the order ID one character at a time" in guarded_packet["ask_next"]
+    assert "transfer" not in guarded_packet["ask_next"].lower()
 
 
 def test_stage_packets_include_only_stage_scoped_missing_facts():
@@ -2418,6 +2695,46 @@ def test_transfer_to_human_blocked_during_resolvable_pending_write(
     _assert_retry_step(packet, "exchange_delivered_order_items")
     assert "transfer_blocked_pending_write" in event_types
     assert environment.tools.write_count == 0
+
+
+def test_transfer_to_human_blocked_during_repairable_entity_state(
+    monkeypatch,
+    tmp_path,
+):
+    trace_path = tmp_path / "trace_events.jsonl"
+    monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _failed_order_lookup_call(),
+        tick_id=1,
+    )
+    transfer = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_repairable",
+            name="transfer_to_human_agents",
+            arguments={"summary": "Order lookup failed."},
+        ),
+        tick_id=2,
+    )
+
+    packet = json.loads(transfer.content)
+    event_types = [
+        json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
+    ]
+    assert transfer.error is True
+    assert packet["missing_facts"][0] == "transfer_blocked_entity_repair"
+    assert "spell the order ID one character at a time" in packet["ask_next"]
+    assert "transfer_blocked_entity_repair" in event_types
 
 
 def test_transfer_to_human_allowed_without_resolvable_pending_write():

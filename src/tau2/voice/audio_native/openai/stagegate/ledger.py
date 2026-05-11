@@ -21,6 +21,9 @@ class LedgerStatus(str, Enum):
     USER_CONFIRMED = "user_confirmed"
     TOOL_VERIFIED = "tool_verified"
     CONTRADICTED = "contradicted"
+    FAILED_LOOKUP = "failed_lookup"
+    SUPERSEDED = "superseded"
+    INVALIDATED_BY_CORRECTION = "invalidated_by_correction"
     STALE = "stale"
 
 
@@ -35,6 +38,73 @@ class LedgerEvidence(BaseModel):
     normalized_value: Optional[str] = None
 
 
+class LedgerCandidate(BaseModel):
+    """One observed value for a slot, including inactive repair state."""
+
+    value: Any
+    normalized_value: str
+    status: LedgerStatus
+    confidence: float = 0.0
+    evidence: list[LedgerEvidence] = Field(default_factory=list)
+    first_seen_tick: Optional[int] = None
+    last_updated_tick: Optional[int] = None
+    failure_count: int = 0
+
+    def observe(
+        self,
+        *,
+        value: Any,
+        status: LedgerStatus,
+        evidence: LedgerEvidence,
+        confidence: float,
+    ) -> None:
+        """Update this candidate with another visible observation."""
+        self.value = value
+        self.evidence.append(evidence)
+        if self.first_seen_tick is None:
+            self.first_seen_tick = evidence.tick_index
+        self.last_updated_tick = evidence.tick_index
+        if self.status is LedgerStatus.FAILED_LOOKUP and status_rank(
+            status
+        ) < status_rank(LedgerStatus.TOOL_VERIFIED):
+            self.confidence = min(self.confidence, confidence)
+            return
+        if status_rank(status) >= status_rank(self.status):
+            self.status = status
+            self.confidence = confidence
+
+    def deactivate(
+        self,
+        *,
+        status: LedgerStatus,
+        evidence: LedgerEvidence,
+    ) -> None:
+        """Mark this candidate inactive using visible repair evidence."""
+        self.status = status
+        self.evidence.append(evidence)
+        self.last_updated_tick = evidence.tick_index
+
+    def mark_failed(self, *, evidence: LedgerEvidence) -> None:
+        """Mark this candidate as failed by an official lookup result."""
+        self.status = LedgerStatus.FAILED_LOOKUP
+        self.confidence = 0.0
+        self.failure_count += 1
+        self.evidence.append(evidence)
+        if self.first_seen_tick is None:
+            self.first_seen_tick = evidence.tick_index
+        self.last_updated_tick = evidence.tick_index
+
+    def packet_fact(self) -> dict[str, object]:
+        """Return a compact candidate representation for repair packets."""
+        return {
+            "value": self.value,
+            "normalized_value": self.normalized_value,
+            "status": self.status.value,
+            "failure_count": self.failure_count,
+            "last_updated_tick": self.last_updated_tick,
+        }
+
+
 class LedgerSlot(BaseModel):
     """A typed dialogue-state slot."""
 
@@ -47,6 +117,8 @@ class LedgerSlot(BaseModel):
     last_updated_turn: Optional[int] = None
     last_updated_tick: Optional[int] = None
     alternatives: list[str] = Field(default_factory=list)
+    candidates: list[LedgerCandidate] = Field(default_factory=list)
+    pending_events: list[dict[str, object]] = Field(default_factory=list, exclude=True)
 
     def observe(
         self,
@@ -66,28 +138,96 @@ class LedgerSlot(BaseModel):
         self.evidence.append(evidence)
         self.last_updated_turn = evidence.turn_index
         self.last_updated_tick = evidence.tick_index
+        candidate = self._candidate_for(normalized_value)
+        if candidate is None:
+            candidate = LedgerCandidate(
+                value=value,
+                normalized_value=normalized_value,
+                status=status,
+                confidence=confidence,
+                evidence=[],
+                first_seen_tick=evidence.tick_index,
+                last_updated_tick=evidence.tick_index,
+            )
+            self.candidates.append(candidate)
+        candidate.observe(
+            value=value,
+            status=status,
+            evidence=evidence,
+            confidence=confidence,
+        )
 
-        if (
-            self.normalized_value is not None
+        if status is LedgerStatus.TOOL_VERIFIED:
+            self._deactivate_other_candidates(
+                normalized_value=normalized_value,
+                status=LedgerStatus.SUPERSEDED,
+                evidence=evidence,
+                event_type="ledger_value_superseded",
+                reason="tool_verified_value_dominates",
+            )
+        elif self.field in SOFT_CORRECTION_FIELDS:
+            self._deactivate_other_candidates(
+                normalized_value=normalized_value,
+                status=LedgerStatus.INVALIDATED_BY_CORRECTION,
+                evidence=evidence,
+                event_type="ledger_value_superseded",
+                reason="later_corrected_value",
+                only_lower_confidence=True,
+            )
+        elif (
+            self.status is LedgerStatus.TOOL_VERIFIED
             and normalized_value != self.normalized_value
-            and self.status not in {LedgerStatus.MISSING, LedgerStatus.STALE}
         ):
-            self.status = LedgerStatus.CONTRADICTED
-            if normalized_value not in self.alternatives:
-                self.alternatives.append(normalized_value)
-            self.confidence = min(self.confidence, confidence)
-            return self._state_marker() != previous_state
+            candidate.deactivate(
+                status=LedgerStatus.SUPERSEDED,
+                evidence=evidence,
+            )
+            self._queue_event(
+                event_type="ledger_value_superseded",
+                candidate=candidate,
+                evidence=evidence,
+                reason="existing_tool_verified_value_dominates",
+            )
 
-        self.value = value
-        self.normalized_value = normalized_value
-        if (
-            self.status is LedgerStatus.CONTRADICTED
-            and normalized_value == self.normalized_value
-        ):
-            self.status = LedgerStatus.CONTRADICTED
-        elif status_rank(status) >= status_rank(self.status):
-            self.status = status
-            self.confidence = confidence
+        self._refresh_active_state()
+        return self._state_marker() != previous_state
+
+    def mark_failed_lookup(
+        self,
+        *,
+        value: Any,
+        evidence: LedgerEvidence,
+        reason: str,
+    ) -> bool:
+        """Mark a candidate as failed by an official lookup result."""
+        normalized_value = normalize_value(value)
+        if normalized_value is None:
+            return False
+        previous_state = self._state_marker()
+        evidence.normalized_value = normalized_value
+        self.evidence.append(evidence)
+        self.last_updated_turn = evidence.turn_index
+        self.last_updated_tick = evidence.tick_index
+        candidate = self._candidate_for(normalized_value)
+        if candidate is None:
+            candidate = LedgerCandidate(
+                value=value,
+                normalized_value=normalized_value,
+                status=LedgerStatus.FAILED_LOOKUP,
+                confidence=0.0,
+                evidence=[],
+                first_seen_tick=evidence.tick_index,
+                last_updated_tick=evidence.tick_index,
+            )
+            self.candidates.append(candidate)
+        candidate.mark_failed(evidence=evidence)
+        self._queue_event(
+            event_type="ledger_value_failed_lookup",
+            candidate=candidate,
+            evidence=evidence,
+            reason=reason,
+        )
+        self._refresh_active_state(prefer_failed=normalized_value)
         return self._state_marker() != previous_state
 
     def packet_fact(self) -> dict[str, object]:
@@ -101,11 +241,161 @@ class LedgerSlot(BaseModel):
             fact["source"] = self.evidence[-1].source
         return fact
 
-    def _state_marker(self) -> tuple[Optional[str], str, tuple[str, ...]]:
+    def active_candidates(self) -> list[LedgerCandidate]:
+        """Return candidates still usable for ordinary packet facts."""
+        return [
+            candidate
+            for candidate in self.candidates
+            if candidate.status not in INACTIVE_CANDIDATE_STATUSES
+        ]
+
+    def failed_candidates(self) -> list[LedgerCandidate]:
+        """Return candidates failed by official lookup evidence."""
+        return [
+            candidate
+            for candidate in self.candidates
+            if candidate.status is LedgerStatus.FAILED_LOOKUP
+        ]
+
+    def failed_lookup_for_value(self, value: Any) -> Optional[LedgerCandidate]:
+        """Return a failed candidate matching a proposed value."""
+        normalized_value = normalize_value(value)
+        if normalized_value is None:
+            return None
+        for candidate in self.failed_candidates():
+            if candidate.normalized_value == normalized_value:
+                return candidate
+        return None
+
+    def drain_pending_events(self) -> list[dict[str, object]]:
+        """Return and clear candidate repair events."""
+        events = list(self.pending_events)
+        self.pending_events.clear()
+        return events
+
+    def _candidate_for(self, normalized_value: str) -> Optional[LedgerCandidate]:
+        for candidate in self.candidates:
+            if candidate.normalized_value == normalized_value:
+                return candidate
+        return None
+
+    def _deactivate_other_candidates(
+        self,
+        *,
+        normalized_value: str,
+        status: LedgerStatus,
+        evidence: LedgerEvidence,
+        event_type: str,
+        reason: str,
+        only_lower_confidence: bool = False,
+    ) -> None:
+        for candidate in self.candidates:
+            if candidate.normalized_value == normalized_value:
+                continue
+            if candidate.status in INACTIVE_CANDIDATE_STATUSES:
+                continue
+            if only_lower_confidence and candidate.confidence > 0.7:
+                continue
+            candidate.deactivate(status=status, evidence=evidence)
+            self._queue_event(
+                event_type=event_type,
+                candidate=candidate,
+                evidence=evidence,
+                reason=reason,
+            )
+
+    def _refresh_active_state(self, *, prefer_failed: Optional[str] = None) -> None:
+        active = self.active_candidates()
+        if not active:
+            failed = self.failed_candidates()
+            if failed:
+                preferred = self._latest_candidate(
+                    [
+                        candidate
+                        for candidate in failed
+                        if candidate.normalized_value == prefer_failed
+                    ]
+                    or failed
+                )
+                self.value = preferred.value
+                self.normalized_value = preferred.normalized_value
+                self.status = LedgerStatus.FAILED_LOOKUP
+                self.confidence = 0.0
+                self.alternatives = []
+                return
+            self.value = None
+            self.normalized_value = None
+            self.status = LedgerStatus.MISSING
+            self.confidence = 0.0
+            self.alternatives = []
+            return
+        if len(active) == 1:
+            candidate = active[0]
+            self.value = candidate.value
+            self.normalized_value = candidate.normalized_value
+            self.status = candidate.status
+            self.confidence = candidate.confidence
+            self.alternatives = []
+            return
+        primary = active[0]
+        self.value = primary.value
+        self.normalized_value = primary.normalized_value
+        self.status = LedgerStatus.CONTRADICTED
+        self.confidence = min(candidate.confidence for candidate in active)
+        self.alternatives = [
+            candidate.normalized_value
+            for candidate in active[1:]
+            if candidate.normalized_value
+        ]
+
+    def _latest_candidate(
+        self,
+        candidates: list[LedgerCandidate],
+    ) -> LedgerCandidate:
+        return max(
+            candidates,
+            key=lambda candidate: (
+                candidate.last_updated_tick is not None,
+                candidate.last_updated_tick or -1,
+            ),
+        )
+
+    def _queue_event(
+        self,
+        *,
+        event_type: str,
+        candidate: LedgerCandidate,
+        evidence: LedgerEvidence,
+        reason: str,
+    ) -> None:
+        self.pending_events.append(
+            {
+                "event_type": event_type,
+                "field": self.field,
+                "normalized_value": candidate.normalized_value,
+                "status": candidate.status.value,
+                "source_tool": evidence.tool_name,
+                "failure_reason": reason,
+                "active_candidate_count": len(self.active_candidates()),
+                "tick_index": evidence.tick_index,
+            }
+        )
+
+    def _state_marker(
+        self,
+    ) -> tuple[Optional[str], str, tuple[str, ...], tuple[tuple[str, str, int], ...]]:
         return (
             self.normalized_value,
             self.status.value,
             tuple(self.alternatives),
+            tuple(
+                (
+                    candidate.normalized_value,
+                    candidate.status.value,
+                    candidate.failure_count,
+                )
+                for candidate in self.candidates
+            ),
         )
 
 
@@ -172,6 +462,51 @@ class EntityLedger(BaseModel):
             tick_index=tick_index,
         )
 
+    def update_from_failed_tool_result(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        content: Optional[str],
+        error: bool,
+        event_id: Optional[str] = None,
+        turn_index: Optional[int] = None,
+        tick_index: Optional[int] = None,
+    ) -> list[dict[str, object]]:
+        """Update slots from official failed lookup output."""
+        if not self.slots or not is_lookup_failure_result(
+            tool_name=tool_name,
+            content=content,
+            error=error,
+        ):
+            return []
+        facts = failed_lookup_facts_from_tool_args(
+            domain_name=self.domain_name,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        deltas: list[dict[str, object]] = []
+        for field, value in facts.items():
+            slot = self.slots.get(field)
+            if slot is None:
+                continue
+            evidence = LedgerEvidence(
+                source=EvidenceSource.DOMAIN_TOOL_OUTPUT.value,
+                event_id=event_id,
+                turn_index=turn_index,
+                tick_index=tick_index,
+                tool_name=tool_name,
+            )
+            slot.mark_failed_lookup(
+                value=value,
+                evidence=evidence,
+                reason="official_lookup_not_found",
+            )
+            deltas.append(
+                slot_delta(slot, source=EvidenceSource.DOMAIN_TOOL_OUTPUT.value)
+            )
+        return deltas
+
     def known_facts(self) -> dict[str, dict[str, object]]:
         """Return non-missing, non-ambiguous facts for a stage packet."""
         return {
@@ -183,6 +518,9 @@ class EntityLedger(BaseModel):
                 LedgerStatus.MISSING,
                 LedgerStatus.CONTRADICTED,
                 LedgerStatus.STALE,
+                LedgerStatus.FAILED_LOOKUP,
+                LedgerStatus.SUPERSEDED,
+                LedgerStatus.INVALIDATED_BY_CORRECTION,
             }
         }
 
@@ -191,7 +529,12 @@ class EntityLedger(BaseModel):
         return [
             field
             for field, slot in self.slots.items()
-            if slot.status in {LedgerStatus.MISSING, LedgerStatus.STALE}
+            if slot.status
+            in {
+                LedgerStatus.MISSING,
+                LedgerStatus.STALE,
+                LedgerStatus.FAILED_LOOKUP,
+            }
         ]
 
     def ambiguous_facts(self) -> list[str]:
@@ -199,10 +542,83 @@ class EntityLedger(BaseModel):
         ambiguous: list[str] = []
         for field, slot in self.slots.items():
             if slot.status is LedgerStatus.CONTRADICTED:
-                values = [slot.normalized_value, *slot.alternatives]
+                active_values = [
+                    candidate.normalized_value
+                    for candidate in slot.active_candidates()
+                    if candidate.normalized_value
+                ]
+                values = active_values or [slot.normalized_value, *slot.alternatives]
                 values_text = ", ".join(value for value in values if value)
                 ambiguous.append(f"{field}: {values_text}")
         return ambiguous
+
+    def entity_repair_snapshot(self) -> Optional[dict[str, object]]:
+        """Return the highest-priority repairable failed lookup state."""
+        failed: list[tuple[str, LedgerCandidate]] = []
+        for field, slot in self.slots.items():
+            active = slot.active_candidates()
+            for candidate in slot.failed_candidates():
+                later_active = [
+                    active_candidate
+                    for active_candidate in active
+                    if (active_candidate.last_updated_tick or -1)
+                    > (candidate.last_updated_tick or -1)
+                ]
+                if later_active:
+                    continue
+                failed.append((field, candidate))
+        if not failed:
+            return None
+        field, candidate = max(
+            failed,
+            key=lambda item: (
+                item[1].last_updated_tick is not None,
+                item[1].last_updated_tick or -1,
+            ),
+        )
+        return {
+            "field": field,
+            "value": candidate.value,
+            "normalized_value": candidate.normalized_value,
+            "status": candidate.status.value,
+            "source_tool": (
+                candidate.evidence[-1].tool_name if candidate.evidence else None
+            ),
+            "failure_count": candidate.failure_count,
+            "active_candidate_count": len(self.slots[field].active_candidates()),
+            "preferred_stage": repair_stage_for_field(field),
+        }
+
+    def failed_lookup_for_tool_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> Optional[dict[str, object]]:
+        """Return a repair snapshot if this call repeats a failed lookup."""
+        facts = failed_lookup_facts_from_tool_args(
+            domain_name=self.domain_name,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        for field, value in facts.items():
+            slot = self.slots.get(field)
+            if slot is None:
+                continue
+            candidate = slot.failed_lookup_for_value(value)
+            if candidate is None:
+                continue
+            return {
+                "field": field,
+                "value": candidate.value,
+                "normalized_value": candidate.normalized_value,
+                "status": candidate.status.value,
+                "source_tool": tool_name,
+                "failure_count": candidate.failure_count,
+                "active_candidate_count": len(slot.active_candidates()),
+                "preferred_stage": repair_stage_for_field(field),
+            }
+        return None
 
     def _update_from_payload(
         self,
@@ -329,12 +745,49 @@ FIELD_ALIASES = {
     },
 }
 
+INACTIVE_CANDIDATE_STATUSES = {
+    LedgerStatus.MISSING,
+    LedgerStatus.STALE,
+    LedgerStatus.FAILED_LOOKUP,
+    LedgerStatus.SUPERSEDED,
+    LedgerStatus.INVALIDATED_BY_CORRECTION,
+}
+
+SOFT_CORRECTION_FIELDS = {
+    "customer_name",
+    "passenger_name",
+}
+
+IDENTITY_REPAIR_FIELDS = {
+    "customer_name",
+    "passenger_name",
+    "email",
+    "phone",
+}
+
+EXACT_ID_REPAIR_FIELDS = {
+    "order_id",
+    "reservation_id",
+    "account_id",
+    "phone_line",
+    "flight_number",
+}
+
+LOOKUP_TOOL_PREFIXES = (
+    "find_",
+    "get_",
+    "search_",
+)
+
 
 def status_rank(status: LedgerStatus) -> int:
     """Return precedence used to avoid downgrading a slot."""
     return {
         LedgerStatus.MISSING: 0,
         LedgerStatus.STALE: 0,
+        LedgerStatus.FAILED_LOOKUP: 0,
+        LedgerStatus.SUPERSEDED: 0,
+        LedgerStatus.INVALIDATED_BY_CORRECTION: 0,
         LedgerStatus.HYPOTHESIZED: 1,
         LedgerStatus.HEARD_NOT_CONFIRMED: 2,
         LedgerStatus.REPEATED_BACK: 3,
@@ -375,6 +828,78 @@ def parse_tool_result(content: Optional[str]) -> Any:
     if isinstance(payload, str):
         return None
     return payload
+
+
+def is_lookup_failure_result(
+    *,
+    tool_name: str,
+    content: Optional[str],
+    error: bool,
+) -> bool:
+    """Return whether official tool output says a lookup failed."""
+    if not tool_name.startswith(LOOKUP_TOOL_PREFIXES):
+        return False
+    if error:
+        return True
+    if not content:
+        return False
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        payload = content
+    if isinstance(payload, str):
+        text = payload.lower()
+    elif isinstance(payload, dict):
+        text = json.dumps(payload, sort_keys=True, default=str).lower()
+    else:
+        text = str(payload).lower()
+    return any(
+        cue in text
+        for cue in (
+            "not found",
+            "no matching",
+            "no record",
+            "does not exist",
+            "unable to find",
+        )
+    )
+
+
+def failed_lookup_facts_from_tool_args(
+    *,
+    domain_name: Optional[str],
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract exact values that were just used in a failed lookup."""
+    domain = domain_name or ""
+    if domain not in DOMAIN_SLOTS:
+        return {}
+    facts: dict[str, Any] = {}
+    if tool_name == "find_user_id_by_name_zip":
+        name = compose_name(arguments)
+        if name:
+            facts["customer_name"] = name
+    for field, aliases in FIELD_ALIASES.get(domain, {}).items():
+        values = unique_values(values_by_key(arguments, aliases))
+        if values:
+            facts[field] = values[0] if len(values) == 1 else values
+    if not facts and tool_name.startswith("get_"):
+        for key, value in arguments.items():
+            if key.endswith("_id") and normalize_value(value) is not None:
+                facts[key] = value
+    return {
+        field: value for field, value in facts.items() if field in DOMAIN_SLOTS[domain]
+    }
+
+
+def repair_stage_for_field(field: str) -> str:
+    """Return the stage that should handle a failed lookup field."""
+    if field in IDENTITY_REPAIR_FIELDS:
+        return "identify_or_authenticate"
+    if field in EXACT_ID_REPAIR_FIELDS:
+        return "collect_required_exact_entities"
+    return "inspect_state_with_read_tools"
 
 
 def extract_domain_facts(
@@ -620,4 +1145,7 @@ def slot_delta(slot: LedgerSlot, *, source: str) -> dict[str, object]:
         delta["alternatives"] = list(slot.alternatives)
     if slot.evidence:
         delta["evidence"] = slot.evidence[-1].model_dump(mode="json")
+    events = slot.drain_pending_events()
+    if events:
+        delta["events"] = events
     return delta

@@ -284,7 +284,53 @@ class PreWriteValidator:
         current_stage: Optional[str] = None,
     ) -> ValidatorDecision:
         """Validate a domain tool call without calling the tool."""
+        repair_snapshot = (
+            ledger.entity_repair_snapshot() if ledger is not None else None
+        )
+        repeated_failed_lookup = (
+            ledger.failed_lookup_for_tool_call(
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+            )
+            if ledger is not None
+            else None
+        )
+        if repeated_failed_lookup is not None:
+            return ValidatorDecision(
+                decision="block",
+                reason="repeated_failed_lookup_blocked",
+                checks={
+                    "side_effecting_tool": False,
+                    "repairable_entity_state": True,
+                    "repeated_failed_lookup": True,
+                },
+                corrective_packet=build_entity_repair_corrective_packet(
+                    tool_call=tool_call,
+                    reason="repeated_failed_lookup_blocked",
+                    repair_snapshot=repeated_failed_lookup,
+                    read_tools=self._read_tool_names(),
+                ),
+            )
+
         if tool_call.name == TRANSFER_TOOL_NAME:
+            if (
+                repair_snapshot is not None
+                and int(repair_snapshot.get("failure_count", 0)) < 3
+            ):
+                return ValidatorDecision(
+                    decision="block",
+                    reason="transfer_blocked_entity_repair",
+                    checks={
+                        "side_effecting_tool": False,
+                        "repairable_entity_state": True,
+                    },
+                    corrective_packet=build_entity_repair_corrective_packet(
+                        tool_call=tool_call,
+                        reason="transfer_blocked_entity_repair",
+                        repair_snapshot=repair_snapshot,
+                        read_tools=self._read_tool_names(),
+                    ),
+                )
             transfer_block = self._transfer_block_for_pending_write(
                 tool_call,
                 tick_index=tick_index,
@@ -1470,6 +1516,58 @@ def build_corrective_packet(
     )
 
 
+def build_entity_repair_corrective_packet(
+    *,
+    tool_call: ToolCall,
+    reason: str,
+    repair_snapshot: dict[str, object],
+    read_tools: list[str],
+) -> StagePacket:
+    """Build a corrective packet for failed lookup repair."""
+    source_tool = str(repair_snapshot.get("source_tool") or tool_call.name)
+    value = str(repair_snapshot.get("normalized_value", "the failed value"))
+    field = str(repair_snapshot.get("field", "identifier"))
+    return StagePacket(
+        stage=str(
+            repair_snapshot.get("preferred_stage") or "collect_required_exact_entities"
+        ),
+        objective="Repair the failed exact entity lookup before continuing.",
+        known_facts={},
+        missing_facts=[reason, field],
+        ambiguous_facts=[],
+        ask_next=entity_repair_instruction(repair_snapshot),
+        allowed_read_tools=[
+            read_tool for read_tool in read_tools if read_tool != source_tool
+        ],
+        allowed_write_tools=[],
+        allowed_internal_tools=[],
+        disallowed_tools=["transfer_to_human_agents"],
+        next_required_steps=[
+            {
+                "step": "do_not_retry_failed_lookup",
+                "tool_name": source_tool,
+                "value": value,
+                "instruction": "Do not retry the same lookup with the same failed value.",
+            },
+            {
+                "step": "repair_exact_entity",
+                "field": field,
+                "instruction": (
+                    f"Ask the user to spell the {field} one character at a time."
+                ),
+            },
+        ],
+        next_tool_call=None,
+        do_not=[
+            f"Do not call {source_tool} again with {value}.",
+            "Do not guess another exact identifier.",
+            "Do not transfer while the entity lookup can still be repaired.",
+        ],
+        exit_condition="The failed exact value is corrected or recovered from official context.",
+        when_done="Retry only with a corrected exact value or official context.",
+    )
+
+
 def stage_for_reason(reason: str) -> str:
     """Map a block reason to the most relevant StageGate stage."""
     if reason in {
@@ -1485,6 +1583,23 @@ def stage_for_reason(reason: str) -> str:
     }:
         return "inspect_state_with_read_tools"
     return "propose_action_and_confirm"
+
+
+def entity_repair_instruction(repair_snapshot: dict[str, object]) -> str:
+    """Return repair instruction for a failed lookup corrective packet."""
+    field = str(repair_snapshot.get("field", "identifier"))
+    if field in {"customer_name", "passenger_name"}:
+        return (
+            "Ask the user to spell the name one character at a time. Use the "
+            "latest corrected name candidate unless that lookup also fails."
+        )
+    if field == "order_id":
+        return (
+            "Ask the user to spell the order ID one character at a time. If "
+            "authenticated user context is available, inspect that user's orders "
+            "rather than guessing another order ID."
+        )
+    return f"Ask the user to spell the {field} one character at a time."
 
 
 def corrective_instruction(*, tool_name: str, reason: str) -> str:
