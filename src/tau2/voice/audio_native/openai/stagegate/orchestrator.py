@@ -230,7 +230,7 @@ SLOT_LABELS = {
     "confirmation": "explicit user confirmation",
 }
 
-HINT_ALTERNATIVE_RE = re.compile(r"\s+or\s+|,")
+HINT_ALTERNATIVE_RE = re.compile(r"\s+or\s+|[,/]")
 HINT_TOKEN_RE = re.compile(r"[a-z0-9]+")
 HINT_STOPWORDS = frozenset(
     {
