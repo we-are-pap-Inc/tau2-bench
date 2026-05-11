@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -30,6 +29,8 @@ PendingWriteStatus = Literal[
     "needs_summary",
     "summarized",
     "confirmed",
+    "denied",
+    "unclear",
     "consumed",
     "expired",
     "mismatched_retry",
@@ -146,59 +147,6 @@ INSPECTION_TOOLS_BY_EXACT_ARG = {
     "user_id": {"get_user_details"},
 }
 
-ACTION_WORDS = {
-    "book",
-    "cancel",
-    "change",
-    "create",
-    "disable",
-    "enable",
-    "exchange",
-    "exchanging",
-    "modify",
-    "refund",
-    "resume",
-    "return",
-    "send",
-    "submit",
-    "suspend",
-    "swap",
-    "swapped",
-    "update",
-}
-
-CONSEQUENCE_WORDS = {
-    "card",
-    "charge",
-    "cost",
-    "credit",
-    "difference",
-    "email",
-    "fee",
-    "instruction",
-    "instructions",
-    "paid",
-    "payment",
-    "price",
-    "refund",
-    "request",
-    "status",
-}
-
-CONFIRMATION_PATTERNS = (
-    re.compile(
-        r"\b(confirm|confirmed|yes|yes please|yep|yeah|correct|proceed)\b", re.I
-    ),
-    re.compile(
-        r"\b(go ahead|please do|sounds good|that's right|that is right|okay,? do it)\b",
-        re.I,
-    ),
-)
-
-NEGATIVE_CONFIRMATION_PATTERN = re.compile(r"\b(no|don't|do not|stop|wait)\b", re.I)
-ASSISTANT_UTTERANCE_BUFFER_CHARS = 6000
-MAX_EVIDENCE_RECORDS = 30
-
 
 class ValidatorDecision(BaseModel):
     """A StageGate validator decision for one model tool call."""
@@ -243,26 +191,8 @@ class InspectionRecord:
 
 
 @dataclass
-class ActionSummaryEvidence:
-    """Visible assistant evidence for one pending side-effecting action."""
-
-    content: str
-    tick_index: Optional[int]
-    source: EvidenceSource
-
-
-@dataclass
-class UserConfirmationEvidence:
-    """Visible user evidence for confirming a pending action summary."""
-
-    content: str
-    tick_index: Optional[int]
-    source: EvidenceSource
-
-
-@dataclass
 class PendingWriteConfirmation:
-    """Concrete side-effecting write awaiting visible summary and confirmation."""
+    """Concrete side-effecting write awaiting structured summary and confirmation."""
 
     pending_write_id: str
     tool_name: str
@@ -271,12 +201,12 @@ class PendingWriteConfirmation:
     created_tick: Optional[int]
     created_stage: Optional[str]
     status: PendingWriteStatus
-    required_summary_facets: list[str]
-    summary_evidence: Optional[ActionSummaryEvidence] = None
-    confirmation_evidence: Optional[UserConfirmationEvidence] = None
+    summary_recorded_tick: Optional[int] = None
+    confirmation_recorded_tick: Optional[int] = None
+    user_turn_after_summary_seen: bool = False
     last_block_reason: Optional[str] = None
-    matched_facets: list[str] = field(default_factory=list)
-    missing_facets: list[str] = field(default_factory=list)
+    summary_action_type: Optional[str] = None
+    confirmation_basis: Optional[str] = None
 
     def snapshot(self) -> dict[str, object]:
         """Return trace-safe pending-write state without raw argument values."""
@@ -287,20 +217,12 @@ class PendingWriteConfirmation:
             "created_tick": self.created_tick,
             "created_stage": self.created_stage,
             "status": self.status,
-            "required_summary_facets": list(self.required_summary_facets),
-            "matched_facets": list(self.matched_facets),
-            "missing_facets": list(self.missing_facets),
-            "summary_evidence_tick": (
-                None
-                if self.summary_evidence is None
-                else self.summary_evidence.tick_index
-            ),
-            "confirmation_evidence_tick": (
-                None
-                if self.confirmation_evidence is None
-                else self.confirmation_evidence.tick_index
-            ),
+            "summary_recorded_tick": self.summary_recorded_tick,
+            "confirmation_recorded_tick": self.confirmation_recorded_tick,
+            "user_turn_after_summary_seen": self.user_turn_after_summary_seen,
             "last_block_reason": self.last_block_reason,
+            "summary_action_type": self.summary_action_type,
+            "confirmation_basis": self.confirmation_basis,
         }
 
 
@@ -310,16 +232,17 @@ class VisibleConversationState:
 
     read_inspections: list[InspectionRecord] = field(default_factory=list)
     verified_identifiers: dict[str, set[str]] = field(default_factory=dict)
-    assistant_utterance_buffer: str = ""
-    action_summaries: list[ActionSummaryEvidence] = field(default_factory=list)
-    user_confirmations: list[UserConfirmationEvidence] = field(default_factory=list)
-    last_action_statement: Optional[str] = None
-    last_action_statement_tick: Optional[int] = None
-    last_action_statement_source: Optional[EvidenceSource] = None
-    last_user_confirmation: Optional[str] = None
-    last_user_confirmation_tick: Optional[int] = None
-    last_user_confirmation_source: Optional[EvidenceSource] = None
+    latest_user_turn_tick: Optional[int] = None
+    user_turn_ticks: list[int] = field(default_factory=list)
     pending_write: Optional[PendingWriteConfirmation] = None
+
+
+class PendingWriteToolResult(BaseModel):
+    """Result for a StageGate internal pending-write protocol tool call."""
+
+    ok: bool
+    reason: str
+    pending_write: Optional[dict[str, object]] = None
 
 
 class PreWriteValidator:
@@ -376,8 +299,10 @@ class PreWriteValidator:
                 tool_call,
                 requirement,
             ),
-            "assistant_stated_action": False,
-            "user_confirmed": False,
+            "pending_write_exists": False,
+            "pending_write_summarized": False,
+            "pending_write_confirmed": False,
+            "pending_write_consumed": False,
         }
         reason_by_check = {
             "tool_arguments_complete": "incomplete_tool_arguments",
@@ -409,35 +334,50 @@ class PreWriteValidator:
             tick_index=tick_index,
             current_stage=current_stage,
         )
-        self._refresh_pending_write_summary(pending_write)
-        self._refresh_pending_write_confirmation(pending_write)
-        checks["assistant_stated_action"] = pending_write.summary_evidence is not None
-        checks["user_confirmed"] = pending_write.status == "confirmed"
+        checks["pending_write_exists"] = True
+        checks["pending_write_summarized"] = pending_write.status in {
+            "summarized",
+            "confirmed",
+            "consumed",
+        }
+        checks["pending_write_confirmed"] = pending_write.status == "confirmed"
+        checks["pending_write_consumed"] = pending_write.status == "consumed"
 
-        if not checks["assistant_stated_action"]:
-            pending_write.status = "needs_summary"
+        if pending_write.status == "confirmed":
+            return ValidatorDecision(
+                decision="allow",
+                reason="validated",
+                checks=checks,
+                pending_write_id=pending_write.pending_write_id,
+                args_fingerprint=pending_write.args_fingerprint,
+            )
+        if pending_write.status == "denied":
             return self._block(
                 tool_call,
-                reason="missing_action_summary",
+                reason="pending_write_denied",
                 checks=checks,
                 pending_write=pending_write,
             )
-        if not checks["user_confirmed"]:
-            pending_write.status = "summarized"
+        if pending_write.status == "unclear":
+            return self._block(
+                tool_call,
+                reason="pending_write_unclear",
+                checks=checks,
+                pending_write=pending_write,
+            )
+        if pending_write.status == "summarized":
             return self._block(
                 tool_call,
                 reason="missing_confirmation",
                 checks=checks,
                 pending_write=pending_write,
             )
-        return ValidatorDecision(
-            decision="allow",
-            reason="validated",
+        pending_write.status = "needs_summary"
+        return self._block(
+            tool_call,
+            reason="missing_action_summary",
             checks=checks,
-            pending_write_id=pending_write.pending_write_id,
-            args_fingerprint=pending_write.args_fingerprint,
-            matched_facets=list(pending_write.matched_facets),
-            missing_facets=list(pending_write.missing_facets),
+            pending_write=pending_write,
         )
 
     def record_visible_message(
@@ -447,13 +387,12 @@ class PreWriteValidator:
         content: Optional[str],
         tick_index: Optional[int] = None,
     ) -> None:
-        """Record legacy assistant text; user text requires explicit evidence."""
+        """Reject transcript text as validator evidence for pending writes."""
         if role == "assistant":
-            self.record_assistant_utterance(content=content, tick_index=tick_index)
             return
         raise ValueError(
             "UserMessage.content from audio-native chunks is simulator gold text; "
-            "use record_user_confirmation_evidence with AGENT_VISIBLE_TRANSCRIPT."
+            "use record_user_turn with AGENT_VISIBLE_TRANSCRIPT ordering only."
         )
 
     def record_assistant_utterance(
@@ -463,28 +402,33 @@ class PreWriteValidator:
         tick_index: Optional[int] = None,
         source: EvidenceSource | str = EvidenceSource.ASSISTANT_UTTERANCE,
     ) -> None:
-        """Record assistant-visible action summaries from model output."""
-        if not content:
-            return
+        """Accept assistant transcript events without using text for validation."""
         source = ensure_runtime_evidence_source(source)
         if source is not EvidenceSource.ASSISTANT_UTTERANCE:
             raise ValueError(
                 "assistant action evidence must use ASSISTANT_UTTERANCE source"
             )
-        self.state.assistant_utterance_buffer = trim_text(
-            f"{self.state.assistant_utterance_buffer}{content}",
-            max_chars=ASSISTANT_UTTERANCE_BUFFER_CHARS,
-        )
-        if looks_like_action_statement(self.state.assistant_utterance_buffer):
-            self._record_action_summary(
-                content=self.state.assistant_utterance_buffer,
-                tick_index=tick_index,
-                source=source,
-            )
+
+    def record_user_turn(
+        self,
+        *,
+        content: Optional[str],
+        tick_index: Optional[int] = None,
+        source: EvidenceSource | str,
+    ) -> None:
+        """Record user-turn ordering without parsing transcript semantics."""
+        source = ensure_runtime_evidence_source(source)
+        if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
+            return
+        if tick_index is not None:
+            self.state.latest_user_turn_tick = tick_index
+            self.state.user_turn_ticks.append(tick_index)
+            self.state.user_turn_ticks = self.state.user_turn_ticks[-50:]
             pending_write = self._active_pending_write()
             if pending_write is not None:
-                self._refresh_pending_write_summary(pending_write)
-                self._refresh_pending_write_confirmation(pending_write)
+                pending_write.user_turn_after_summary_seen = (
+                    self._user_turn_after_summary_seen(pending_write)
+                )
 
     def record_user_confirmation_evidence(
         self,
@@ -493,29 +437,12 @@ class PreWriteValidator:
         tick_index: Optional[int] = None,
         source: EvidenceSource | str,
     ) -> None:
-        """Record user confirmation only from model-path transcript evidence."""
-        if not content:
-            return
-        source = ensure_runtime_evidence_source(source)
-        if source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
-            return
-        if looks_like_user_confirmation(content):
-            evidence = UserConfirmationEvidence(
-                content=content,
-                tick_index=tick_index,
-                source=source,
-            )
-            self.state.user_confirmations.append(evidence)
-            self.state.user_confirmations = self.state.user_confirmations[
-                -MAX_EVIDENCE_RECORDS:
-            ]
-            self.state.last_user_confirmation = content
-            self.state.last_user_confirmation_tick = tick_index
-            self.state.last_user_confirmation_source = source
-            pending_write = self._active_pending_write()
-            if pending_write is not None:
-                self._refresh_pending_write_confirmation(pending_write)
-        self.state.assistant_utterance_buffer = ""
+        """Backward-compatible wrapper that records only user-turn ordering."""
+        self.record_user_turn(
+            content=content,
+            tick_index=tick_index,
+            source=source,
+        )
 
     def record_tool_result(
         self,
@@ -610,6 +537,136 @@ class PreWriteValidator:
         self._pending_write_events = []
         return events
 
+    def record_pending_write_summary(
+        self,
+        *,
+        pending_write_id: str,
+        summary_presented: bool,
+        action_type: str,
+        consequence_presented: bool,
+        confirmation_requested: bool,
+        notes: Optional[str] = None,
+        tick_index: Optional[int] = None,
+    ) -> PendingWriteToolResult:
+        """Record that the model completed the structured summary step."""
+        pending_write = self._active_pending_write()
+        if pending_write is None or pending_write.pending_write_id != pending_write_id:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_not_found",
+                pending_write=self.pending_write_snapshot(),
+            )
+        if not summary_presented:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="summary_not_presented",
+                pending_write=pending_write.snapshot(),
+            )
+        if not consequence_presented:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="consequence_not_presented",
+                pending_write=pending_write.snapshot(),
+            )
+        if not confirmation_requested:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="confirmation_not_requested",
+                pending_write=pending_write.snapshot(),
+            )
+        if not action_type.strip():
+            return PendingWriteToolResult(
+                ok=False,
+                reason="missing_action_type",
+                pending_write=pending_write.snapshot(),
+            )
+
+        pending_write.status = "summarized"
+        pending_write.summary_recorded_tick = tick_index
+        pending_write.summary_action_type = action_type.strip()
+        pending_write.user_turn_after_summary_seen = self._user_turn_after_summary_seen(
+            pending_write
+        )
+        self._queue_pending_write_event(
+            "pending_write_summary_recorded",
+            pending_write,
+            tick_index=tick_index,
+        )
+        return PendingWriteToolResult(
+            ok=True,
+            reason="summary_recorded",
+            pending_write=pending_write.snapshot(),
+        )
+
+    def record_pending_write_confirmation(
+        self,
+        *,
+        pending_write_id: str,
+        decision: str,
+        basis: str,
+        notes: Optional[str] = None,
+        tick_index: Optional[int] = None,
+    ) -> PendingWriteToolResult:
+        """Record the model's structured confirmation decision."""
+        if decision not in {"confirmed", "denied", "unclear"}:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="invalid_confirmation_decision",
+                pending_write=self.pending_write_snapshot(),
+            )
+        if basis not in {
+            "latest_user_turn",
+            "user_corrected_details",
+            "user_declined",
+            "unclear_response",
+        }:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="invalid_confirmation_basis",
+                pending_write=self.pending_write_snapshot(),
+            )
+        pending_write = self._active_pending_write()
+        if pending_write is None or pending_write.pending_write_id != pending_write_id:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_not_found",
+                pending_write=self.pending_write_snapshot(),
+            )
+        if pending_write.status != "summarized":
+            return PendingWriteToolResult(
+                ok=False,
+                reason="pending_write_not_summarized",
+                pending_write=pending_write.snapshot(),
+            )
+        pending_write.user_turn_after_summary_seen = self._user_turn_after_summary_seen(
+            pending_write
+        )
+        if not pending_write.user_turn_after_summary_seen:
+            return PendingWriteToolResult(
+                ok=False,
+                reason="missing_user_turn_after_summary",
+                pending_write=pending_write.snapshot(),
+            )
+
+        pending_write.confirmation_recorded_tick = tick_index
+        pending_write.confirmation_basis = basis
+        pending_write.status = decision
+        event_type = {
+            "confirmed": "pending_write_confirmed",
+            "denied": "pending_write_denied",
+            "unclear": "pending_write_unclear",
+        }[decision]
+        self._queue_pending_write_event(
+            event_type,
+            pending_write,
+            tick_index=tick_index,
+        )
+        return PendingWriteToolResult(
+            ok=True,
+            reason=f"confirmation_{decision}",
+            pending_write=pending_write.snapshot(),
+        )
+
     def mark_side_effecting_write_consumed(
         self,
         *,
@@ -656,12 +713,6 @@ class PreWriteValidator:
             args_fingerprint=None
             if pending_write is None
             else pending_write.args_fingerprint,
-            matched_facets=[]
-            if pending_write is None
-            else pending_write.matched_facets,
-            missing_facets=[]
-            if pending_write is None
-            else pending_write.missing_facets,
         )
 
     def _active_pending_write(self) -> Optional[PendingWriteConfirmation]:
@@ -758,7 +809,6 @@ class PreWriteValidator:
             created_tick=tick_index,
             created_stage=current_stage,
             status=status,
-            required_summary_facets=required_summary_facets_for_tool(tool_call.name),
         )
 
     def _pending_write_matches_tool_call(
@@ -771,172 +821,16 @@ class PreWriteValidator:
             and pending_write.args_fingerprint == args_fingerprint(tool_call.arguments)
         )
 
-    def _refresh_pending_write_summary(
+    def _user_turn_after_summary_seen(
         self,
-        pending_write: PendingWriteConfirmation,
-    ) -> None:
-        if pending_write.status in {"summarized", "confirmed", "consumed", "expired"}:
-            return
-        best_matched: list[str] = []
-        best_missing: list[str] = list(pending_write.required_summary_facets)
-        for summary in reversed(self.state.action_summaries):
-            matched, missing = self._pending_summary_facets(
-                pending_write,
-                summary.content,
-            )
-            if len(matched) > len(best_matched):
-                best_matched = matched
-                best_missing = missing
-            if not missing:
-                pending_write.summary_evidence = summary
-                pending_write.matched_facets = matched
-                pending_write.missing_facets = []
-                pending_write.status = "summarized"
-                self._queue_pending_write_event(
-                    "pending_write_summary_detected",
-                    pending_write,
-                    tick_index=summary.tick_index,
-                )
-                return
-        pending_write.matched_facets = best_matched
-        pending_write.missing_facets = best_missing
-
-    def _refresh_pending_write_confirmation(
-        self,
-        pending_write: PendingWriteConfirmation,
-    ) -> None:
-        if pending_write.status in {"confirmed", "consumed", "expired"}:
-            return
-        summary = pending_write.summary_evidence
-        if summary is None or summary.tick_index is None:
-            return
-        for confirmation in self.state.user_confirmations:
-            if confirmation.source is not EvidenceSource.AGENT_VISIBLE_TRANSCRIPT:
-                continue
-            if confirmation.tick_index is None:
-                continue
-            if confirmation.tick_index <= summary.tick_index:
-                continue
-            pending_write.confirmation_evidence = confirmation
-            pending_write.status = "confirmed"
-            self._queue_pending_write_event(
-                "pending_write_confirmed",
-                pending_write,
-                tick_index=confirmation.tick_index,
-            )
-            return
-
-    def _pending_summary_facets(
-        self,
-        pending_write: PendingWriteConfirmation,
-        content: str,
-    ) -> tuple[list[str], list[str]]:
-        if pending_write.tool_name == "exchange_delivered_order_items":
-            matched = self._exchange_pending_summary_facets(pending_write, content)
-        else:
-            matched = self._generic_pending_summary_facets(pending_write, content)
-        required = list(pending_write.required_summary_facets)
-        missing = [facet for facet in required if facet not in matched]
-        return [facet for facet in required if facet in matched], missing
-
-    def _exchange_pending_summary_facets(
-        self,
-        pending_write: PendingWriteConfirmation,
-        content: str,
-    ) -> set[str]:
-        normalized = normalize_value(content) or ""
-        matched: set[str] = set()
-        if re.search(r"\b(exchange|exchanging|exchanged|swap|swapped)\b", normalized):
-            matched.add("action_type")
-        old_values = string_values(pending_write.normalized_args.get("item_ids"))
-        new_values = string_values(pending_write.normalized_args.get("new_item_ids"))
-        if self._summary_mentions_all_values(normalized, old_values) or (
-            len(
-                self._descriptor_tokens_for_values(set(old_values))
-                & meaningful_tokens(normalized)
-            )
-            >= 3
-        ):
-            matched.add("old_items")
-        if self._summary_mentions_all_values(normalized, new_values) or (
-            len(
-                self._descriptor_tokens_for_values(set(new_values))
-                & meaningful_tokens(normalized)
-            )
-            >= 3
-        ):
-            matched.add("new_items")
-        if self._pending_write_needs_payment_consequence(pending_write):
-            if any(word in normalized for word in CONSEQUENCE_WORDS):
-                matched.add("consequence")
-        else:
-            matched.add("consequence")
-        if summary_requests_confirmation(normalized):
-            matched.add("confirmation_request")
-        return matched
-
-    def _generic_pending_summary_facets(
-        self,
-        pending_write: PendingWriteConfirmation,
-        content: str,
-    ) -> set[str]:
-        normalized = normalize_value(content) or ""
-        matched: set[str] = set()
-        if looks_like_action_statement(content):
-            matched.add("action_type")
-            matched.add("consequence")
-        if self._summary_mentions_pending_exact_args(normalized, pending_write):
-            matched.add("record_reference")
-        if summary_requests_confirmation(normalized):
-            matched.add("confirmation_request")
-        return matched
-
-    def _summary_mentions_pending_exact_args(
-        self,
-        normalized_summary: str,
         pending_write: PendingWriteConfirmation,
     ) -> bool:
-        exact_args = exact_identifier_args_for_tool(pending_write.tool_name)
-        if not exact_args:
-            return True
-        for arg_name in exact_args:
-            values = self._pending_write_arg_values(pending_write, arg_name)
-            if not values:
-                return False
-            if not self._summary_mentions_all_values(normalized_summary, values):
-                return False
-        return True
-
-    def _pending_write_arg_values(
-        self,
-        pending_write: PendingWriteConfirmation,
-        arg_name: str,
-    ) -> list[str]:
-        if arg_name in pending_write.normalized_args:
-            return string_values(pending_write.normalized_args.get(arg_name))
-        if arg_name == SERVICE_TASK_REF:
-            values: list[str] = []
-            for raw_name, raw_value in pending_write.normalized_args.items():
-                if is_identifier_arg_name(raw_name):
-                    values.extend(string_values(raw_value))
-            return values
-        return []
-
-    def _summary_mentions_all_values(
-        self,
-        normalized_summary: str,
-        values: list[str],
-    ) -> bool:
-        return bool(values) and all(
-            normalized_text_mentions_value(normalized_summary, value)
-            for value in values
+        if pending_write.summary_recorded_tick is None:
+            return False
+        return any(
+            tick > pending_write.summary_recorded_tick
+            for tick in self.state.user_turn_ticks
         )
-
-    def _pending_write_needs_payment_consequence(
-        self,
-        pending_write: PendingWriteConfirmation,
-    ) -> bool:
-        return bool(pending_write.normalized_args.get("payment_method_id"))
 
     def _queue_pending_write_event(
         self,
@@ -1019,177 +913,6 @@ class PreWriteValidator:
             for inspection in self.state.read_inspections
         )
 
-    def _record_action_summary(
-        self,
-        *,
-        content: str,
-        tick_index: Optional[int],
-        source: EvidenceSource,
-    ) -> None:
-        summary = ActionSummaryEvidence(
-            content=content,
-            tick_index=tick_index,
-            source=source,
-        )
-        self.state.action_summaries.append(summary)
-        self.state.action_summaries = self.state.action_summaries[
-            -MAX_EVIDENCE_RECORDS:
-        ]
-        self.state.last_action_statement = content
-        self.state.last_action_statement_tick = tick_index
-        self.state.last_action_statement_source = source
-
-    def _assistant_stated_action(
-        self,
-        requirement: ActionRequirement,
-        matching_summary: Optional[ActionSummaryEvidence],
-    ) -> bool:
-        if not requirement.requires_action_statement:
-            return True
-        return matching_summary is not None
-
-    def _user_confirmed(
-        self,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-        *,
-        matching_summary: Optional[ActionSummaryEvidence],
-    ) -> bool:
-        if not requirement.requires_user_confirmation:
-            return True
-        if matching_summary is None or matching_summary.tick_index is None:
-            return False
-        return any(
-            confirmation.source is EvidenceSource.AGENT_VISIBLE_TRANSCRIPT
-            and confirmation.tick_index is not None
-            and confirmation.tick_index > matching_summary.tick_index
-            for confirmation in self.state.user_confirmations
-        )
-
-    def _matching_action_summary(
-        self,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-    ) -> Optional[ActionSummaryEvidence]:
-        if not requirement.requires_action_statement:
-            return None
-        for summary in reversed(self.state.action_summaries):
-            if self._action_summary_matches_tool_call(summary, tool_call, requirement):
-                return summary
-        return None
-
-    def _action_summary_matches_tool_call(
-        self,
-        summary: ActionSummaryEvidence,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-    ) -> bool:
-        if summary.source is not EvidenceSource.ASSISTANT_UTTERANCE:
-            return False
-        if not looks_like_action_statement(summary.content):
-            return False
-        if tool_call.name == "exchange_delivered_order_items":
-            return self._exchange_summary_matches_tool_call(summary.content, tool_call)
-        return self._action_statement_mentions_exact_args(
-            summary.content,
-            tool_call,
-            requirement,
-        )
-
-    def _exchange_summary_matches_tool_call(
-        self,
-        content: str,
-        tool_call: ToolCall,
-    ) -> bool:
-        normalized = normalize_value(content) or ""
-        if not re.search(
-            r"\b(exchange|exchanging|exchanged|swap|swapped)\b", normalized
-        ):
-            return False
-        if not summary_requests_confirmation(normalized):
-            return False
-        if not self._summary_mentions_exchange_items(normalized, tool_call):
-            return False
-        if self._summary_mentions_order_reference(normalized, tool_call):
-            return True
-        return self._summary_mentions_all_exchange_item_ids(normalized, tool_call)
-
-    def _summary_mentions_order_reference(
-        self,
-        normalized_summary: str,
-        tool_call: ToolCall,
-    ) -> bool:
-        order_id = normalize_value(tool_call.arguments.get("order_id"))
-        if order_id and normalized_text_mentions_value(normalized_summary, order_id):
-            return True
-        return "order" in normalized_summary
-
-    def _summary_mentions_exchange_items(
-        self,
-        normalized_summary: str,
-        tool_call: ToolCall,
-    ) -> bool:
-        old_item_ids = {
-            normalize_value(value)
-            for value in iter_values(tool_call.arguments.get("item_ids"))
-        }
-        new_item_ids = {
-            normalize_value(value)
-            for value in iter_values(tool_call.arguments.get("new_item_ids"))
-        }
-        old_item_ids.discard(None)
-        new_item_ids.discard(None)
-        mentioned_old = {
-            value
-            for value in old_item_ids
-            if normalized_text_mentions_value(normalized_summary, value)
-        }
-        mentioned_new = {
-            value
-            for value in new_item_ids
-            if normalized_text_mentions_value(normalized_summary, value)
-        }
-        if mentioned_old and mentioned_new:
-            return True
-
-        target_values = old_item_ids | new_item_ids
-        descriptor_tokens = self._descriptor_tokens_for_values(target_values)
-        summary_tokens = meaningful_tokens(normalized_summary)
-        return len(summary_tokens & descriptor_tokens) >= 3
-
-    def _summary_mentions_all_exchange_item_ids(
-        self,
-        normalized_summary: str,
-        tool_call: ToolCall,
-    ) -> bool:
-        old_item_ids = {
-            normalize_value(value)
-            for value in iter_values(tool_call.arguments.get("item_ids"))
-        }
-        new_item_ids = {
-            normalize_value(value)
-            for value in iter_values(tool_call.arguments.get("new_item_ids"))
-        }
-        old_item_ids.discard(None)
-        new_item_ids.discard(None)
-        all_item_ids = old_item_ids | new_item_ids
-        return bool(all_item_ids) and all(
-            normalized_text_mentions_value(normalized_summary, value)
-            for value in all_item_ids
-        )
-
-    def _descriptor_tokens_for_values(self, normalized_values: set[str]) -> set[str]:
-        if not normalized_values:
-            return set()
-        tokens: set[str] = set()
-        for inspection in self.state.read_inspections:
-            for text in descriptor_strings_for_values(
-                inspection.payload,
-                normalized_values,
-            ):
-                tokens.update(meaningful_tokens(text))
-        return tokens
-
     def _is_value_verified(
         self,
         arg_name: str,
@@ -1204,7 +927,7 @@ class PreWriteValidator:
             return True
         if self._ledger_verifies_value(arg_name, normalized, ledger):
             return True
-        return self._last_confirmed_action_mentions(normalized)
+        return False
 
     def _ledger_verifies_value(
         self,
@@ -1228,36 +951,6 @@ class PreWriteValidator:
             if any(normalize_value(value) == normalized for value in slot_values):
                 return True
         return False
-
-    def _last_confirmed_action_mentions(self, normalized_value: str) -> bool:
-        if self.state.last_action_statement is None:
-            return False
-        statement = normalize_value(self.state.last_action_statement)
-        if statement is None:
-            return False
-        return normalized_text_mentions_value(statement, normalized_value)
-
-    def _action_statement_mentions_exact_args(
-        self,
-        statement: str,
-        tool_call: ToolCall,
-        requirement: ActionRequirement,
-    ) -> bool:
-        normalized_statement = normalize_value(statement)
-        if normalized_statement is None:
-            return False
-        for arg_name in requirement.exact_args:
-            values = list(self._tool_argument_values(tool_call, arg_name))
-            if not values:
-                return False
-            for value in values:
-                normalized = normalize_value(value)
-                if normalized is not None and not normalized_text_mentions_value(
-                    normalized_statement,
-                    normalized,
-                ):
-                    return False
-        return True
 
     def _inspection_matches_tool_call(
         self,
@@ -1525,20 +1218,6 @@ def precondition_field_present(keys: set[str], field: str) -> bool:
     return bool(keys & aliases)
 
 
-def normalized_text_mentions_value(text: str, value: str) -> bool:
-    """Return whether normalized text contains value as a distinct token."""
-    if not value:
-        return False
-    return (
-        re.search(
-            rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])",
-            text,
-            flags=re.I,
-        )
-        is not None
-    )
-
-
 def canonicalize_for_fingerprint(value: Any) -> Any:
     """Return stable, trace-safe normalized data for pending-write matching."""
     if isinstance(value, dict):
@@ -1562,42 +1241,6 @@ def args_fingerprint(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def required_summary_facets_for_tool(tool_name: str) -> list[str]:
-    """Return summary facets needed to confirm one pending write."""
-    if tool_name == "exchange_delivered_order_items":
-        return [
-            "action_type",
-            "old_items",
-            "new_items",
-            "consequence",
-            "confirmation_request",
-        ]
-    return [
-        "action_type",
-        "record_reference",
-        "consequence",
-        "confirmation_request",
-    ]
-
-
-def string_values(value: Any) -> list[str]:
-    """Return flattened normalized string values."""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        values: list[str] = []
-        for item in value:
-            values.extend(string_values(item))
-        return values
-    if isinstance(value, dict):
-        values = []
-        for item in value.values():
-            values.extend(string_values(item))
-        return values
-    normalized = normalize_value(value)
-    return [] if normalized is None else [normalized]
-
-
 def build_corrective_packet(
     *,
     tool_call: ToolCall,
@@ -1618,8 +1261,14 @@ def build_corrective_packet(
             f"Do not call {tool_call.name} again until the missing prerequisite is satisfied.",
             "Do not call advance_stage before retrying the original write tool.",
         ],
-        exit_condition="The missing prerequisite is visible in conversation, ledger, or official read-tool state.",
-        when_done=f"After the user confirms, retry {tool_call.name} directly.",
+        exit_condition=(
+            "The pending write has a structured summary record and a structured "
+            "confirmed decision after a later user turn."
+        ),
+        when_done=(
+            f"After record_pending_write_confirmation returns confirmed, retry "
+            f"{tool_call.name} directly with the same arguments."
+        ),
     )
 
 
@@ -1644,22 +1293,35 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     """Return concise corrective text for the model."""
     if reason == "missing_confirmation":
         return (
-            f"State the pending {tool_call.name} action and consequence, ask "
-            "for explicit confirmation, then retry the same original write "
-            "tool directly after the user confirms."
+            f"After the user responds, call record_pending_write_confirmation "
+            f"for the pending {tool_call.name}; if confirmed, retry the same "
+            "original domain write tool directly."
         )
     if reason == "missing_action_summary":
         return (
             "State the pending action and consequence, ask for explicit "
-            "confirmation, then retry the same original write tool directly "
-            "after the user confirms."
+            "confirmation, call record_pending_write_summary, then after the "
+            "user responds call record_pending_write_confirmation. If confirmed, "
+            "retry the same original domain write tool directly."
         )
     if reason == "pending_write_mismatch":
         return (
             "The retried write differs from the confirmed pending action. "
-            "State the changed pending action and consequence, ask for explicit "
-            "confirmation, then retry the same write tool directly after the "
-            "user confirms."
+            "Summarize the changed pending action and consequence, call "
+            "record_pending_write_summary, then after the user responds call "
+            "record_pending_write_confirmation. If confirmed, retry the same "
+            "domain write tool directly."
+        )
+    if reason == "pending_write_denied":
+        return (
+            "The user declined the pending write. Do not retry the write unless "
+            "a changed pending action is summarized and confirmed through the "
+            "pending-write tools."
+        )
+    if reason == "pending_write_unclear":
+        return (
+            "The user response was unclear. Ask for clarification, then call "
+            "record_pending_write_confirmation again after the next user response."
         )
     if reason == "missing_policy_state_inspection":
         return (
@@ -1668,121 +1330,12 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
     if reason == "missing_policy_precondition_state":
         return "Inspect the policy-relevant state needed to establish the precondition first."
     if reason == "missing_verified_identifier":
-        return "Verify the exact identifier with a read tool or explicit user confirmation."
+        return "Verify the exact identifier with an official read tool."
     if reason == "missing_verified_identity":
         return "Authenticate or verify the account identity with an official read tool first."
     if reason == "ambiguous_tool_arguments":
         return "Ask one clarification question to resolve the ambiguous tool argument."
     return "Collect the missing required tool argument before retrying."
-
-
-def trim_text(text: str, *, max_chars: int) -> str:
-    """Keep only the recent transcript text needed for validator evidence."""
-    if len(text) <= max_chars:
-        return text
-    return text[-max_chars:]
-
-
-def looks_like_action_statement(content: str) -> bool:
-    """Detect a visible assistant statement of intended action and consequence."""
-    normalized = normalize_value(content)
-    if normalized is None:
-        return False
-    has_action = any(word in normalized for word in ACTION_WORDS)
-    has_consequence = any(word in normalized for word in CONSEQUENCE_WORDS)
-    return has_action and has_consequence
-
-
-def looks_like_user_confirmation(content: str) -> bool:
-    """Detect an affirmative user confirmation from visible transcript text."""
-    if NEGATIVE_CONFIRMATION_PATTERN.search(content):
-        return False
-    return any(pattern.search(content) for pattern in CONFIRMATION_PATTERNS)
-
-
-def summary_requests_confirmation(normalized_content: str) -> bool:
-    """Return whether an assistant summary asked the user to confirm/proceed."""
-    return any(
-        cue in normalized_content
-        for cue in (
-            "confirm",
-            "please reply yes",
-            "please say yes",
-            "say yes",
-            "reply yes",
-            "proceed",
-        )
-    )
-
-
-def meaningful_tokens(text: str) -> set[str]:
-    """Return compact content tokens for matching summaries to read-tool payloads."""
-    stopwords = {
-        "and",
-        "any",
-        "are",
-        "for",
-        "from",
-        "item",
-        "items",
-        "order",
-        "the",
-        "this",
-        "that",
-        "will",
-        "with",
-        "your",
-    }
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", text.lower())
-        if len(token) > 2 and token not in stopwords and not token.isdigit()
-    }
-
-
-def descriptor_strings_for_values(
-    payload: Any,
-    normalized_values: set[str],
-) -> list[str]:
-    """Collect string descriptors from payload objects containing target IDs."""
-    descriptors: list[str] = []
-    if isinstance(payload, dict):
-        if payload_contains_normalized_value(payload, normalized_values):
-            descriptors.extend(string_leaf_values(payload))
-        for value in payload.values():
-            descriptors.extend(descriptor_strings_for_values(value, normalized_values))
-    elif isinstance(payload, list):
-        for item in payload:
-            descriptors.extend(descriptor_strings_for_values(item, normalized_values))
-    return descriptors
-
-
-def payload_contains_normalized_value(
-    payload: dict[str, Any], values: set[str]
-) -> bool:
-    """Return whether a dictionary contains one of the target normalized values."""
-    for value in payload.values():
-        if isinstance(value, (dict, list)):
-            continue
-        normalized = normalize_value(value)
-        if normalized in values:
-            return True
-    return False
-
-
-def string_leaf_values(payload: Any) -> list[str]:
-    """Return all non-ID string leaves from a payload subtree."""
-    values: list[str] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            if isinstance(value, str) and not key.lower().endswith("_id"):
-                values.append(value)
-            elif isinstance(value, (dict, list)):
-                values.extend(string_leaf_values(value))
-    elif isinstance(payload, list):
-        for item in payload:
-            values.extend(string_leaf_values(item))
-    return values
 
 
 def is_empty_value(value: Any) -> bool:

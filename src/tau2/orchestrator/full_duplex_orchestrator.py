@@ -588,6 +588,11 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
                 tool_call,
                 tick_id=tick_id,
             )
+        if stagegate_controller.is_pending_write_tool(tool_call):
+            return stagegate_controller.handle_pending_write_tool(
+                tool_call,
+                tick_id=tick_id,
+            )
 
         validator_decision = stagegate_controller.validate_tool_call(
             tool_call,

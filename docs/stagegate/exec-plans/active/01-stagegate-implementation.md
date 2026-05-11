@@ -221,13 +221,14 @@ remains validator-free; the pre-write validator is active only for
   per-run `advance_stage` loop guard defaults, stage-scoped packets, fallback
   packets, `stage_loop_guard_triggered` events, and trace summary payloads on
   `trace_summary` and `run_end`.
-- [x] Add structural pending-write confirmation state to the pre-write
-  validator. Side-effecting write attempts now create a pending write keyed by
-  tool name and stable argument fingerprint, assistant summaries and user
-  confirmations are matched to that pending write, mismatched retries are
-  blocked, and successful domain-tool results consume the pending write.
-- [x] Emit pending-write trace events for creation, summary detection,
-  confirmation, mismatched retry, consumption, and expiration.
+- [x] Replace transcript-pattern confirmation with a structured pending-write
+  protocol. Side-effecting write attempts now create a pending write keyed by
+  tool name and stable argument fingerprint; the model must call
+  `record_pending_write_summary` and `record_pending_write_confirmation` before
+  the same fingerprinted retry is allowed.
+- [x] Emit pending-write trace events for creation, structured summary record,
+  structured confirmation/denial/unclear decisions, mismatched retry, and
+  consumption.
 - [x] Gate `advance_stage` with pending-write state so unconsumed pending writes
   cannot drift to `verify_result_and_close`.
 
@@ -286,11 +287,13 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   no-crash/no-mutation behavior, stage-scoped missing facts, identity-stage
   exclusion of later-stage facts in retail/airline/telecom, StageGate ledger
   enrichment, and trace summary counters.
-- pending-write tests cover blocked exchange creation, summary and `Yes` retry,
-  summary and `Yeah` retry, no-order-ID exact item summaries, confirmation
-  before summary, changed-argument mismatch blocks, corrective direct-retry
-  packet text, stage guard behavior for blocked/confirmed/consumed writes,
-  pending-write trace events, and baseline/StageOnly absence of validator state.
+- pending-write tests cover blocked exchange creation, structured summary
+  recording, structured confirmation after a later user turn, same-fingerprint
+  retry allow, changed-argument mismatch blocks, denied/unclear decisions
+  blocking retry, corrective direct-retry packet text, stage guard behavior for
+  blocked/confirmed/consumed writes, pending-write trace events,
+  baseline/StageOnly absence of validator state, and absence of semantic
+  transcript regex in the validator source.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -630,6 +633,29 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-10 structural pending-write confirmation:
   `npm run format`, `npm run check`, and `npm run lint` all failed with npm
   `ENOENT` because this repository has no root `package.json`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result after formatting: `70 passed, 2 warnings in 0.25s`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-10 structured pending-write protocol:
+  `make format` result: `2 files reformatted, 327 files left unchanged`;
+  `make check-all` result: `All checks passed!` and `329 files left unchanged`.
+- 2026-05-10 structured pending-write protocol:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 structured pending-write protocol:
+  local smoke_008 trace replay against
+  `/private/tmp/stagegate_smoke_008_stagegate_trace_events.jsonl` shows direct
+  replay blocks as `missing_action_summary` because the historical trace lacks
+  the new internal protocol events. Injecting the structured
+  `record_pending_write_summary` / later user turn /
+  `record_pending_write_confirmation` sequence for the same fingerprint returns
+  `allow` / `validated`.
+- 2026-05-10 structured pending-write protocol:
+  `npm run format`, `npm run check`, and `npm run lint` all failed with npm
+  `ENOENT` because this repository has no root `package.json`.
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -741,6 +767,11 @@ Warnings observed in the passing focused and voice test commands:
   close a write-intent path while the pending write is `needs_summary`,
   `summarized`, `confirmed`, or `mismatched_retry`; only a consumed successful
   side-effecting domain-tool result permits closeout.
+- 2026-05-10 structured pending-write protocol: The validator no longer parses
+  assistant or user transcript text for summary or consent. The only write
+  confirmation path is a StageGate-only internal protocol:
+  `record_pending_write_summary`, a later user-turn event, then
+  `record_pending_write_confirmation`.
 
 ## Remaining Work
 

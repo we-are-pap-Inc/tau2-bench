@@ -518,6 +518,66 @@ def _exchange_tool_call(call_id: str = "call_exchange") -> ToolCall:
     )
 
 
+def _pending_write_id(controller: StageGateController) -> str:
+    snapshot = controller.validator.pending_write_snapshot()
+    assert snapshot is not None
+    return str(snapshot["pending_write_id"])
+
+
+def _record_pending_summary(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+    *,
+    pending_write_id: str | None = None,
+    tick_id: int = 11,
+    action_type: str = "exchange_delivered_order_items",
+) -> ToolMessage:
+    return orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id=f"call_record_summary_{tick_id}",
+            name="record_pending_write_summary",
+            arguments={
+                "pending_write_id": pending_write_id or _pending_write_id(controller),
+                "summary_presented": True,
+                "action_type": action_type,
+                "consequence_presented": True,
+                "confirmation_requested": True,
+            },
+        ),
+        tick_id=tick_id,
+    )
+
+
+def _record_pending_confirmation(
+    orchestrator: FullDuplexOrchestrator,
+    controller: StageGateController,
+    *,
+    pending_write_id: str | None = None,
+    decision: str = "confirmed",
+    basis: str = "latest_user_turn",
+    user_tick_id: int = 12,
+    tool_tick_id: int = 13,
+) -> ToolMessage:
+    controller.record_agent_visible_user_transcript(
+        "user response event",
+        tick_id=user_tick_id,
+    )
+    return orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id=f"call_record_confirmation_{tool_tick_id}",
+            name="record_pending_write_confirmation",
+            arguments={
+                "pending_write_id": pending_write_id or _pending_write_id(controller),
+                "decision": decision,
+                "basis": basis,
+            },
+        ),
+        tick_id=tool_tick_id,
+    )
+
+
 def _prepare_validated_retail_exchange(
     orchestrator: FullDuplexOrchestrator,
     controller: StageGateController,
@@ -655,12 +715,18 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
 
     tool_names = [tool.name for tool in adapter.connect.call_args.kwargs["tools"]]
     system_prompt = adapter.connect.call_args.kwargs["system_prompt"]
-    assert tool_names == ["_test_tool", "advance_stage"]
+    assert tool_names == [
+        "_test_tool",
+        "advance_stage",
+        "record_pending_write_summary",
+        "record_pending_write_confirmation",
+    ]
     assert "StageGate operating rules" in system_prompt
     assert (
         "call advance_stage before the first customer-specific domain tool call"
         in system_prompt
     )
+    assert "record_pending_write_summary" in system_prompt
     assert hasattr(agent.stagegate_controller, "ledger")
     assert hasattr(agent.stagegate_controller, "validator")
 
@@ -1345,7 +1411,7 @@ def test_validator_never_mutates_domain_state_when_blocking():
     assert orchestrator.num_errors == 1
 
 
-def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
+def test_pending_write_creation_blocks_first_write(monkeypatch, tmp_path):
     trace_path = tmp_path / "trace_events.jsonl"
     monkeypatch.setenv("TAU2_TRACE_JSONL", str(trace_path))
     environment = _environment()
@@ -1366,13 +1432,6 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_id=2,
-    )
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1388,14 +1447,17 @@ def test_missing_confirmation_blocks_write(monkeypatch, tmp_path):
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert result.error is True
     assert packet["stage"] == "propose_action_and_confirm"
-    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert packet["missing_facts"] == ["missing_action_summary"]
+    assert "record_pending_write_summary" in packet["ask_next"]
+    assert "record_pending_write_confirmation" in packet["ask_next"]
+    assert "retry update_account directly" in packet["when_done"]
     assert environment.tools.write_count == 0
-    assert events[-2]["event_type"] == "validator_check"
+    assert "pending_write_created" in [event["event_type"] for event in events]
     assert events[-1]["event_type"] == "validator_block"
-    assert events[-1]["validator_reason"] == "missing_confirmation"
+    assert events[-1]["validator_reason"] == "missing_action_summary"
 
 
-def test_exchange_summary_and_yes_confirmation_allows_write():
+def test_summary_tool_records_summary_without_transcript_parsing():
     environment = _retail_exchange_environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1406,30 +1468,87 @@ def test_exchange_summary_and_yes_confirmation_allows_write():
     orchestrator = _orchestrator_shell(environment)
     _prepare_validated_retail_exchange(orchestrator, controller)
 
-    summary_chunks = [
-        "You're exchanging order W2378156: mechanical keyboard item 1151293680 ",
-        "to replacement item 7706410293, and smart thermostat item 4983901480 ",
-        "to replacement item 7747408585. Any price difference will go on ",
-        "the saved credit card ending 2478. Please confirm by saying yes.",
-    ]
-    for index, chunk in enumerate(summary_chunks, start=10):
-        controller.record_assistant_utterance(
-            AssistantMessage.text(chunk), tick_id=index
-        )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=14)
+    blocked = orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    assert blocked.error is True
+
+    summary_result = _record_pending_summary(orchestrator, controller, tick_id=11)
+
+    assert summary_result.error is False
+    assert json.loads(summary_result.content)["reason"] == "summary_recorded"
+    assert controller.validator.pending_write_snapshot()["status"] == "summarized"
+
+
+def test_confirmation_tool_records_confirmed_after_user_turn():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+
+    confirmation_result = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    assert confirmation_result.error is False
+    assert json.loads(confirmation_result.content)["reason"] == "confirmation_confirmed"
+    assert controller.validator.pending_write_snapshot()["status"] == "confirmed"
+
+
+def test_retry_same_write_allowed_after_structured_confirmation():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
-        _exchange_tool_call(),
-        tick_id=15,
+        _exchange_tool_call("call_retry_exchange"),
+        tick_id=14,
     )
 
     assert result.error is False
     assert json.loads(result.content)["status"] == "exchange requested"
     assert environment.tools.write_count == 1
+    assert controller.validator.pending_write_snapshot()["status"] == "consumed"
 
 
-def test_exchange_summary_and_yeah_confirmation_allows_write():
+def test_confirmation_tool_before_summary_does_not_confirm():
     environment = _retail_exchange_environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1440,91 +1559,64 @@ def test_exchange_summary_and_yeah_confirmation_allows_write():
     orchestrator = _orchestrator_shell(environment)
     _prepare_validated_retail_exchange(orchestrator, controller)
 
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I'll submit the exchange on order W2378156: swap item 1151293680 "
-            "for 7706410293 and item 4983901480 for 7747408585. The order "
-            "will move to exchange requested, and any charge or refund uses "
-            "the saved credit card ending 2478. Please reply YES to proceed."
-        ),
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
         tick_id=10,
     )
-    controller.record_agent_visible_user_transcript("Yeah.", tick_id=11)
-
-    result = orchestrator._execute_stagegate_tool_call(
+    result = _record_pending_confirmation(
+        orchestrator,
         controller,
-        _exchange_tool_call(),
-        tick_id=12,
+        user_tick_id=11,
+        tool_tick_id=12,
     )
 
-    assert result.error is False
-    assert environment.tools.write_count == 1
-
-
-def test_exchange_summary_with_exact_item_ids_can_omit_order_word():
-    environment = _retail_exchange_environment()
-    controller = StageGateController(
-        condition="stagegate",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-        domain_name=environment.get_domain_name(),
-    )
-    orchestrator = _orchestrator_shell(environment)
-    _prepare_validated_retail_exchange(orchestrator, controller)
-
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "Here's the exchange I'm set to submit. Mechanical Keyboard item "
-            "1151293680 to full-size clicky with no backlight item 7706410293. "
-            "Smart Thermostat item 4983901480 to Google Home compatible black "
-            "thermostat item 7747408585. The price difference is a refund to "
-            "the card ending 2478. Please reply yes to confirm and proceed."
-        ),
-        tick_id=10,
-    )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=11)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        _exchange_tool_call(),
-        tick_id=12,
-    )
-
-    assert result.error is False
-    assert environment.tools.write_count == 1
-
-
-def test_confirmation_before_exchange_summary_does_not_allow_write():
-    environment = _retail_exchange_environment()
-    controller = StageGateController(
-        condition="stagegate",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-        domain_name=environment.get_domain_name(),
-    )
-    orchestrator = _orchestrator_shell(environment)
-    _prepare_validated_retail_exchange(orchestrator, controller)
-
-    controller.record_agent_visible_user_transcript("Yes", tick_id=10)
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I'll submit the exchange on order W2378156: item 1151293680 to "
-            "7706410293 and item 4983901480 to 7747408585. Any price difference "
-            "will go on the saved credit card ending 2478. Please confirm."
-        ),
-        tick_id=11,
-    )
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        _exchange_tool_call(),
-        tick_id=12,
-    )
-
-    packet = json.loads(result.content)
     assert result.error is True
-    assert packet["missing_facts"] == ["missing_confirmation"]
-    assert environment.tools.write_count == 0
+    assert json.loads(result.content)["reason"] == "pending_write_not_summarized"
+    assert controller.validator.pending_write_snapshot()["status"] == "needs_summary"
+
+
+def test_denied_or_unclear_pending_write_does_not_allow_write():
+    for decision, reason in (
+        ("denied", "pending_write_denied"),
+        ("unclear", "pending_write_unclear"),
+    ):
+        environment = _retail_exchange_environment()
+        controller = StageGateController(
+            condition="stagegate",
+            domain_policy=environment.get_policy(),
+            tools=environment.get_tools(),
+            domain_name=environment.get_domain_name(),
+        )
+        orchestrator = _orchestrator_shell(environment)
+        _prepare_validated_retail_exchange(orchestrator, controller)
+
+        orchestrator._execute_stagegate_tool_call(
+            controller,
+            _exchange_tool_call("call_initial_exchange"),
+            tick_id=10,
+        )
+        _record_pending_summary(orchestrator, controller, tick_id=11)
+        _record_pending_confirmation(
+            orchestrator,
+            controller,
+            decision=decision,
+            basis="user_declined" if decision == "denied" else "unclear_response",
+            user_tick_id=12,
+            tool_tick_id=13,
+        )
+
+        result = orchestrator._execute_stagegate_tool_call(
+            controller,
+            _exchange_tool_call("call_retry_exchange"),
+            tick_id=14,
+        )
+
+        packet = json.loads(result.content)
+        assert result.error is True
+        assert controller.last_validator_decision["reason"] == reason
+        assert packet["missing_facts"] == [reason]
+        assert environment.tools.write_count == 0
 
 
 def test_missing_exchange_summary_still_blocks_write():
@@ -1537,7 +1629,7 @@ def test_missing_exchange_summary_still_blocks_write():
     )
     orchestrator = _orchestrator_shell(environment)
     _prepare_validated_retail_exchange(orchestrator, controller)
-    controller.record_agent_visible_user_transcript("Yes", tick_id=10)
+    controller.record_agent_visible_user_transcript("user response event", tick_id=10)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -1548,12 +1640,14 @@ def test_missing_exchange_summary_still_blocks_write():
     packet = json.loads(result.content)
     assert result.error is True
     assert packet["missing_facts"] == ["missing_action_summary"]
+    assert "record_pending_write_summary" in packet["ask_next"]
+    assert "record_pending_write_confirmation" in packet["ask_next"]
     assert "retry exchange_delivered_order_items directly" in packet["when_done"]
     assert "advance_stage" not in packet["when_done"]
     assert environment.tools.write_count == 0
 
 
-def test_pending_exchange_summary_and_yes_confirmation_allows_retry():
+def test_pending_exchange_summary_and_confirmation_allows_retry():
     environment = _retail_exchange_environment()
     controller = StageGateController(
         condition="stagegate",
@@ -1571,66 +1665,24 @@ def test_pending_exchange_summary_and_yes_confirmation_allows_retry():
     )
     assert blocked.error is True
     assert controller.validator.pending_write_snapshot()["status"] == "needs_summary"
-
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "Here's the exchange I'm set to submit. Mechanical Keyboard item "
-            "1151293680 to item 7706410293, and Smart Thermostat item "
-            "4983901480 to item 7747408585. The price difference is a refund "
-            "to the saved card ending 2478. Please reply yes to confirm."
-        ),
-        tick_id=11,
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
     )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
         _exchange_tool_call("call_retry_exchange"),
-        tick_id=13,
+        tick_id=14,
     )
 
     assert result.error is False
     assert json.loads(result.content)["status"] == "exchange requested"
     assert environment.tools.write_count == 1
     assert controller.validator.pending_write_snapshot()["status"] == "consumed"
-
-
-def test_pending_exchange_summary_and_yeah_confirmation_allows_retry():
-    environment = _retail_exchange_environment()
-    controller = StageGateController(
-        condition="stagegate",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-        domain_name=environment.get_domain_name(),
-    )
-    orchestrator = _orchestrator_shell(environment)
-    _prepare_validated_retail_exchange(orchestrator, controller)
-
-    blocked = orchestrator._execute_stagegate_tool_call(
-        controller,
-        _exchange_tool_call("call_initial_exchange"),
-        tick_id=10,
-    )
-    assert blocked.error is True
-
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will exchange item 1151293680 for item 7706410293 and item "
-            "4983901480 for item 7747408585. Any price difference will be "
-            "handled on the saved card ending 2478. Please confirm to proceed."
-        ),
-        tick_id=11,
-    )
-    controller.record_agent_visible_user_transcript("Yeah.", tick_id=12)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        _exchange_tool_call("call_retry_exchange"),
-        tick_id=13,
-    )
-
-    assert result.error is False
-    assert environment.tools.write_count == 1
 
 
 def test_pending_exchange_retry_with_changed_args_blocks_as_mismatch(
@@ -1654,22 +1706,20 @@ def test_pending_exchange_retry_with_changed_args_blocks_as_mismatch(
         _exchange_tool_call("call_initial_exchange"),
         tick_id=10,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will exchange item 1151293680 for item 7706410293 and item "
-            "4983901480 for item 7747408585. Any price difference will be "
-            "handled on the saved card ending 2478. Please confirm to proceed."
-        ),
-        tick_id=11,
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
     )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
 
     changed_call = _exchange_tool_call("call_changed_exchange")
     changed_call.arguments["new_item_ids"] = ["9025753381", "7747408585"]
     result = orchestrator._execute_stagegate_tool_call(
         controller,
         changed_call,
-        tick_id=13,
+        tick_id=14,
     )
 
     packet = json.loads(result.content)
@@ -1700,22 +1750,20 @@ def test_confirmed_unconsumed_pending_write_keeps_stage_at_execute():
         _exchange_tool_call("call_initial_exchange"),
         tick_id=10,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will exchange item 1151293680 for item 7706410293 and item "
-            "4983901480 for item 7747408585. Any price difference will be "
-            "handled on the saved card ending 2478. Please confirm to proceed."
-        ),
-        tick_id=11,
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
     )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
 
     packet = _advance_stage_packet(
         controller,
         current_stage="verify_result_and_close",
         observed_facts=["Model claims the write was validated."],
         last_action="No domain write result yet.",
-        tick_id=13,
+        tick_id=14,
     )
 
     assert packet["stage"] == "execute_write_action"
@@ -1741,26 +1789,24 @@ def test_pending_write_trace_events_are_emitted(monkeypatch, tmp_path):
         _exchange_tool_call("call_initial_exchange"),
         tick_id=10,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will exchange item 1151293680 for item 7706410293 and item "
-            "4983901480 for item 7747408585. Any price difference will be "
-            "handled on the saved card ending 2478. Please confirm to proceed."
-        ),
-        tick_id=11,
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
     )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=12)
     orchestrator._execute_stagegate_tool_call(
         controller,
         _exchange_tool_call("call_retry_exchange"),
-        tick_id=13,
+        tick_id=14,
     )
 
     event_types = [
         json.loads(line)["event_type"] for line in trace_path.read_text().splitlines()
     ]
     assert "pending_write_created" in event_types
-    assert "pending_write_summary_detected" in event_types
+    assert "pending_write_summary_recorded" in event_types
     assert "pending_write_confirmed" in event_types
     assert "pending_write_consumed" in event_types
 
@@ -1839,19 +1885,22 @@ def test_retail_item_id_product_list_ambiguity_not_surfaced_at_close():
     )
     orchestrator = _orchestrator_shell(environment)
     _prepare_validated_retail_exchange(orchestrator, controller)
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I'll submit the exchange on order W2378156: item 1151293680 to "
-            "7706410293 and item 4983901480 to 7747408585. The order status "
-            "will become exchange requested. Please confirm."
-        ),
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
         tick_id=10,
     )
-    controller.record_agent_visible_user_transcript("Yes", tick_id=11)
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
     result = orchestrator._execute_stagegate_tool_call(
         controller,
-        _exchange_tool_call(),
-        tick_id=12,
+        _exchange_tool_call("call_retry_exchange"),
+        tick_id=14,
     )
     assert result.error is False
 
@@ -1860,7 +1909,7 @@ def test_retail_item_id_product_list_ambiguity_not_surfaced_at_close():
         current_stage="execute_write_action",
         observed_facts=["Exchange tool succeeded."],
         last_action="exchange_delivered_order_items returned exchange requested",
-        tick_id=13,
+        tick_id=15,
     )
 
     assert packet["stage"] == "verify_result_and_close"
@@ -1893,30 +1942,44 @@ def test_confirmed_exact_identifier_allows_lookup_or_write_when_policy_allows():
     assert read_result.error is False
     assert json.loads(read_result.content)["account_id"] == "acct_123"
 
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
+    initial = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_initial_write",
+            name="update_account",
+            arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
         tick_id=2,
     )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
+    assert initial.error is True
+    _record_pending_summary(
+        orchestrator,
+        controller,
+        tick_id=3,
+        action_type="update_account",
+    )
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=4,
+        tool_tick_id=5,
+    )
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_write",
+            id="call_retry_write",
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=6,
     )
 
     content = json.loads(result.content)
     assert result.error is False
     assert content["plan_name"] == "premium"
     assert environment.tools.write_count == 1
-    assert orchestrator.num_errors == 0
+    assert orchestrator.num_errors == 1
 
 
 def test_service_task_ref_preserves_mock_task_write_validation():
@@ -1942,23 +2005,37 @@ def test_service_task_ref_preserves_mock_task_write_validation():
     assert user_result.error is False
     assert task_result.error is False
 
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update service task service_task_1 to completed. "
-            "This will change the service task status. Please confirm."
+    initial = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_initial_update_task",
+            name="update_task_status",
+            arguments={"task_id": "service_task_1", "status": "completed"},
         ),
         tick_id=3,
     )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=4)
+    assert initial.error is True
+    _record_pending_summary(
+        orchestrator,
+        controller,
+        tick_id=4,
+        action_type="update_task_status",
+    )
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        user_tick_id=5,
+        tool_tick_id=6,
+    )
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_update_task",
+            id="call_retry_update_task",
             name="update_task_status",
             arguments={"task_id": "service_task_1", "status": "completed"},
         ),
-        tick_id=5,
+        tick_id=7,
     )
 
     content = json.loads(result.content)
@@ -1990,10 +2067,10 @@ def test_clean_user_message_content_is_rejected_as_runtime_evidence():
         slot.status is not LedgerStatus.USER_CONFIRMED
         for slot in controller.ledger.slots.values()
     )
-    assert controller.validator.state.last_user_confirmation is None
+    assert controller.validator.state.latest_user_turn_tick is None
 
 
-def test_same_tick_user_confirmation_cannot_satisfy_validator():
+def test_same_tick_user_turn_cannot_satisfy_pending_confirmation():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -2015,11 +2092,11 @@ def test_same_tick_user_confirmation_cannot_satisfy_validator():
     assert tick.user_chunk.content == "Yes, I confirm."
     assert orchestrator.agent.received_chunks[-1].content == "I want the premium plan."
     assert tick.agent_tool_results[0].error is True
-    assert packet["missing_facts"] == ["missing_confirmation"]
+    assert packet["missing_facts"] == ["missing_action_summary"]
     assert environment.tools.write_count == 0
 
 
-def test_next_tick_clean_user_content_does_not_satisfy_validator():
+def test_next_tick_clean_user_content_does_not_confirm_without_internal_tool():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -2045,12 +2122,12 @@ def test_next_tick_clean_user_content_does_not_satisfy_validator():
     assert orchestrator.agent.received_chunks[-1].content == "Yes, I confirm."
     assert second_tick_result.error is True
     assert json.loads(second_tick_result.content)["missing_facts"] == [
-        "missing_confirmation"
+        "missing_action_summary"
     ]
     assert environment.tools.write_count == 0
 
 
-def test_agent_visible_user_transcript_satisfies_confirmation():
+def test_user_turn_event_alone_does_not_satisfy_confirmation():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -2069,14 +2146,7 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
+    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=2)
 
     result = orchestrator._execute_stagegate_tool_call(
         controller,
@@ -2085,12 +2155,12 @@ def test_agent_visible_user_transcript_satisfies_confirmation():
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=3,
     )
 
-    assert result.error is False
-    assert json.loads(result.content)["plan_name"] == "premium"
-    assert environment.tools.write_count == 1
+    assert result.error is True
+    assert json.loads(result.content)["missing_facts"] == ["missing_action_summary"]
+    assert environment.tools.write_count == 0
 
 
 def test_openai_adapter_records_input_transcription_event(monkeypatch):
@@ -2130,7 +2200,7 @@ def test_openai_adapter_records_input_transcription_event(monkeypatch):
     assert "Yes, I confirm." not in "\n".join(debug_messages)
 
 
-def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypatch):
+def test_agent_wires_provider_user_transcript_to_user_turn_order(monkeypatch):
     monkeypatch.setenv("TAU2_STAGEGATE_CONDITION", "stagegate")
     environment = _environment()
     adapter = MagicMock()
@@ -2165,13 +2235,6 @@ def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypa
         ),
         tick_index=0,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_id=0,
-    )
     state = agent.get_init_state()
 
     agent.get_next_chunk(
@@ -2186,11 +2249,12 @@ def test_agent_wires_provider_user_transcript_to_stagegate_confirmation(monkeypa
         )
     )
 
-    assert controller.validator.state.last_user_confirmation == "Yes, I confirm."
-    assert decision.decision == "allow"
+    assert controller.validator.state.latest_user_turn_tick == 1
+    assert decision.decision == "block"
+    assert decision.reason == "missing_action_summary"
 
 
-def test_validator_uses_confirmation_only_after_visible_recording():
+def test_validator_uses_structured_confirmation_only_after_user_turn():
     environment = _environment()
     validator = PreWriteValidator(
         domain_name="mock",
@@ -2216,28 +2280,45 @@ def test_validator_uses_confirmation_only_after_visible_recording():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_index=2,
-    )
-
-    before_delivery = validator.validate(write_call)
-    validator.record_user_confirmation_evidence(
-        content="Yes, I confirm.",
+    before_summary = validator.validate(write_call, tick_index=2)
+    pending_id = validator.pending_write_snapshot()["pending_write_id"]
+    summary_result = validator.record_pending_write_summary(
+        pending_write_id=str(pending_id),
+        summary_presented=True,
+        action_type="update_account",
+        consequence_presented=True,
+        confirmation_requested=True,
         tick_index=3,
+    )
+    before_user_turn = validator.record_pending_write_confirmation(
+        pending_write_id=str(pending_id),
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=4,
+    )
+    validator.record_user_turn(
+        content="Yes, I confirm.",
+        tick_index=5,
         source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
     )
-    after_delivery = validator.validate(write_call)
+    confirmation_result = validator.record_pending_write_confirmation(
+        pending_write_id=str(pending_id),
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=6,
+    )
+    after_confirmation = validator.validate(write_call, tick_index=7)
 
-    assert before_delivery.decision == "block"
-    assert before_delivery.reason == "missing_confirmation"
-    assert after_delivery.decision == "allow"
+    assert before_summary.decision == "block"
+    assert before_summary.reason == "missing_action_summary"
+    assert summary_result.ok is True
+    assert before_user_turn.ok is False
+    assert before_user_turn.reason == "missing_user_turn_after_summary"
+    assert confirmation_result.ok is True
+    assert after_confirmation.decision == "allow"
 
 
-def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
+def test_model_tool_argument_text_cannot_satisfy_user_turn_order():
     environment = _environment()
     validator = PreWriteValidator(
         domain_name="mock",
@@ -2263,21 +2344,32 @@ def test_model_tool_argument_text_cannot_satisfy_user_confirmation():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will update account acct_123 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_index=2,
+    first_decision = validator.validate(write_call, tick_index=2)
+    pending_id = str(first_decision.pending_write_id)
+    validator.record_pending_write_summary(
+        pending_write_id=pending_id,
+        summary_presented=True,
+        action_type="update_account",
+        consequence_presented=True,
+        confirmation_requested=True,
+        tick_index=3,
     )
     validator.record_user_confirmation_evidence(
         content="Yes, I confirm.",
-        tick_index=3,
+        tick_index=4,
         source=EvidenceSource.MODEL_TOOL_ARGUMENT,
+    )
+    confirmation_result = validator.record_pending_write_confirmation(
+        pending_write_id=pending_id,
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=5,
     )
 
     decision = validator.validate(write_call)
 
+    assert confirmation_result.ok is False
+    assert confirmation_result.reason == "missing_user_turn_after_summary"
     assert decision.decision == "block"
     assert decision.reason == "missing_confirmation"
 
@@ -2303,7 +2395,28 @@ def test_forbidden_oracle_evidence_sources_are_rejected_at_runtime():
         )
 
 
-def test_confirmation_requires_exact_identifier_mention():
+def test_validator_source_has_no_semantic_transcript_regex():
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (
+        repo_root / "src/tau2/voice/audio_native/openai/stagegate/validator.py"
+    ).read_text(encoding="utf-8")
+
+    forbidden_tokens = [
+        "CONFIRMATION_PATTERNS",
+        "looks_like_user_confirmation",
+        "looks_like_action_statement",
+        "summary_requests_confirmation",
+        "_exchange_summary_matches_tool_call",
+        "_action_summary_matches_tool_call",
+        "re.compile",
+        "re.search",
+        "re.findall",
+    ]
+
+    assert all(token not in source for token in forbidden_tokens)
+
+
+def test_summary_tool_requires_structured_consequence_and_confirmation_request():
     environment = _environment()
     controller = StageGateController(
         condition="stagegate",
@@ -2322,70 +2435,37 @@ def test_confirmation_requires_exact_identifier_mention():
         ),
         tick_id=1,
     )
-    controller.record_assistant_utterance(
-        AssistantMessage.text(
-            "I will update account acct_1234 to premium. "
-            "This will change the account plan status. Please confirm."
-        ),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        ToolCall(
-            id="call_write",
-            name="update_account",
-            arguments={"account_id": "acct_123", "plan_name": "premium"},
-        ),
-        tick_id=4,
-    )
-
-    packet = json.loads(result.content)
-    assert result.error is True
-    assert packet["missing_facts"] == ["missing_action_summary"]
-    assert environment.tools.write_count == 0
-
-
-def test_action_statement_requires_consequence():
-    environment = _environment()
-    controller = StageGateController(
-        condition="stagegate",
-        domain_policy=environment.get_policy(),
-        tools=environment.get_tools(),
-        domain_name=environment.get_domain_name(),
-    )
-    orchestrator = _orchestrator_shell(environment)
-
     orchestrator._execute_stagegate_tool_call(
         controller,
         ToolCall(
-            id="call_read",
-            name="get_account",
-            arguments={"account_id": "acct_123"},
-        ),
-        tick_id=1,
-    )
-    controller.record_assistant_utterance(
-        AssistantMessage.text("I will update account acct_123 to premium."),
-        tick_id=2,
-    )
-    controller.record_agent_visible_user_transcript("Yes, I confirm.", tick_id=3)
-
-    result = orchestrator._execute_stagegate_tool_call(
-        controller,
-        ToolCall(
-            id="call_write",
+            id="call_initial_write",
             name="update_account",
             arguments={"account_id": "acct_123", "plan_name": "premium"},
         ),
-        tick_id=4,
+        tick_id=2,
     )
 
-    packet = json.loads(result.content)
-    assert result.error is True
-    assert packet["missing_facts"] == ["missing_action_summary"]
-    assert environment.tools.write_count == 0
+    missing_consequence = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_bad_summary",
+            name="record_pending_write_summary",
+            arguments={
+                "pending_write_id": _pending_write_id(controller),
+                "summary_presented": True,
+                "action_type": "update_account",
+                "consequence_presented": False,
+                "confirmation_requested": True,
+            },
+        ),
+        tick_id=3,
+    )
+
+    assert missing_consequence.error is True
+    assert json.loads(missing_consequence.content)["reason"] == (
+        "consequence_not_presented"
+    )
+    assert controller.validator.pending_write_snapshot()["status"] == "needs_summary"
 
 
 def test_read_only_tools_not_overblocked():
@@ -2535,18 +2615,6 @@ def test_policy_preconditions_require_all_required_visible_fields():
         ),
         tick_index=1,
     )
-    validator.record_assistant_utterance(
-        content=(
-            "I will send payment request for customer C1 and bill B1. "
-            "This will change the bill status to awaiting payment. Please confirm."
-        ),
-        tick_index=2,
-    )
-    validator.record_user_confirmation_evidence(
-        content="Yes, I confirm.",
-        tick_index=3,
-        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
-    )
     write_call = ToolCall(
         id="call_payment",
         name="send_payment_request",
@@ -2580,7 +2648,29 @@ def test_policy_preconditions_require_all_required_visible_fields():
         tick_index=4,
     )
 
-    allowed = validator.validate(write_call)
+    pending_block = validator.validate(write_call, tick_index=5)
+    pending_id = str(pending_block.pending_write_id)
+    validator.record_pending_write_summary(
+        pending_write_id=pending_id,
+        summary_presented=True,
+        action_type="send_payment_request",
+        consequence_presented=True,
+        confirmation_requested=True,
+        tick_index=6,
+    )
+    validator.record_user_turn(
+        content="Yes, I confirm.",
+        tick_index=7,
+        source=EvidenceSource.AGENT_VISIBLE_TRANSCRIPT,
+    )
+    validator.record_pending_write_confirmation(
+        pending_write_id=pending_id,
+        decision="confirmed",
+        basis="latest_user_turn",
+        tick_index=8,
+    )
+
+    allowed = validator.validate(write_call, tick_index=9)
 
     assert allowed.decision == "allow"
     assert allowed.reason == "validated"

@@ -184,8 +184,9 @@ The validator admits only typed runtime evidence:
 `SIMULATOR_GOLD_TEXT` and `POSTHOC_ORACLE` are forbidden in runtime StageGate
 state. In audio-native runs, clean `UserMessage.content` from the simulator is
 not agent-visible when the model receives only `user_audio`, so it must not
-update the ledger or satisfy confirmation. If no agent-visible user transcript
-exists, confirmation remains missing.
+update the ledger or satisfy confirmation. Agent-visible user transcript events
+may establish only user-turn ordering; the validator does not parse transcript
+text for consent or action summaries.
 
 Validator checks:
 
@@ -197,21 +198,26 @@ Validator checks:
 6. Are policy preconditions satisfied?
 7. Is there a matching pending write keyed by the attempted tool and stable
    argument fingerprint?
-8. Did the assistant summarize that pending action and consequence?
-9. Did the user confirm after that pending-action summary?
+8. Has the model called `record_pending_write_summary` for that pending write?
+9. Has a later user turn occurred, and has the model called
+   `record_pending_write_confirmation` with a structured decision?
 
 Pending write confirmation:
 
-- A side-effecting tool attempt with satisfied non-conversation checks creates a
-  pending write record from the attempted tool name and arguments.
-- The record stores a stable argument fingerprint, required summary facets,
-  assistant summary evidence, user confirmation evidence, and status.
+- A side-effecting tool attempt with satisfied non-conversation checks creates
+  a pending write record from the attempted tool name and arguments.
+- The record stores a stable argument fingerprint, structured summary and
+  confirmation ticks, user-turn ordering state, and status.
+- The validator does not regex-match assistant or user transcript text. The
+  agent must explicitly call StageGate internal tools:
+  `record_pending_write_summary` after summarizing the pending write and
+  `record_pending_write_confirmation` after a later user response.
 - A retry is allowed only when the pending write is `confirmed` and the retried
   tool name and argument fingerprint match.
 - A successful side-effecting domain-tool result marks the pending write
   `consumed`; only consumed writes can satisfy write-intent closeout.
 - Changed retry arguments create a `pending_write_mismatch` block and require a
-  fresh visible summary and confirmation.
+  fresh structured summary and confirmation.
 
 Allow result:
 
@@ -223,7 +229,7 @@ Block result:
       "decision": "block",
       "reason": "missing_confirmation",
       "corrective_packet": {
-        "say_next": "State the pending action and consequence, then ask for explicit confirmation.",
+        "say_next": "State the pending action and consequence, call record_pending_write_summary, then after the user responds call record_pending_write_confirmation.",
         "allowed_next_tools": [],
         "do_not": ["Do not call advance_stage before retrying the original write tool."]
       }
@@ -255,8 +261,9 @@ All StageGate behavior should emit JSONL events with `schema_version`. See `docs
 Pending-write runtime events are:
 
 - `pending_write_created`
-- `pending_write_summary_detected`
+- `pending_write_summary_recorded`
 - `pending_write_confirmed`
+- `pending_write_denied`
+- `pending_write_unclear`
 - `pending_write_mismatch`
 - `pending_write_consumed`
-- `pending_write_expired`
