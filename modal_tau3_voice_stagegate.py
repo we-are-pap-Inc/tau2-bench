@@ -24,8 +24,10 @@ from scripts.stagegate_modal_runner_config import (
     planned_jobs,
     planned_manifest,
     require_full_commit_sha,
+    save_name,
     simulation_output_dir,
     trace_jsonl_path,
+    trace_run_id,
     utc_now_iso,
     validate_condition,
     validate_domain,
@@ -166,7 +168,7 @@ def run_domain(
         env = os.environ.copy()
         env["TAU2_STAGEGATE_CONDITION"] = condition
         env["TAU2_TRACE_JSONL"] = trace_jsonl_path(batch_id, job)
-        env["TAU2_TRACE_RUN_ID"] = f"{batch_id}:{condition}:{domain}"
+        env["TAU2_TRACE_RUN_ID"] = trace_run_id(batch_id, job)
 
         tau2_argv = command_metadata(
             batch_id=batch_id,
@@ -178,7 +180,7 @@ def run_domain(
         _run_logged(tau2_argv, cwd=workdir, env=env)
 
         source_simulation_dir = (
-            workdir / "data" / "simulations" / f"{batch_id}_{condition}_{domain}"
+            workdir / "data" / "simulations" / save_name(batch_id, job)
         )
         if not source_simulation_dir.exists():
             raise FileNotFoundError(
@@ -274,6 +276,7 @@ def launch(
     condition: str | None = None,
     domain: str | None = None,
     dry_run: bool = False,
+    allow_dev_smoke_domain: bool = False,
     collect_completed: bool = False,
     verify_secret_keys_only: bool = False,
 ) -> None:
@@ -300,7 +303,12 @@ def launch(
     if not repo_ref:
         raise ValueError("repo_ref is required unless --collect-completed is set")
     require_full_commit_sha(repo_ref, mode=mode)
-    jobs = planned_jobs(mode=mode, condition=condition, domain=domain)
+    jobs = planned_jobs(
+        mode=mode,
+        condition=condition,
+        domain=domain,
+        allow_dev_smoke_domain=allow_dev_smoke_domain,
+    )
     manifest = planned_manifest(
         batch_id=batch_id,
         repo_url=repo_url,

@@ -39,10 +39,13 @@ OPTIONAL_CONTROL_VOICE_ID_KEYS = (
 )
 REQUIRED_PROVIDER_SECRET_KEYS = (
     *REQUIRED_API_SECRET_KEYS,
+    *OPTIONAL_CONTROL_VOICE_ID_KEYS,
     *REQUIRED_REGULAR_VOICE_ID_KEYS,
 )
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 logger = logging.getLogger(__name__)
+
+RUN_CONSTANT_VALUE = str | int | float | bool
 
 FINAL_CONSTANTS: dict[str, str | int | float] = {
     "model": "gpt-realtime-2",
@@ -53,6 +56,20 @@ FINAL_CONSTANTS: dict[str, str | int | float] = {
     "max_steps_seconds": "1200",
     "max_concurrency": "1",
     "seed": "300",
+}
+
+SMOKE_CONSTANTS: dict[str, RUN_CONSTANT_VALUE] = {
+    "model": "gpt-realtime-2",
+    "provider": "openai",
+    "reasoning_effort": "high",
+    "speech_complexity": "control",
+    "tick_duration": "0.2",
+    "max_steps_seconds": "300",
+    "max_concurrency": "1",
+    "seed": "300",
+    "num_tasks": "1",
+    "audio_taps": True,
+    "auto_resume": False,
 }
 
 FORBIDDEN_TASK_FILTER_FLAGS = ("--num-tasks", "--task-ids")
@@ -106,14 +123,24 @@ def final_matrix() -> list[StageGateJob]:
     ]
 
 
-def smoke_jobs(condition: str | None, domain: str | None) -> list[StageGateJob]:
-    """Return smoke jobs, defaulting to baseline/retail."""
-    return [
-        StageGateJob(
-            condition=validate_condition(condition or "baseline"),
-            domain=validate_domain(domain or "retail"),
-            mode="smoke",
+def smoke_jobs(
+    condition: str | None,
+    domain: str | None,
+    *,
+    allow_dev_smoke_domain: bool = False,
+) -> list[StageGateJob]:
+    """Return the paid smoke matrix, with an explicit non-retail dev escape hatch."""
+    if condition is not None:
+        raise ValueError("smoke mode always runs all StageGate conditions")
+    smoke_domain = validate_domain(domain or "retail")
+    if smoke_domain != "retail" and not allow_dev_smoke_domain:
+        raise ValueError(
+            "smoke mode defaults to retail only; pass --allow-dev-smoke-domain "
+            "for non-retail development smoke runs"
         )
+    return [
+        StageGateJob(condition=condition_name, domain=smoke_domain, mode="smoke")
+        for condition_name in CONDITIONS
     ]
 
 
@@ -122,18 +149,35 @@ def planned_jobs(
     mode: RunMode,
     condition: str | None = None,
     domain: str | None = None,
+    allow_dev_smoke_domain: bool = False,
 ) -> list[StageGateJob]:
     """Return jobs for the requested mode."""
     if mode == "final":
         if condition is not None or domain is not None:
             raise ValueError("final mode does not accept condition/domain subsets")
         return final_matrix()
-    return smoke_jobs(condition, domain)
+    return smoke_jobs(
+        condition,
+        domain,
+        allow_dev_smoke_domain=allow_dev_smoke_domain,
+    )
 
 
 def save_name(batch_id: str, job: StageGateJob) -> str:
     """Return the tau2 save name for a job."""
-    return f"{batch_id}_{job.condition}_{job.domain}"
+    return f"{job.mode}_{batch_id}_{job.condition}_{job.domain}"
+
+
+def run_constants(job: StageGateJob) -> dict[str, RUN_CONSTANT_VALUE]:
+    """Return mode-specific constants for one StageGate job."""
+    if job.mode == "smoke":
+        return dict(SMOKE_CONSTANTS)
+    return dict(FINAL_CONSTANTS)
+
+
+def trace_run_id(batch_id: str, job: StageGateJob) -> str:
+    """Return the stable trace run identifier for one job."""
+    return f"{batch_id}:{job.condition}:{job.domain}"
 
 
 def trace_jsonl_path(batch_id: str, job: StageGateJob) -> str:
@@ -153,7 +197,8 @@ def simulation_output_dir(batch_id: str, job: StageGateJob) -> str:
 
 def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
     """Build the fixed, sanitized tau2 command for a job."""
-    return [
+    constants = run_constants(job)
+    argv = [
         "uv",
         "run",
         "tau2",
@@ -162,26 +207,35 @@ def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
         job.domain,
         "--audio-native",
         "--audio-native-provider",
-        str(FINAL_CONSTANTS["provider"]),
+        str(constants["provider"]),
         "--audio-native-model",
-        str(FINAL_CONSTANTS["model"]),
+        str(constants["model"]),
         "--reasoning-effort",
-        str(FINAL_CONSTANTS["reasoning_effort"]),
+        str(constants["reasoning_effort"]),
         "--speech-complexity",
-        str(FINAL_CONSTANTS["speech_complexity"]),
+        str(constants["speech_complexity"]),
         "--tick-duration",
-        str(FINAL_CONSTANTS["tick_duration"]),
+        str(constants["tick_duration"]),
         "--max-steps-seconds",
-        str(FINAL_CONSTANTS["max_steps_seconds"]),
+        str(constants["max_steps_seconds"]),
         "--max-concurrency",
-        str(FINAL_CONSTANTS["max_concurrency"]),
+        str(constants["max_concurrency"]),
         "--seed",
-        str(FINAL_CONSTANTS["seed"]),
-        "--verbose-logs",
-        "--auto-resume",
-        "--save-to",
-        save_name(batch_id, job),
+        str(constants["seed"]),
     ]
+    if job.mode == "smoke":
+        argv.extend(
+            [
+                "--num-tasks",
+                str(constants["num_tasks"]),
+                "--verbose-logs",
+                "--audio-taps",
+            ]
+        )
+    else:
+        argv.extend(["--verbose-logs", "--auto-resume"])
+    argv.extend(["--save-to", save_name(batch_id, job)])
+    return argv
 
 
 def command_to_log(argv: list[str]) -> str:
@@ -199,6 +253,8 @@ def validate_no_task_filters(argv: list[str]) -> None:
 def validate_final_command(argv: list[str]) -> None:
     """Validate constants and absence of task filters on a tau2 command."""
     validate_no_task_filters(argv)
+    if _has_flag(argv, "--audio-taps"):
+        raise ValueError("--audio-taps is not allowed in final mode")
     expected = {
         "--audio-native-provider": str(FINAL_CONSTANTS["provider"]),
         "--audio-native-model": str(FINAL_CONSTANTS["model"]),
@@ -212,6 +268,32 @@ def validate_final_command(argv: list[str]) -> None:
     for flag, value in expected.items():
         if _flag_value(argv, flag) != value:
             raise ValueError(f"{flag} must be {value!r}")
+    if not _has_flag(argv, "--auto-resume"):
+        raise ValueError("--auto-resume is required in final mode")
+
+
+def validate_smoke_command(argv: list[str]) -> None:
+    """Validate constants and task filtering for a paid smoke command."""
+    if _has_flag(argv, "--task-ids"):
+        raise ValueError("--task-ids is not allowed in smoke mode")
+    expected = {
+        "--audio-native-provider": str(SMOKE_CONSTANTS["provider"]),
+        "--audio-native-model": str(SMOKE_CONSTANTS["model"]),
+        "--reasoning-effort": str(SMOKE_CONSTANTS["reasoning_effort"]),
+        "--speech-complexity": str(SMOKE_CONSTANTS["speech_complexity"]),
+        "--tick-duration": str(SMOKE_CONSTANTS["tick_duration"]),
+        "--max-steps-seconds": str(SMOKE_CONSTANTS["max_steps_seconds"]),
+        "--max-concurrency": str(SMOKE_CONSTANTS["max_concurrency"]),
+        "--seed": str(SMOKE_CONSTANTS["seed"]),
+        "--num-tasks": str(SMOKE_CONSTANTS["num_tasks"]),
+    }
+    for flag, value in expected.items():
+        if _flag_value(argv, flag) != value:
+            raise ValueError(f"{flag} must be {value!r}")
+    if not _has_flag(argv, "--audio-taps"):
+        raise ValueError("--audio-taps is required in smoke mode")
+    if _has_flag(argv, "--auto-resume"):
+        raise ValueError("--auto-resume is not allowed in smoke mode")
 
 
 def planned_manifest(
@@ -224,6 +306,7 @@ def planned_manifest(
     created_at: str | None = None,
 ) -> dict[str, Any]:
     """Build the local pre-spawn batch manifest."""
+    manifest_run_constants = run_constants(jobs[0]) if jobs else {}
     return {
         "schema_version": "stagegate.modal.batch_manifest.planned.v1",
         "batch_id": batch_id,
@@ -232,6 +315,7 @@ def planned_manifest(
         "mode": mode,
         "created_at": created_at or utc_now_iso(),
         "final_constants": dict(FINAL_CONSTANTS),
+        "run_constants": manifest_run_constants,
         "runs": [
             job_manifest_base(
                 batch_id=batch_id,
@@ -256,11 +340,17 @@ def write_planned_manifest(
     mode: RunMode,
     condition: str | None = None,
     domain: str | None = None,
+    allow_dev_smoke_domain: bool = False,
     output_path: Path = Path("batch_manifest_planned.json"),
 ) -> dict[str, Any]:
     """Create a plan-only manifest without importing or contacting Modal."""
     require_full_commit_sha(repo_ref, mode=mode)
-    jobs = planned_jobs(mode=mode, condition=condition, domain=domain)
+    jobs = planned_jobs(
+        mode=mode,
+        condition=condition,
+        domain=domain,
+        allow_dev_smoke_domain=allow_dev_smoke_domain,
+    )
     manifest = planned_manifest(
         batch_id=batch_id,
         repo_url=repo_url,
@@ -304,7 +394,11 @@ def job_manifest_base(
 ) -> dict[str, Any]:
     """Build the common job manifest shape."""
     argv = build_tau2_command(batch_id, job)
-    validate_final_command(argv)
+    constants = run_constants(job)
+    if job.mode == "final":
+        validate_final_command(argv)
+    else:
+        validate_smoke_command(argv)
     return {
         "schema_version": "stagegate.modal.job_manifest.v1",
         "batch_id": batch_id,
@@ -314,12 +408,14 @@ def job_manifest_base(
         "requested_repo_ref": repo_ref,
         "resolved_commit_sha": resolved_commit_sha,
         "final_constants": dict(FINAL_CONSTANTS),
+        "run_constants": constants,
         "args": argv,
         "command": argv,
         "sanitized_command_argv": argv,
         "save_name": save_name(batch_id, job),
         "artifact_dir": artifact_dir(batch_id, job),
         "trace_jsonl": trace_jsonl_path(batch_id, job),
+        "trace_run_id": trace_run_id(batch_id, job),
         "simulation_output_dir": simulation_output_dir(batch_id, job),
         "start_timestamp": start_timestamp,
         "end_timestamp": end_timestamp,
@@ -327,18 +423,20 @@ def job_manifest_base(
         "modal_function_call_id": modal_function_call_id,
         "modal_container_id": modal_container_id,
         "mode": job.mode,
-        "model": FINAL_CONSTANTS["model"],
-        "provider": FINAL_CONSTANTS["provider"],
-        "reasoning_effort": FINAL_CONSTANTS["reasoning_effort"],
-        "speech_complexity": FINAL_CONSTANTS["speech_complexity"],
-        "tick_duration": FINAL_CONSTANTS["tick_duration"],
-        "max_steps_seconds": FINAL_CONSTANTS["max_steps_seconds"],
-        "timeout": FINAL_CONSTANTS["max_steps_seconds"],
-        "seed": FINAL_CONSTANTS["seed"],
-        "concurrency": FINAL_CONSTANTS["max_concurrency"],
-        "max_concurrency": FINAL_CONSTANTS["max_concurrency"],
-        "num_tasks": None,
+        "model": constants["model"],
+        "provider": constants["provider"],
+        "reasoning_effort": constants["reasoning_effort"],
+        "speech_complexity": constants["speech_complexity"],
+        "tick_duration": constants["tick_duration"],
+        "max_steps_seconds": constants["max_steps_seconds"],
+        "timeout": constants["max_steps_seconds"],
+        "seed": constants["seed"],
+        "concurrency": constants["max_concurrency"],
+        "max_concurrency": constants["max_concurrency"],
+        "num_tasks": constants.get("num_tasks"),
         "task_ids": None,
+        "audio_taps": constants.get("audio_taps", False),
+        "auto_resume": constants.get("auto_resume", True),
     }
 
 
@@ -352,6 +450,7 @@ def command_metadata(
 ) -> dict[str, Any]:
     """Build command metadata for a job."""
     argv = build_tau2_command(batch_id, job)
+    constants = run_constants(job)
     return {
         "schema_version": "stagegate.modal.command_metadata.v1",
         "batch_id": batch_id,
@@ -364,7 +463,9 @@ def command_metadata(
         "sanitized_command_argv": argv,
         "sanitized_command": command_to_log(argv),
         "final_constants": dict(FINAL_CONSTANTS),
+        "run_constants": constants,
         "trace_jsonl": trace_jsonl_path(batch_id, job),
+        "trace_run_id": trace_run_id(batch_id, job),
     }
 
 
@@ -477,6 +578,11 @@ def build_arg_parser() -> ArgumentParser:
     plan.add_argument("--condition")
     plan.add_argument("--domain")
     plan.add_argument(
+        "--allow-dev-smoke-domain",
+        action="store_true",
+        help="Allow non-retail smoke jobs for development only.",
+    )
+    plan.add_argument(
         "--output",
         type=Path,
         default=Path("batch_manifest_planned.json"),
@@ -517,6 +623,7 @@ def _run_plan_command(args: Namespace) -> int:
         mode=args.mode,
         condition=args.condition,
         domain=args.domain,
+        allow_dev_smoke_domain=args.allow_dev_smoke_domain,
         output_path=args.output,
     )
     logger.info("Wrote planned manifest to %s", args.output)
@@ -561,6 +668,10 @@ def _flag_value(argv: list[str], flag: str) -> str | None:
         if arg.startswith(f"{flag}="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _has_flag(argv: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
 
 
 if __name__ == "__main__":
