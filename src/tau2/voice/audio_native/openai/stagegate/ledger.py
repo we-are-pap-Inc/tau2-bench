@@ -456,6 +456,11 @@ def retail_item_id_facts(*, tool_name: str, payload: Any) -> dict[str, Any]:
             )
             if order_ids:
                 facts["order_item_ids"] = order_ids
+                facts["item_id"] = order_ids[0] if len(order_ids) == 1 else order_ids
+        elif tool_name == "get_item_details":
+            item_ids = flat_unique_values(values_by_key(payload, {"item_id"}))
+            if item_ids:
+                facts["item_id"] = item_ids[0] if len(item_ids) == 1 else item_ids
         elif tool_name == "get_product_details":
             replacement_ids = flat_unique_values(values_by_key(payload, {"item_id"}))
             if replacement_ids:

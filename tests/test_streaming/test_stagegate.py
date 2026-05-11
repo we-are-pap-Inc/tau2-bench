@@ -986,6 +986,54 @@ def test_ledger_does_not_treat_product_or_plan_names_as_customer_names():
     assert telecom_ledger.slots["plan_name"].value == "Unlimited Plus"
 
 
+def test_retail_order_and_item_reads_fill_item_id_compatibility_slot():
+    order_ledger = EntityLedger.for_domain("retail")
+    order_ledger.update_from_tool_result(
+        tool_name="get_order_details",
+        content=json.dumps(
+            {
+                "order_id": "#W2378156",
+                "items": [
+                    {"item_id": "1151293680", "name": "Mechanical Keyboard"},
+                    {"item_id": "4983901480", "name": "Smart Thermostat"},
+                ],
+                "fulfillments": [
+                    {"item_ids": ["1151293680", "4983901480"]},
+                ],
+            }
+        ),
+        event_id="call_order",
+        tick_index=1,
+    )
+
+    assert order_ledger.slots["item_id"].status is LedgerStatus.TOOL_VERIFIED
+    assert order_ledger.slots["item_id"].value == ["1151293680", "4983901480"]
+    assert order_ledger.slots["order_item_ids"].value == [
+        "1151293680",
+        "4983901480",
+    ]
+
+    item_ledger = EntityLedger.for_domain("retail")
+    item_ledger.update_from_tool_result(
+        tool_name="get_item_details",
+        content=json.dumps(
+            {
+                "item_id": "1151293680",
+                "options": {
+                    "switch type": "linear",
+                    "backlight": "RGB",
+                    "size": "full size",
+                },
+            }
+        ),
+        event_id="call_item",
+        tick_index=2,
+    )
+
+    assert item_ledger.slots["item_id"].status is LedgerStatus.TOOL_VERIFIED
+    assert item_ledger.slots["item_id"].value == "1151293680"
+
+
 def test_errored_tool_results_do_not_update_ledger():
     environment = _environment(domain_name="telecom")
     controller = StageGateController(
