@@ -57,6 +57,9 @@ class StagePacket(BaseModel):
     ask_next: str
     allowed_read_tools: list[str] = Field(default_factory=list)
     allowed_write_tools: list[str] = Field(default_factory=list)
+    allowed_internal_tools: list[str] = Field(default_factory=list)
+    disallowed_tools: list[str] = Field(default_factory=list)
+    next_required_steps: list[dict[str, object]] = Field(default_factory=list)
     do_not: list[str] = Field(default_factory=list)
     exit_condition: str
     when_done: str

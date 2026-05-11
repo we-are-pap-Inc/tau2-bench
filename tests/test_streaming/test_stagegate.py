@@ -548,6 +548,40 @@ def _pending_write_id(controller: StageGateController) -> str:
     return str(snapshot["pending_write_id"])
 
 
+def _step_by_name(packet: dict, step_name: str) -> dict:
+    for step in packet["next_required_steps"]:
+        if step["step"] == step_name:
+            return step
+    raise AssertionError(f"missing next_required_steps entry {step_name!r}")
+
+
+def _assert_summary_step(packet: dict, tool_name: str) -> None:
+    summary_step = _step_by_name(packet, "call_tool")
+    assert summary_step["tool_name"] == "record_pending_write_summary"
+    assert summary_step["arguments"] == {
+        "summary_presented": True,
+        "action_type": tool_name,
+        "consequence_presented": True,
+        "confirmation_requested": True,
+    }
+    assert "pending_write_id" not in summary_step["arguments"]
+
+
+def _assert_confirmation_step(packet: dict) -> None:
+    confirmation_step = _step_by_name(packet, "call_tool_if_user_confirms")
+    assert confirmation_step["tool_name"] == "record_pending_write_confirmation"
+    assert confirmation_step["arguments"] == {
+        "decision": "confirmed",
+        "basis": "latest_user_turn",
+    }
+    assert "pending_write_id" not in confirmation_step["arguments"]
+
+
+def _assert_retry_step(packet: dict, tool_name: str) -> None:
+    retry_step = _step_by_name(packet, "retry_original_write")
+    assert retry_step["tool_name"] == tool_name
+
+
 def _record_pending_summary(
     orchestrator: FullDuplexOrchestrator,
     controller: StageGateController,
@@ -770,6 +804,39 @@ def test_stagegate_condition_enables_entity_ledger(monkeypatch):
     assert "no pending_write_id is needed" in system_prompt
     assert hasattr(agent.stagegate_controller, "ledger")
     assert hasattr(agent.stagegate_controller, "validator")
+
+
+def test_pending_write_tool_descriptions_explain_active_handle():
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy="Policy.",
+        tools=[Tool(_test_tool)],
+        domain_name="mock",
+    )
+
+    summary_description = controller.pending_write_summary_tool.openai_schema[
+        "function"
+    ]["description"]
+    confirmation_description = controller.pending_write_confirmation_tool.openai_schema[
+        "function"
+    ]["description"]
+
+    normalized_descriptions = [
+        " ".join(description.split())
+        for description in (summary_description, confirmation_description)
+    ]
+    for description in normalized_descriptions:
+        assert "active pending write" in description
+        assert "pending_write_id is not required" in description
+        assert "retry the same original write tool directly" in description
+    assert (
+        "after you have told the user the pending action and consequence"
+        in normalized_descriptions[0]
+    )
+    assert (
+        "after the user responds to that confirmation request"
+        in normalized_descriptions[1]
+    )
 
 
 def test_entity_ledger_initializes_domain_slots_and_serializes():
@@ -1492,6 +1559,14 @@ def test_pending_write_creation_blocks_first_write(monkeypatch, tmp_path):
     assert "record_pending_write_summary" in packet["ask_next"]
     assert "record_pending_write_confirmation" in packet["ask_next"]
     assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["record_pending_write_summary"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_summary_step(packet, "update_account")
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "update_account")
     assert "retry update_account directly" in packet["when_done"]
     assert environment.tools.write_count == 0
     assert "pending_write_created" in [event["event_type"] for event in events]
@@ -1697,6 +1772,138 @@ def test_denied_or_unclear_pending_write_does_not_allow_write():
         assert environment.tools.write_count == 0
 
 
+def test_unclear_pending_write_keeps_protocol_active_for_clarification():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="unclear",
+        basis="unclear_response",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write can close."],
+        last_action="No confirmed pending write yet.",
+        tick_id=14,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["missing_facts"] == ["pending_write_unclear"]
+    assert packet["allowed_internal_tools"] == ["record_pending_write_confirmation"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    clarification_step = _step_by_name(packet, "ask_one_clarification")
+    assert "clarification" in clarification_step["instruction"]
+
+    transfer = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_unclear_path",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User response was unclear."},
+        ),
+        tick_id=15,
+    )
+    transfer_packet = json.loads(transfer.content)
+    assert transfer.error is True
+    assert transfer_packet["missing_facts"] == ["transfer_blocked_pending_write"]
+
+    repeated_without_user = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="confirmed",
+        basis="latest_user_turn",
+        user_tick_id=12,
+        tool_tick_id=16,
+    )
+    assert repeated_without_user.error is True
+    assert json.loads(repeated_without_user.content)["reason"] == (
+        "missing_user_turn_after_unclear_confirmation"
+    )
+
+    clarified = _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="confirmed",
+        basis="latest_user_turn",
+        user_tick_id=17,
+        tool_tick_id=18,
+    )
+    assert clarified.error is False
+    assert controller.validator.pending_write_snapshot()["status"] == "confirmed"
+
+
+def test_denied_pending_write_allows_non_write_resolution_path():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    _record_pending_confirmation(
+        orchestrator,
+        controller,
+        decision="denied",
+        basis="user_declined",
+        user_tick_id=12,
+        tool_tick_id=13,
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims the write can close."],
+        last_action="User declined the pending write.",
+        tick_id=14,
+    )
+    transfer = orchestrator._execute_stagegate_tool_call(
+        controller,
+        ToolCall(
+            id="call_transfer_denied_path",
+            name="transfer_to_human_agents",
+            arguments={"summary": "User declined the pending write."},
+        ),
+        tick_id=15,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["missing_facts"] == ["pending_write_denied"]
+    assert packet["next_required_steps"][0]["step"] == "do_not_retry_denied_write"
+    assert packet["disallowed_tools"] == []
+    assert transfer.error is False
+
+
 def test_missing_exchange_summary_still_blocks_write():
     environment = _retail_exchange_environment()
     controller = StageGateController(
@@ -1721,6 +1928,14 @@ def test_missing_exchange_summary_still_blocks_write():
     assert "record_pending_write_summary" in packet["ask_next"]
     assert "record_pending_write_confirmation" in packet["ask_next"]
     assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["record_pending_write_summary"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_summary_step(packet, "exchange_delivered_order_items")
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
     assert "retry exchange_delivered_order_items directly" in packet["when_done"]
     assert "advance_stage" not in packet["when_done"]
     assert environment.tools.write_count == 0
@@ -1765,6 +1980,14 @@ def test_transfer_to_human_blocked_during_resolvable_pending_write(
     assert packet["missing_facts"] == ["transfer_blocked_pending_write"]
     assert "record_pending_write_summary" in packet["ask_next"]
     assert "pending_write_id" not in packet["ask_next"]
+    assert packet["allowed_internal_tools"] == ["record_pending_write_summary"]
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_summary_step(packet, "exchange_delivered_order_items")
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
     assert "transfer_blocked_pending_write" in event_types
     assert environment.tools.write_count == 0
 
@@ -1907,6 +2130,78 @@ def test_pending_exchange_retry_with_changed_args_blocks_as_mismatch(
     assert "pending_write_expired" in event_types
 
 
+def test_advance_stage_needs_summary_repeats_required_protocol_steps():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims confirmation happened."],
+        last_action="No structured pending write summary yet.",
+        tick_id=11,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["allowed_internal_tools"] == ["record_pending_write_summary"]
+    assert packet["allowed_write_tools"] == []
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_summary_step(packet, "exchange_delivered_order_items")
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+
+
+def test_advance_stage_summarized_repeats_confirmation_recording_steps():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+    orchestrator = _orchestrator_shell(environment)
+    _prepare_validated_retail_exchange(orchestrator, controller)
+
+    orchestrator._execute_stagegate_tool_call(
+        controller,
+        _exchange_tool_call("call_initial_exchange"),
+        tick_id=10,
+    )
+    _record_pending_summary(orchestrator, controller, tick_id=11)
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="verify_result_and_close",
+        observed_facts=["Model claims confirmation happened."],
+        last_action="No structured pending write confirmation yet.",
+        tick_id=12,
+    )
+
+    assert packet["stage"] == "propose_action_and_confirm"
+    assert packet["allowed_internal_tools"] == ["record_pending_write_confirmation"]
+    assert packet["allowed_write_tools"] == []
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    _assert_confirmation_step(packet)
+    _assert_retry_step(packet, "exchange_delivered_order_items")
+
+
 def test_confirmed_unconsumed_pending_write_keeps_stage_at_execute():
     environment = _retail_exchange_environment()
     controller = StageGateController(
@@ -1941,6 +2236,12 @@ def test_confirmed_unconsumed_pending_write_keeps_stage_at_execute():
 
     assert packet["stage"] == "execute_write_action"
     assert packet["allowed_write_tools"] == ["exchange_delivered_order_items"]
+    assert packet["allowed_internal_tools"] == []
+    assert packet["disallowed_tools"] == [
+        "advance_stage",
+        "transfer_to_human_agents",
+    ]
+    assert packet["next_required_steps"][0]["step"] == "retry_original_write"
     assert "Retry exchange_delivered_order_items" in packet["ask_next"]
 
 

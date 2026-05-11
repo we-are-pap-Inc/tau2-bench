@@ -116,11 +116,15 @@ NON_SIDE_EFFECTING_TOOL_NAMES = {
     "calculate",
     "transfer_to_human_agents",
 }
+ADVANCE_STAGE_TOOL_NAME = "advance_stage"
+RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME = "record_pending_write_summary"
+RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME = "record_pending_write_confirmation"
 TRANSFER_TOOL_NAME = "transfer_to_human_agents"
 TRANSFER_BLOCKING_PENDING_WRITE_STATUSES = {
     "needs_summary",
     "summarized",
     "confirmed",
+    "unclear",
     "mismatched_retry",
 }
 
@@ -660,11 +664,12 @@ class PreWriteValidator:
                 pending_write=pending_write.snapshot(),
             )
         if pending_write.status != "summarized":
-            return PendingWriteToolResult(
-                ok=False,
-                reason="pending_write_not_summarized",
-                pending_write=pending_write.snapshot(),
-            )
+            if pending_write.status != "unclear":
+                return PendingWriteToolResult(
+                    ok=False,
+                    reason="pending_write_not_summarized",
+                    pending_write=pending_write.snapshot(),
+                )
         pending_write.user_turn_after_summary_seen = self._user_turn_after_summary_seen(
             pending_write
         )
@@ -672,6 +677,16 @@ class PreWriteValidator:
             return PendingWriteToolResult(
                 ok=False,
                 reason="missing_user_turn_after_summary",
+                pending_write=pending_write.snapshot(),
+            )
+        if (
+            pending_write.status == "unclear"
+            and pending_write.confirmation_recorded_tick is not None
+            and not self._user_turn_after_confirmation_seen(pending_write)
+        ):
+            return PendingWriteToolResult(
+                ok=False,
+                reason="missing_user_turn_after_unclear_confirmation",
                 pending_write=pending_write.snapshot(),
             )
 
@@ -733,6 +748,9 @@ class PreWriteValidator:
                 tool_call=tool_call,
                 reason=reason,
                 read_tools=self._read_tool_names(),
+                pending_write_tool_name=None
+                if pending_write is None
+                else pending_write.tool_name,
             ),
             pending_write_id=None
             if pending_write is None
@@ -887,6 +905,17 @@ class PreWriteValidator:
             return False
         return any(
             tick > pending_write.summary_recorded_tick
+            for tick in self.state.user_turn_ticks
+        )
+
+    def _user_turn_after_confirmation_seen(
+        self,
+        pending_write: PendingWriteConfirmation,
+    ) -> bool:
+        if pending_write.confirmation_recorded_tick is None:
+            return False
+        return any(
+            tick > pending_write.confirmation_recorded_tick
             for tick in self.state.user_turn_ticks
         )
 
@@ -1299,23 +1328,156 @@ def args_fingerprint(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def pending_write_next_required_steps(
+    *,
+    tool_name: str,
+    status: str,
+) -> list[dict[str, object]]:
+    """Return model-actionable pending-write protocol steps for a status."""
+    summary_args: dict[str, object] = {
+        "summary_presented": True,
+        "action_type": tool_name,
+        "consequence_presented": True,
+        "confirmation_requested": True,
+    }
+    confirmation_args: dict[str, object] = {
+        "decision": "confirmed",
+        "basis": "latest_user_turn",
+    }
+    retry_step = {
+        "step": "retry_original_write",
+        "tool_name": tool_name,
+        "instruction": "Retry the same original write tool directly with the same arguments.",
+    }
+    no_advance_step = {
+        "step": "do_not_advance_stage",
+        "tool_name": ADVANCE_STAGE_TOOL_NAME,
+        "instruction": "Do not call advance_stage before retrying the write.",
+    }
+    no_transfer_step = {
+        "step": "do_not_transfer",
+        "tool_name": TRANSFER_TOOL_NAME,
+        "instruction": (
+            "Do not transfer unless the user explicitly asks for a human or an "
+            "unrecoverable error occurs."
+        ),
+    }
+
+    if status in {"needs_summary", "mismatched_retry"}:
+        return [
+            {
+                "step": "tell_user_pending_action",
+                "instruction": "Tell the user the pending action and consequence.",
+            },
+            {
+                "step": "ask_user_to_confirm",
+                "instruction": "Ask the user to confirm.",
+            },
+            {
+                "step": "call_tool",
+                "tool_name": RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME,
+                "arguments": summary_args,
+            },
+            {
+                "step": "wait_for_user_response",
+                "instruction": "Wait for the user's response.",
+            },
+            {
+                "step": "call_tool_if_user_confirms",
+                "tool_name": RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME,
+                "arguments": confirmation_args,
+            },
+            retry_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    if status == "summarized":
+        return [
+            {
+                "step": "wait_for_user_response",
+                "instruction": "Wait for the user's response to the confirmation request.",
+            },
+            {
+                "step": "call_tool_if_user_confirms",
+                "tool_name": RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME,
+                "arguments": confirmation_args,
+            },
+            retry_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    if status == "confirmed":
+        return [
+            retry_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    if status == "unclear":
+        return [
+            {
+                "step": "ask_one_clarification",
+                "instruction": "Ask one concise clarification question about whether the user confirms the pending action.",
+            },
+            {
+                "step": "wait_for_user_response",
+                "instruction": "Wait for the user's clarified response.",
+            },
+            {
+                "step": "call_tool_after_clarification",
+                "tool_name": RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME,
+                "arguments": confirmation_args,
+            },
+            retry_step,
+            no_advance_step,
+            no_transfer_step,
+        ]
+    return []
+
+
+def pending_write_allowed_internal_tools(*, status: str) -> list[str]:
+    """Return StageGate tools allowed for the active pending-write status."""
+    if status in {"needs_summary", "mismatched_retry"}:
+        return [RECORD_PENDING_WRITE_SUMMARY_TOOL_NAME]
+    if status in {"summarized", "unclear"}:
+        return [RECORD_PENDING_WRITE_CONFIRMATION_TOOL_NAME]
+    return []
+
+
+def pending_write_disallowed_tools(*, status: str) -> list[str]:
+    """Return tools the model should not call while pending write is active."""
+    if status in {
+        "needs_summary",
+        "summarized",
+        "confirmed",
+        "unclear",
+        "mismatched_retry",
+    }:
+        return [ADVANCE_STAGE_TOOL_NAME, TRANSFER_TOOL_NAME]
+    return []
+
+
 def build_corrective_packet(
     *,
     tool_call: ToolCall,
     reason: str,
     read_tools: list[str],
+    pending_write_tool_name: Optional[str] = None,
 ) -> StagePacket:
     """Build a corrective StageGate packet for a blocked tool call."""
+    protocol_tool_name = pending_write_tool_name or tool_call.name
+    protocol_status_by_reason = {
+        "missing_action_summary": "needs_summary",
+        "missing_confirmation": "summarized",
+        "pending_write_mismatch": "mismatched_retry",
+        "pending_write_unclear": "unclear",
+        "transfer_blocked_pending_write": "needs_summary",
+    }
+    protocol_status = protocol_status_by_reason.get(reason)
     do_not = [
         f"Do not call {tool_call.name} again until the missing prerequisite is satisfied.",
         "Do not call advance_stage before retrying the original write tool.",
     ]
-    if reason in {
-        "missing_action_summary",
-        "missing_confirmation",
-        "pending_write_mismatch",
-        "transfer_blocked_pending_write",
-    }:
+    if protocol_status is not None:
         do_not.append(
             "Do not transfer to a human agent unless the pending write protocol is "
             "structurally impossible or the pending write is denied or unclear."
@@ -1327,7 +1489,10 @@ def build_corrective_packet(
         known_facts={},
         missing_facts=[reason],
         ambiguous_facts=[],
-        ask_next=corrective_instruction(tool_call=tool_call, reason=reason),
+        ask_next=corrective_instruction(
+            tool_name=protocol_tool_name,
+            reason=reason,
+        ),
         allowed_read_tools=[
             tool_name
             for tool_name in read_tools
@@ -1337,6 +1502,18 @@ def build_corrective_packet(
             )
         ],
         allowed_write_tools=[],
+        allowed_internal_tools=[]
+        if protocol_status is None
+        else pending_write_allowed_internal_tools(status=protocol_status),
+        disallowed_tools=[]
+        if protocol_status is None
+        else pending_write_disallowed_tools(status=protocol_status),
+        next_required_steps=[]
+        if protocol_status is None
+        else pending_write_next_required_steps(
+            tool_name=protocol_tool_name,
+            status=protocol_status,
+        ),
         do_not=do_not,
         exit_condition=(
             "The pending write has a structured summary record and a structured "
@@ -1344,7 +1521,7 @@ def build_corrective_packet(
         ),
         when_done=(
             f"After record_pending_write_confirmation returns confirmed, retry "
-            f"{tool_call.name} directly with the same arguments."
+            f"{protocol_tool_name} directly with the same arguments."
         ),
     )
 
@@ -1366,7 +1543,7 @@ def stage_for_reason(reason: str) -> str:
     return "propose_action_and_confirm"
 
 
-def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
+def corrective_instruction(*, tool_name: str, reason: str) -> str:
     """Return concise corrective text for the model."""
     if reason == "missing_confirmation":
         return (
@@ -1374,19 +1551,19 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
             'record_pending_write_confirmation({"decision": "confirmed", '
             '"basis": "latest_user_turn"}) if the user confirmed, or use '
             "decision=denied/unclear as appropriate. If confirmed, retry the "
-            f"same original {tool_call.name} domain write tool directly."
+            f"same original {tool_name} domain write tool directly."
         )
     if reason == "missing_action_summary":
         return (
             "Tell the user the pending action and consequence, ask for explicit "
             "confirmation, then call "
             'record_pending_write_summary({"summary_presented": true, '
-            f'"action_type": "{tool_call.name}", "consequence_presented": true, '
+            f'"action_type": "{tool_name}", "consequence_presented": true, '
             '"confirmation_requested": true}). Wait for the user response. If '
             "the user confirms, call "
             'record_pending_write_confirmation({"decision": "confirmed", '
             '"basis": "latest_user_turn"}), then retry the same original '
-            f"{tool_call.name} domain write tool directly."
+            f"{tool_name} domain write tool directly."
         )
     if reason == "pending_write_mismatch":
         return (
@@ -1394,7 +1571,7 @@ def corrective_instruction(*, tool_call: ToolCall, reason: str) -> str:
             "Summarize the changed pending action and consequence, ask for "
             "explicit confirmation, then call "
             'record_pending_write_summary({"summary_presented": true, '
-            f'"action_type": "{tool_call.name}", "consequence_presented": true, '
+            f'"action_type": "{tool_name}", "consequence_presented": true, '
             '"confirmation_requested": true}). After the user responds, call '
             "record_pending_write_confirmation with decision=confirmed, denied, "
             "or unclear. If confirmed, retry the same domain write tool directly."

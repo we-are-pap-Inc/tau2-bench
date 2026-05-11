@@ -230,6 +230,12 @@ remains validator-free; the pre-write validator is active only for
   model-facing protocol does not require copying an opaque pending-write ID.
 - [x] Block `transfer_to_human_agents` while a resolvable active pending write is
   waiting for summary, structured confirmation, or direct retry.
+- [x] Add `next_required_steps`, `allowed_internal_tools`, and
+  `disallowed_tools` to corrective and active-pending packets so the model sees
+  the pending-write protocol as a mechanical checklist instead of prose.
+- [x] Keep denied and unclear decisions structural: denied blocks the write and
+  allows non-write resolution; unclear keeps the protocol active, blocks
+  transfer, and requires a later user turn before recording another decision.
 - [x] Emit pending-write trace events for creation, structured summary record,
   structured confirmation/denial/unclear decisions, mismatched retry, and
   consumption.
@@ -670,6 +676,18 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
   `make check-all` result: `All checks passed!` and `329 files left
   unchanged`.
 - 2026-05-10 active pending-write protocol:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-10 active pending-write affordance hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `78 passed, 2 warnings in 0.33s`.
+- 2026-05-10 active pending-write affordance hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-10 active pending-write affordance hardening:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-10 active pending-write affordance hardening:
   `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
   result: `StageGate prohibited-path guard passed.`
 

@@ -214,16 +214,23 @@ Pending write confirmation:
   `record_pending_write_confirmation` after a later user response.
 - There is at most one active pending write. The model-facing internal tools
   apply to that active pending write and do not require a pending write ID.
+- Corrective and active-pending packets include `next_required_steps` with exact
+  structured calls for `record_pending_write_summary`,
+  `record_pending_write_confirmation`, and the direct retry.
 - A retry is allowed only when the pending write is `confirmed` and the retried
   tool name and argument fingerprint match.
 - A successful side-effecting domain-tool result marks the pending write
   `consumed`; only consumed writes can satisfy write-intent closeout.
 - Changed retry arguments create a `pending_write_mismatch` block and require a
   fresh structured summary and confirmation.
+- `denied` keeps the write blocked and permits graceful close or alternative
+  non-write assistance. `unclear` keeps the protocol active, asks one
+  clarification, and allows another structured confirmation decision after a
+  later user turn.
 - `transfer_to_human_agents` is blocked while a resolvable active pending write
-  is `needs_summary`, `summarized`, `confirmed`, or `mismatched_retry`. Transfer
+  is `needs_summary`, `summarized`, `confirmed`, `unclear`, or `mismatched_retry`. Transfer
   is allowed with no active pending write, or after the active pending write is
-  `denied`, `unclear`, `consumed`, or `expired`.
+  `denied`, `consumed`, or `expired`.
 
 Allow result:
 
@@ -236,6 +243,16 @@ Block result:
       "reason": "missing_confirmation",
       "corrective_packet": {
         "say_next": "Tell the user the pending action and consequence, ask for explicit confirmation, call record_pending_write_summary with structured booleans, then after the user responds call record_pending_write_confirmation with a structured decision.",
+        "next_required_steps": [
+          {"step": "tell_user_pending_action"},
+          {"step": "ask_user_to_confirm"},
+          {"step": "call_tool", "tool_name": "record_pending_write_summary", "arguments": {"summary_presented": true, "action_type": "<write_tool>", "consequence_presented": true, "confirmation_requested": true}},
+          {"step": "wait_for_user_response"},
+          {"step": "call_tool_if_user_confirms", "tool_name": "record_pending_write_confirmation", "arguments": {"decision": "confirmed", "basis": "latest_user_turn"}},
+          {"step": "retry_original_write", "tool_name": "<write_tool>"}
+        ],
+        "allowed_internal_tools": ["record_pending_write_summary"],
+        "disallowed_tools": ["advance_stage", "transfer_to_human_agents"],
         "allowed_next_tools": [],
         "do_not": ["Do not call advance_stage before retrying the original write tool.", "Do not transfer while the active pending write is still resolvable."]
       }

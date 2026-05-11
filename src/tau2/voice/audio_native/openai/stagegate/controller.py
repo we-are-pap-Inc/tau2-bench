@@ -25,6 +25,9 @@ from tau2.voice.audio_native.openai.stagegate.trace import (
 from tau2.voice.audio_native.openai.stagegate.validator import (
     PreWriteValidator,
     ValidatorDecision,
+    pending_write_allowed_internal_tools,
+    pending_write_disallowed_tools,
+    pending_write_next_required_steps,
 )
 
 CONDITION_ENV_VAR = "TAU2_STAGEGATE_CONDITION"
@@ -88,9 +91,11 @@ def record_pending_write_summary(
     """Record that the assistant summarized a pending write and asked confirmation.
 
     This StageGate-only orchestration tool does not modify domain state.
-    Use this after you have summarized the currently active pending write and
-    asked the user to confirm. You do not need to provide a pending_write_id;
-    this applies to the active pending write.
+    This applies to the active pending write. pending_write_id is not required.
+    Use record_pending_write_summary after you have told the user the pending
+    action and consequence and asked for confirmation. If the user later
+    confirms, record that response with record_pending_write_confirmation and
+    retry the same original write tool directly.
 
     Args:
         summary_presented: Whether the assistant presented the pending write summary.
@@ -120,8 +125,10 @@ def record_pending_write_confirmation(
     """Record the assistant's structured decision after the user's response.
 
     This StageGate-only orchestration tool does not modify domain state.
-    Use this after the user responds to the confirmation question for the
-    active pending write. You do not need to provide a pending_write_id.
+    This applies to the active pending write. pending_write_id is not required.
+    Use record_pending_write_confirmation after the user responds to that
+    confirmation request. If confirmed, retry the same original write tool
+    directly.
 
     Args:
         decision: Whether the user confirmed, denied, or gave an unclear response.
@@ -922,6 +929,14 @@ class StageGateController:
                         "and confirmation_requested=true."
                     ),
                     "allowed_write_tools": [],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
                         "Do not call a write/action tool before structured confirmation.",
                         "Do not call advance_stage before retrying the original write tool.",
@@ -950,6 +965,14 @@ class StageGateController:
                         "and basis=latest_user_turn."
                     ),
                     "allowed_write_tools": [],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
                         "Do not call a write/action tool before structured confirmation.",
                         "Do not call advance_stage before retrying the original write tool.",
@@ -966,31 +989,79 @@ class StageGateController:
                     "missing_facts": [],
                     "ask_next": f"Retry {tool_name} now with the same confirmed arguments.",
                     "allowed_write_tools": [tool_name],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
                         "Do not change the confirmed write arguments.",
                         "Do not call advance_stage before retrying the original write tool.",
+                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
                     ],
                     "exit_condition": "The confirmed write tool has completed or returned an error.",
                     "when_done": "After the tool returns, call advance_stage with the visible tool result.",
                 }
             )
-        if status in {"denied", "unclear"}:
+        if status == "unclear":
             return packet.model_copy(
                 update={
                     "stage": "propose_action_and_confirm",
-                    "missing_facts": [f"pending_write_{status}"],
+                    "missing_facts": ["pending_write_unclear"],
                     "ask_next": (
-                        "Do not retry the pending write. Ask one clarification "
-                        "or propose a changed action, then use the pending-write "
-                        "tools again if a new write is needed."
+                        "Ask one concise clarification question. After the user "
+                        "responds, call record_pending_write_confirmation again "
+                        "with confirmed, denied, or unclear."
                     ),
                     "allowed_write_tools": [],
+                    "allowed_internal_tools": pending_write_allowed_internal_tools(
+                        status=status
+                    ),
+                    "disallowed_tools": pending_write_disallowed_tools(status=status),
+                    "next_required_steps": pending_write_next_required_steps(
+                        tool_name=tool_name,
+                        status=status,
+                    ),
                     "do_not": [
-                        "Do not call the denied or unclear write tool.",
+                        "Do not retry the unclear write tool before structured confirmation.",
                         "Do not call advance_stage before resolving the pending write.",
+                        "Do not transfer to a human agent unless the pending write protocol is structurally impossible or the pending write is denied or unclear.",
                     ],
-                    "exit_condition": "The pending write is clarified, changed, or abandoned.",
-                    "when_done": "Proceed only after the pending-write status changes.",
+                    "exit_condition": "record_pending_write_confirmation returned confirmed or denied.",
+                    "when_done": f"If confirmed, retry {tool_name} directly.",
+                }
+            )
+        if status == "denied":
+            return packet.model_copy(
+                update={
+                    "stage": "propose_action_and_confirm",
+                    "missing_facts": ["pending_write_denied"],
+                    "ask_next": (
+                        "Do not retry the denied pending write. Gracefully close "
+                        "or offer alternative help that does not execute this write."
+                    ),
+                    "allowed_write_tools": [],
+                    "allowed_internal_tools": [],
+                    "disallowed_tools": [],
+                    "next_required_steps": [
+                        {
+                            "step": "do_not_retry_denied_write",
+                            "tool_name": tool_name,
+                            "instruction": "Do not retry the denied pending write.",
+                        },
+                        {
+                            "step": "non_write_resolution",
+                            "instruction": "Gracefully close or offer alternative non-write help.",
+                        },
+                    ],
+                    "do_not": [
+                        "Do not call the denied write tool.",
+                    ],
+                    "exit_condition": "The denied write is not executed.",
+                    "when_done": "Close or continue only with non-write assistance.",
                 }
             )
         return packet
