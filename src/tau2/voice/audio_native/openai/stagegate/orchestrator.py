@@ -44,6 +44,17 @@ READ_TOOL_PREFIXES = (
     "search_",
 )
 
+READ_TOOL_PRIORITY_PREFIXES = (
+    "get_",
+    "find_",
+    "search_",
+    "list_",
+    "check_",
+    "run_",
+    "can_",
+    "calculate",
+)
+
 WRITE_TOOL_PREFIXES = (
     "book_",
     "cancel_",
@@ -76,6 +87,68 @@ NON_SIDE_EFFECTING_TOOL_NAMES = {
     "calculate",
     "transfer_to_human_agents",
 }
+
+STAGE_ALIASES = {
+    "auth": "identify_or_authenticate",
+    "authenticate": "identify_or_authenticate",
+    "authentication": "identify_or_authenticate",
+    "identify": "identify_or_authenticate",
+    "identity": "identify_or_authenticate",
+    "collect": "collect_required_exact_entities",
+    "entity": "collect_required_exact_entities",
+    "exact": "collect_required_exact_entities",
+    "inspect": "inspect_state_with_read_tools",
+    "lookup": "inspect_state_with_read_tools",
+    "read": "inspect_state_with_read_tools",
+    "policy": "check_policy_eligibility",
+    "eligibility": "check_policy_eligibility",
+    "confirm": "propose_action_and_confirm",
+    "confirmation": "propose_action_and_confirm",
+    "propose": "propose_action_and_confirm",
+}
+
+READ_REPAIR_TERMS = (
+    "availability",
+    "available",
+    "check",
+    "details",
+    "fetch",
+    "inspect",
+    "inventory",
+    "look up",
+    "lookup",
+    "read tool",
+    "retrieve",
+    "variant",
+)
+
+READ_REPAIR_MARKERS = (
+    "before",
+    "blocked",
+    "cannot",
+    "do not allow",
+    "does not allow",
+    "missing",
+    "need",
+    "required",
+    "requires",
+)
+
+READ_TOOL_HINTS = (
+    ("product", "get_product_details"),
+    ("variant", "get_product_details"),
+    ("inventory", "get_product_details"),
+    ("availability", "get_product_details"),
+    ("order", "get_order_details"),
+    ("reservation", "get_reservation_details"),
+    ("flight", "search_direct_flight"),
+    ("user", "get_user_details"),
+    ("customer", "get_customer_by_phone"),
+    ("phone", "get_customer_by_phone"),
+    ("line", "get_details_by_id"),
+    ("bill", "get_bills_for_customer"),
+    ("usage", "get_data_usage"),
+)
 
 IDENTITY_READ_HINTS = {
     "retail": ("find_user", "get_user", "get_order"),
@@ -300,6 +373,13 @@ class StagePacketOrchestrator:
         """Build a compact packet from visible state."""
         stage = forced_stage or self._choose_stage(current_stage, blocker)
         domain = self._domain(domain_name=domain_name, ledger=ledger)
+        stage = self._stage_only_repair_stage(
+            stage=stage,
+            observed_facts=observed_facts,
+            last_action=last_action,
+            blocker=blocker,
+            ledger=ledger,
+        )
         inventory = self._split_tools(tools)
         allowed_read_tools = self._allowed_read_tools(
             stage=stage,
@@ -337,6 +417,10 @@ class StagePacketOrchestrator:
             ambiguous.extend(self._stage_ambiguous_facts(ledger, stage, domain))
         if blocker:
             missing.insert(0, blocker)
+        allowed_read_tools = self._prioritize_read_tools(
+            allowed_read_tools,
+            context_parts=[*missing, *observed_facts, last_action],
+        )
         if (
             domain == "retail"
             and stage == "execute_write_action"
@@ -470,19 +554,50 @@ class StagePacketOrchestrator:
         }
 
     def _choose_stage(self, current_stage: str, blocker: str | None) -> str:
-        if current_stage not in STAGES:
+        stage = self._canonical_stage(current_stage)
+        if stage not in STAGES:
             return STAGES[0]
         if blocker:
-            return current_stage
-        idx = STAGES.index(current_stage)
+            return stage
+        idx = STAGES.index(stage)
         return STAGES[min(idx + 1, len(STAGES) - 1)]
+
+    def _canonical_stage(self, current_stage: str) -> str:
+        stage = current_stage.strip().lower()
+        if stage in STAGES:
+            return stage
+        stage_tokens = set(HINT_TOKEN_RE.findall(stage))
+        for token in stage_tokens:
+            canonical = STAGE_ALIASES.get(token)
+            if canonical is not None:
+                return canonical
+        return STAGES[0]
+
+    def _stage_only_repair_stage(
+        self,
+        *,
+        stage: str,
+        observed_facts: list[str],
+        last_action: str,
+        blocker: str | None,
+        ledger: EntityLedger | None,
+    ) -> str:
+        if ledger is not None or stage not in {
+            "propose_action_and_confirm",
+            "execute_write_action",
+        }:
+            return stage
+        context = " ".join([*(observed_facts or []), last_action, blocker or ""])
+        if self._context_requests_read_tool(context):
+            return "inspect_state_with_read_tools"
+        return stage
 
     def _split_tools(self, tools: list[Tool]) -> ToolInventory:
         read_tools: list[str] = []
         write_tools: list[str] = []
         for tool in tools:
             if tool.name in NON_SIDE_EFFECTING_TOOL_NAMES:
-                if tool.name != "advance_stage":
+                if tool.name not in {"advance_stage", "transfer_to_human_agents"}:
                     read_tools.append(tool.name)
                 continue
             if self._is_write_tool(tool):
@@ -490,7 +605,7 @@ class StagePacketOrchestrator:
             else:
                 read_tools.append(tool.name)
         return ToolInventory(
-            read_tools=tuple(sorted(read_tools)),
+            read_tools=tuple(self._prioritize_read_tools(read_tools)),
             write_tools=tuple(sorted(write_tools)),
         )
 
@@ -554,16 +669,18 @@ class StagePacketOrchestrator:
                     f"confirmed, call {selected_write_tool}. If confirmation is "
                     "still missing, summarize the selected fallback and ask once."
                 )
-        if missing:
-            return f"Ask the customer for {missing[0]}."
         if stage == "inspect_state_with_read_tools":
             if allowed_read_tools:
                 return f"Call {allowed_read_tools[0]} to inspect the official current state."
             return "Ask for the exact identifier needed to inspect official state."
         if stage == "check_policy_eligibility":
-            if allowed_read_tools:
+            if allowed_read_tools and self._missing_requires_read_tool(missing):
                 return f"Use {allowed_read_tools[0]} or the last read result to check the public policy requirements."
+            if missing:
+                return f"Ask the customer for {missing[0]}."
             return "Explain that the policy cannot be checked until official state is available."
+        if missing:
+            return f"Ask the customer for {missing[0]}."
         if stage == "propose_action_and_confirm":
             return "Summarize the intended change and consequence, then ask: Do you confirm?"
         if stage == "execute_write_action":
@@ -982,6 +1099,51 @@ class StagePacketOrchestrator:
             for token in HINT_TOKEN_RE.findall(text.lower())
             if token not in HINT_STOPWORDS and (len(token) > 2 or token == "id")
         )
+
+    def _context_requests_read_tool(self, context: str) -> bool:
+        text = context.lower()
+        if not any(marker in text for marker in READ_REPAIR_MARKERS):
+            return False
+        return any(term in text for term in READ_REPAIR_TERMS)
+
+    def _missing_requires_read_tool(self, missing: list[str]) -> bool:
+        if not missing:
+            return True
+        first_missing = missing[0].lower()
+        return self._context_requests_read_tool(first_missing) or any(
+            term in first_missing
+            for term in ("official", "policy-relevant", "state", "facts")
+        )
+
+    def _prioritize_read_tools(
+        self,
+        read_tools: list[str],
+        *,
+        context_parts: list[str] | None = None,
+    ) -> list[str]:
+        tools = list(dict.fromkeys(read_tools))
+        if not tools:
+            return []
+        context = " ".join(context_parts or []).lower()
+        hinted_with_position: list[tuple[int, str]] = []
+        for term, tool_name in READ_TOOL_HINTS:
+            position = context.find(term)
+            if position >= 0 and tool_name in tools:
+                hinted_with_position.append((position, tool_name))
+        hinted: list[str] = []
+        for _, tool_name in sorted(hinted_with_position):
+            if tool_name not in hinted:
+                hinted.append(tool_name)
+
+        def priority(name: str) -> tuple[int, str]:
+            if name in hinted:
+                return (hinted.index(name), name)
+            for idx, prefix in enumerate(READ_TOOL_PRIORITY_PREFIXES, start=10):
+                if name.startswith(prefix):
+                    return (idx, name)
+            return (99, name)
+
+        return sorted(tools, key=priority)
 
     def _fallback_ask_next(self, packet: StagePacket) -> str:
         if packet.missing_facts and packet.missing_facts[0] == "entity_repair_required":
