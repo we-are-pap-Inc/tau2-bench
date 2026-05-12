@@ -10,6 +10,8 @@ from scripts.stagegate_final_run_hygiene import validate_final_run_manifest
 from scripts.stagegate_modal_runner_config import (
     CONDITIONS,
     DEFAULT_REPO_URL,
+    DEV_CONSTANTS,
+    DEV_SPEECH_COMPLEXITY_BY_DOMAIN,
     DOMAINS,
     FINAL_CONSTANTS,
     OPTIONAL_CONTROL_VOICE_ID_KEYS,
@@ -32,6 +34,7 @@ from scripts.stagegate_modal_runner_config import (
     run_constants,
     save_name,
     trace_run_id,
+    validate_dev_command,
     validate_final_command,
     validate_smoke_command,
     wait_for_stagegate_calls,
@@ -72,6 +75,9 @@ def test_final_mode_rejects_subsets_and_non_sha_refs():
     with pytest.raises(ValueError, match="40-character"):
         require_full_commit_sha("stagegate", mode="final")
 
+    with pytest.raises(ValueError, match="40-character"):
+        require_full_commit_sha("stagegate", mode="dev")
+
     require_full_commit_sha("stagegate", mode="smoke")
 
 
@@ -98,6 +104,28 @@ def test_smoke_mode_rejects_condition_subsets_and_non_retail_without_override():
         StageGateJob(condition="baseline", domain="telecom", mode="smoke"),
         StageGateJob(condition="stage_only", domain="telecom", mode="smoke"),
         StageGateJob(condition="stagegate", domain="telecom", mode="smoke"),
+    ]
+
+
+def test_dev_mode_defaults_to_mixed_ten_task_replication_matrix():
+    jobs = planned_jobs(mode="dev")
+
+    assert len(jobs) == 9
+    assert [(job.condition, job.domain) for job in jobs] == [
+        (condition, domain) for condition in CONDITIONS for domain in DOMAINS
+    ]
+    assert {job.mode for job in jobs} == {"dev"}
+
+
+def test_dev_mode_allows_full_condition_domain_job_subset():
+    with pytest.raises(ValueError, match="both condition and domain"):
+        planned_jobs(mode="dev", condition="stagegate")
+
+    with pytest.raises(ValueError, match="both condition and domain"):
+        planned_jobs(mode="dev", domain="telecom")
+
+    assert planned_jobs(mode="dev", condition="stagegate", domain="telecom") == [
+        StageGateJob(condition="stagegate", domain="telecom", mode="dev")
     ]
 
 
@@ -130,6 +158,30 @@ def test_build_tau2_command_enforces_smoke_constants_and_debug_artifacts():
     assert argv[argv.index("--save-to") + 1] == "smoke_batch_stage_only_retail"
 
 
+def test_build_tau2_command_enforces_dev_replication_constants():
+    retail_job = StageGateJob(condition="stagegate", domain="retail", mode="dev")
+    retail_argv = build_tau2_command("batch", retail_job)
+    airline_job = StageGateJob(condition="baseline", domain="airline", mode="dev")
+    airline_argv = build_tau2_command("batch", airline_job)
+
+    validate_dev_command(retail_argv, job=retail_job)
+    validate_dev_command(airline_argv, job=airline_job)
+    assert (
+        retail_argv[retail_argv.index("--audio-native-model") + 1]
+        == (DEV_CONSTANTS["model"])
+    )
+    assert retail_argv[retail_argv.index("--speech-complexity") + 1] == "regular"
+    assert airline_argv[airline_argv.index("--speech-complexity") + 1] == "control"
+    assert retail_argv[retail_argv.index("--max-steps-seconds") + 1] == "600"
+    assert retail_argv[retail_argv.index("--num-tasks") + 1] == "10"
+    assert "--audio-taps" not in retail_argv
+    assert "--auto-resume" not in retail_argv
+    assert "--task-ids" not in retail_argv
+    assert retail_argv[retail_argv.index("--save-to") + 1] == (
+        "dev_batch_stagegate_retail"
+    )
+
+
 def test_validate_final_command_rejects_task_filters_and_mutated_constants():
     job = StageGateJob(condition="baseline", domain="retail", mode="final")
     argv = build_tau2_command("batch", job)
@@ -159,6 +211,20 @@ def test_validate_smoke_command_rejects_final_shape_and_task_ids():
     without_audio_taps = [arg for arg in argv if arg != "--audio-taps"]
     with pytest.raises(ValueError, match="audio-taps"):
         validate_smoke_command(without_audio_taps)
+
+
+def test_validate_dev_command_rejects_task_ids_audio_taps_and_auto_resume():
+    job = StageGateJob(condition="baseline", domain="retail", mode="dev")
+    argv = build_tau2_command("batch", job)
+
+    with pytest.raises(ValueError, match="--task-ids"):
+        validate_dev_command([*argv, "--task-ids", "retail_1"], job=job)
+
+    with pytest.raises(ValueError, match="audio-taps"):
+        validate_dev_command([*argv, "--audio-taps"], job=job)
+
+    with pytest.raises(ValueError, match="auto-resume"):
+        validate_dev_command([*argv, "--auto-resume"], job=job)
 
 
 def test_manifest_shape_passes_final_hygiene_guard():
@@ -198,6 +264,25 @@ def test_smoke_manifest_is_rejected_by_final_hygiene_guard():
     assert any("40-character repo SHA" in error for error in errors)
 
 
+def test_dev_manifest_is_rejected_by_final_hygiene_guard():
+    job = StageGateJob(condition="baseline", domain="retail", mode="dev")
+    manifest = job_manifest_base(
+        batch_id="dryrun",
+        repo_url=DEFAULT_REPO_URL,
+        repo_ref=COMMIT_SHA,
+        resolved_commit_sha=None,
+        job=job,
+        start_timestamp=None,
+        end_timestamp=None,
+        status="planned",
+    )
+
+    errors = validate_final_run_manifest([manifest])
+
+    assert any("mode='final'" in error for error in errors)
+    assert any("must not use task filters" in error for error in errors)
+
+
 def test_smoke_manifest_has_trace_run_id_and_smoke_metadata():
     job = StageGateJob(condition="stagegate", domain="retail", mode="smoke")
     manifest = job_manifest_base(
@@ -218,6 +303,32 @@ def test_smoke_manifest_has_trace_run_id_and_smoke_metadata():
     assert manifest["audio_taps"] is True
     assert manifest["auto_resume"] is False
     assert manifest["save_name"] == save_name("batch", job)
+
+
+def test_dev_manifest_has_mixed_speech_and_ten_task_metadata():
+    jobs = planned_jobs(mode="dev")
+    manifests = [
+        job_manifest_base(
+            batch_id="batch",
+            repo_url=DEFAULT_REPO_URL,
+            repo_ref=COMMIT_SHA,
+            resolved_commit_sha=COMMIT_SHA,
+            job=job,
+            start_timestamp=None,
+            end_timestamp=None,
+            status="planned",
+        )
+        for job in jobs
+    ]
+
+    assert {manifest["mode"] for manifest in manifests} == {"dev"}
+    assert {manifest["num_tasks"] for manifest in manifests} == {"10"}
+    assert {manifest["max_steps_seconds"] for manifest in manifests} == {"600"}
+    assert all(manifest["audio_taps"] is False for manifest in manifests)
+    assert all(manifest["auto_resume"] is False for manifest in manifests)
+    assert {
+        manifest["domain"]: manifest["speech_complexity"] for manifest in manifests
+    } == DEV_SPEECH_COMPLEXITY_BY_DOMAIN
 
 
 def test_collect_completed_manifest_reads_per_job_manifests(tmp_path: Path):
@@ -348,6 +459,27 @@ def test_write_planned_smoke_manifest_is_three_retail_jobs(tmp_path: Path):
     ]
     assert all(run["mode"] == "smoke" for run in manifest["runs"])
     assert all(run["speech_complexity"] == "control" for run in manifest["runs"])
+    assert any(validate_final_run_manifest(manifest["runs"]))
+
+
+def test_write_planned_dev_manifest_is_mixed_replication_matrix(tmp_path: Path):
+    output = tmp_path / "batch_manifest_planned.json"
+
+    manifest = write_planned_manifest(
+        batch_id="batch",
+        repo_url=DEFAULT_REPO_URL,
+        repo_ref=COMMIT_SHA,
+        mode="dev",
+        output_path=output,
+    )
+
+    assert output.exists()
+    assert len(manifest["runs"]) == 9
+    assert all(run["mode"] == "dev" for run in manifest["runs"])
+    assert all(run["num_tasks"] == "10" for run in manifest["runs"])
+    assert {
+        run["domain"]: run["speech_complexity"] for run in manifest["runs"]
+    } == DEV_SPEECH_COMPLEXITY_BY_DOMAIN
     assert any(validate_final_run_manifest(manifest["runs"]))
 
 
@@ -486,6 +618,15 @@ def test_modal_runner_waits_for_spawned_calls_before_entrypoint_exits():
     )
     assert "FunctionCall.get()" in source
     assert "blocking/waiting mode" in source
+
+
+def test_modal_runner_throttles_dev_job_batches():
+    source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
+
+    assert "modal_job_concurrency" in source
+    assert '3 if mode == "dev" else len(jobs)' in source
+    assert "range(0, len(jobs), job_concurrency)" in source
+    assert "blocking until this Modal batch completes" in source
 
 
 def test_modal_runner_packages_config_helpers_for_remote_import():
