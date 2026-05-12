@@ -1749,6 +1749,111 @@ def test_stage_only_missing_fact_matching_treats_slash_as_alternative():
     )
 
 
+def test_stage_only_maps_authentication_stage_alias_to_identity_stage():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="authenticate_user",
+        observed_facts=[
+            "Customer provided first name Mei, last name Kovacs, zip 28236."
+        ],
+        blocker="Need full first and last name plus ZIP to locate user ID",
+    )
+
+    assert packet["stage"] == "identify_or_authenticate"
+    assert packet["allowed_read_tools"]
+    assert "transfer_to_human_agents" not in packet["allowed_read_tools"]
+
+
+def test_stage_only_stage_aliases_do_not_match_substrings():
+    environment = _environment(domain_name="retail")
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    action_packet = _advance_stage_packet(
+        controller,
+        current_stage="action_planning",
+        observed_facts=["Customer described a possible order change."],
+        tick_id=1,
+    )
+    ready_packet = _advance_stage_packet(
+        controller,
+        current_stage="write_ready",
+        observed_facts=["Customer described a possible order change."],
+        tick_id=2,
+    )
+
+    assert action_packet["stage"] == "identify_or_authenticate"
+    assert ready_packet["stage"] == "identify_or_authenticate"
+
+
+def test_stage_only_reopens_read_path_when_confirmation_stage_needs_inventory():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="propose_action_and_confirm",
+        observed_facts=[
+            "User needs availability check for replacement variants before confirmation."
+        ],
+        last_action=(
+            "Blocked because exact replacement item IDs and availability require "
+            "inventory lookup, but current stage does not allow read tools."
+        ),
+        blocker=(
+            "Need to inspect product variants to find available replacement item IDs "
+            "matching requested options before summarizing final exchange action."
+        ),
+    )
+
+    assert packet["stage"] == "inspect_state_with_read_tools"
+    assert packet["allowed_read_tools"][0] == "get_product_details"
+    assert packet["ask_next"].startswith(
+        "Call get_product_details to inspect the official current state."
+    )
+    assert "transfer_to_human_agents" not in packet["allowed_read_tools"]
+
+
+def test_stage_only_policy_state_missing_prefers_read_tool_over_customer_question():
+    environment = _retail_exchange_environment()
+    controller = StageGateController(
+        condition="stage_only",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    packet = _advance_stage_packet(
+        controller,
+        current_stage="inspect_state_with_read_tools",
+        observed_facts=["Product variants were inspected."],
+        last_action="Inspected product variants and found a matching available item.",
+    )
+
+    assert packet["stage"] == "check_policy_eligibility"
+    assert packet["allowed_read_tools"][0] == "get_order_details"
+    assert packet["ask_next"].startswith(
+        "Use get_order_details or the last read result"
+    )
+
+
 def test_retail_identity_packet_excludes_later_stage_slots():
     environment = _environment(domain_name="retail")
     controller = StageGateController(
