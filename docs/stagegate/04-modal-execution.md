@@ -238,6 +238,42 @@ approval:
       --repo-ref FINAL_40_CHAR_COMMIT_SHA \
       --mode final
 
+## Live Dev Candidate Mode
+
+Dev mode supports full condition/domain jobs for paid candidate selection without
+changing final-run constants or benchmark harness behavior. It always keeps
+`tau2 --max-concurrency 1`; `--modal-job-concurrency` controls only how many
+independent Modal jobs are active at once.
+
+Dev mode constants:
+
+      model: gpt-realtime-2
+      provider: openai
+      reasoning_effort: high
+      speech_complexity: regular for retail, control for airline/telecom
+      tick_duration: 0.2
+      max_steps_seconds: 600
+      max_concurrency: 1
+      seed: 300
+      num_tasks: 10
+      audio_taps: false
+
+By default, dev mode runs the full 9-job development matrix. For candidate
+selection, use dev-only plural selectors to run a smaller matrix in one command:
+
+    uv run --with modal modal run modal_tau3_voice_stagegate.py \
+      --batch-id stageonly_candidate_010_001 \
+      --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
+      --repo-ref NEW_40_CHAR_COMMIT_SHA \
+      --mode dev \
+      --conditions baseline,stage_only \
+      --domains retail,airline,telecom \
+      --modal-job-concurrency 4
+
+Plural selectors are dev-only. Do not use them for final mode. If a provider
+crash invalidates a job, rerun the full condition/domain job with a new batch
+suffix; do not cherry-pick individual failed tasks.
+
 ## Manifest Flow
 
 The plan-only dry-run or live local launcher writes `batch_manifest_planned.json`

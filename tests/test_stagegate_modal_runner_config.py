@@ -9,6 +9,7 @@ import pytest
 from scripts.stagegate_final_run_hygiene import validate_final_run_manifest
 from scripts.stagegate_modal_runner_config import (
     CONDITIONS,
+    DEFAULT_DEV_MODAL_JOB_CONCURRENCY,
     DEFAULT_REPO_URL,
     DEV_CONSTANTS,
     DEV_SPEECH_COMPLEXITY_BY_DOMAIN,
@@ -31,6 +32,7 @@ from scripts.stagegate_modal_runner_config import (
     planned_jobs,
     planned_manifest,
     require_full_commit_sha,
+    resolve_modal_job_concurrency,
     run_constants,
     save_name,
     trace_run_id,
@@ -127,6 +129,101 @@ def test_dev_mode_allows_full_condition_domain_job_subset():
     assert planned_jobs(mode="dev", condition="stagegate", domain="telecom") == [
         StageGateJob(condition="stagegate", domain="telecom", mode="dev")
     ]
+
+
+def test_dev_mode_allows_plural_candidate_matrix_selectors():
+    jobs = planned_jobs(
+        mode="dev",
+        conditions="baseline,stage_only",
+        domains="retail,airline,telecom",
+    )
+
+    assert len(jobs) == 6
+    assert [(job.condition, job.domain) for job in jobs] == [
+        ("baseline", "retail"),
+        ("baseline", "airline"),
+        ("baseline", "telecom"),
+        ("stage_only", "retail"),
+        ("stage_only", "airline"),
+        ("stage_only", "telecom"),
+    ]
+    assert {job.mode for job in jobs} == {"dev"}
+
+
+def test_dev_plural_selectors_are_canonical_and_reject_bad_values():
+    assert planned_jobs(
+        mode="dev",
+        conditions="stage_only,baseline",
+        domains="telecom,retail",
+    ) == [
+        StageGateJob(condition="baseline", domain="retail", mode="dev"),
+        StageGateJob(condition="baseline", domain="telecom", mode="dev"),
+        StageGateJob(condition="stage_only", domain="retail", mode="dev"),
+        StageGateJob(condition="stage_only", domain="telecom", mode="dev"),
+    ]
+
+    with pytest.raises(ValueError, match="cannot mix singular and plural"):
+        planned_jobs(
+            mode="dev",
+            condition="baseline",
+            domains="retail,telecom",
+        )
+
+    with pytest.raises(ValueError, match="unsupported conditions"):
+        planned_jobs(mode="dev", conditions="baseline,other")
+
+    with pytest.raises(ValueError, match="duplicates"):
+        planned_jobs(mode="dev", domains="retail,retail")
+
+
+def test_non_dev_modes_reject_plural_selectors():
+    with pytest.raises(ValueError, match="final mode does not accept"):
+        planned_jobs(mode="final", conditions="baseline,stage_only")
+
+    with pytest.raises(ValueError, match="smoke mode does not accept plural"):
+        planned_jobs(mode="smoke", domains="retail,airline")
+
+
+def test_modal_job_concurrency_defaults_and_overrides():
+    dev_jobs_matrix = planned_jobs(
+        mode="dev",
+        conditions="baseline,stage_only",
+        domains="retail,airline,telecom",
+    )
+    smoke_jobs_matrix = planned_jobs(mode="smoke")
+
+    assert (
+        resolve_modal_job_concurrency(
+            mode="dev",
+            jobs=dev_jobs_matrix,
+        )
+        == DEFAULT_DEV_MODAL_JOB_CONCURRENCY
+    )
+    assert (
+        resolve_modal_job_concurrency(
+            mode="dev",
+            jobs=[dev_jobs_matrix[0]],
+        )
+        == 1
+    )
+    assert resolve_modal_job_concurrency(
+        mode="smoke",
+        jobs=smoke_jobs_matrix,
+    ) == len(smoke_jobs_matrix)
+    assert (
+        resolve_modal_job_concurrency(
+            mode="dev",
+            jobs=dev_jobs_matrix,
+            override=2,
+        )
+        == 2
+    )
+    with pytest.raises(ValueError, match="non-negative"):
+        resolve_modal_job_concurrency(
+            mode="dev",
+            jobs=dev_jobs_matrix,
+            override=-1,
+        )
 
 
 def test_build_tau2_command_enforces_final_constants_and_no_task_filters():
@@ -483,6 +580,33 @@ def test_write_planned_dev_manifest_is_mixed_replication_matrix(tmp_path: Path):
     assert any(validate_final_run_manifest(manifest["runs"]))
 
 
+def test_write_planned_dev_manifest_accepts_candidate_selectors(tmp_path: Path):
+    output = tmp_path / "batch_manifest_planned.json"
+
+    manifest = write_planned_manifest(
+        batch_id="batch",
+        repo_url=DEFAULT_REPO_URL,
+        repo_ref=COMMIT_SHA,
+        mode="dev",
+        conditions="baseline,stage_only",
+        domains="retail,airline,telecom",
+        output_path=output,
+    )
+
+    assert output.exists()
+    assert [(run["condition"], run["domain"]) for run in manifest["runs"]] == [
+        ("baseline", "retail"),
+        ("baseline", "airline"),
+        ("baseline", "telecom"),
+        ("stage_only", "retail"),
+        ("stage_only", "airline"),
+        ("stage_only", "telecom"),
+    ]
+    assert all(run["num_tasks"] == "10" for run in manifest["runs"])
+    assert all(run["max_concurrency"] == "1" for run in manifest["runs"])
+    assert all(run["audio_taps"] is False for run in manifest["runs"])
+
+
 def test_plan_only_cli_does_not_require_modal_or_secret(tmp_path: Path):
     output = tmp_path / "batch_manifest_planned.json"
 
@@ -624,7 +748,7 @@ def test_modal_runner_throttles_dev_job_batches():
     source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
 
     assert "modal_job_concurrency" in source
-    assert '3 if mode == "dev" else len(jobs)' in source
+    assert "resolve_modal_job_concurrency(" in source
     assert "range(0, len(jobs), job_concurrency)" in source
     assert "blocking until this Modal batch completes" in source
 

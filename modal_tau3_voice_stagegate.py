@@ -25,6 +25,7 @@ from scripts.stagegate_modal_runner_config import (
     planned_jobs,
     planned_manifest,
     require_full_commit_sha,
+    resolve_modal_job_concurrency,
     save_name,
     simulation_output_dir,
     trace_jsonl_path,
@@ -301,6 +302,8 @@ def launch(
     mode: Literal["final", "smoke", "dev"] = "final",
     condition: str | None = None,
     domain: str | None = None,
+    conditions: str | None = None,
+    domains: str | None = None,
     dry_run: bool = False,
     allow_dev_smoke_domain: bool = False,
     collect_completed: bool = False,
@@ -334,6 +337,8 @@ def launch(
         mode=mode,
         condition=condition,
         domain=domain,
+        conditions=conditions,
+        domains=domains,
         allow_dev_smoke_domain=allow_dev_smoke_domain,
     )
     manifest = planned_manifest(
@@ -347,9 +352,11 @@ def launch(
     write_json(planned_path, manifest)
     logger.info("Wrote planned manifest to %s", planned_path)
     logger.info("Prepared %s %s job(s)", len(jobs), mode)
-    job_concurrency = modal_job_concurrency or (3 if mode == "dev" else len(jobs))
-    if job_concurrency < 1:
-        raise ValueError("modal_job_concurrency must be at least 1")
+    job_concurrency = resolve_modal_job_concurrency(
+        mode=mode,
+        jobs=jobs,
+        override=modal_job_concurrency,
+    )
     logger.info("Modal job concurrency: %s", job_concurrency)
 
     if dry_run:

@@ -92,6 +92,7 @@ DEV_SPEECH_COMPLEXITY_BY_DOMAIN: dict[Domain, str] = {
 }
 
 FORBIDDEN_TASK_FILTER_FLAGS = ("--num-tasks", "--task-ids")
+DEFAULT_DEV_MODAL_JOB_CONCURRENCY = 4
 
 
 @dataclass(frozen=True)
@@ -179,23 +180,98 @@ def smoke_jobs(
     ]
 
 
-def dev_jobs(condition: str | None, domain: str | None) -> list[StageGateJob]:
+def _parse_selector_csv(
+    raw_value: str,
+    *,
+    allowed_values: tuple[str, ...],
+    label: str,
+) -> tuple[str, ...]:
+    """Parse comma-separated selector values in canonical allowed-value order."""
+    requested = [value.strip() for value in raw_value.split(",")]
+    if any(not value for value in requested):
+        raise ValueError(f"{label} selectors must not contain empty values")
+    invalid = sorted({value for value in requested if value not in allowed_values})
+    if invalid:
+        raise ValueError(f"unsupported {label} selector(s): {', '.join(invalid)}")
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"{label} selectors must not contain duplicates")
+    requested_set = set(requested)
+    return tuple(value for value in allowed_values if value in requested_set)
+
+
+def dev_jobs(
+    condition: str | None,
+    domain: str | None,
+    *,
+    conditions: str | None = None,
+    domains: str | None = None,
+) -> list[StageGateJob]:
     """Return the mixed 10-task development replication matrix."""
-    if condition is None and domain is None:
+    singular_selected = condition is not None or domain is not None
+    plural_selected = conditions is not None or domains is not None
+    if singular_selected and plural_selected:
+        raise ValueError("dev mode cannot mix singular and plural selectors")
+    if singular_selected:
+        if condition is None or domain is None:
+            raise ValueError("dev mode subsets require both condition and domain")
         return [
-            StageGateJob(condition=condition_name, domain=domain_name, mode="dev")
-            for condition_name in CONDITIONS
-            for domain_name in DOMAINS
+            StageGateJob(
+                condition=validate_condition(condition),
+                domain=validate_domain(domain),
+                mode="dev",
+            )
         ]
-    if condition is None or domain is None:
-        raise ValueError("dev mode subsets require both condition and domain")
-    return [
-        StageGateJob(
-            condition=validate_condition(condition),
-            domain=validate_domain(domain),
-            mode="dev",
+
+    selected_conditions = (
+        _parse_selector_csv(
+            conditions,
+            allowed_values=CONDITIONS,
+            label="conditions",
         )
+        if conditions is not None
+        else CONDITIONS
+    )
+    selected_domains = (
+        _parse_selector_csv(
+            domains,
+            allowed_values=DOMAINS,
+            label="domains",
+        )
+        if domains is not None
+        else DOMAINS
+    )
+    return [
+        StageGateJob(condition=condition_name, domain=domain_name, mode="dev")
+        for condition_name in selected_conditions
+        for domain_name in selected_domains
     ]
+
+
+def resolve_modal_job_concurrency(
+    *,
+    mode: RunMode,
+    jobs: list[StageGateJob],
+    override: int = 0,
+) -> int:
+    """Return Modal job-level concurrency for a launcher invocation."""
+    if override < 0:
+        raise ValueError("modal_job_concurrency must be non-negative")
+    if override > 0:
+        return override
+    if mode == "dev":
+        return max(1, min(DEFAULT_DEV_MODAL_JOB_CONCURRENCY, len(jobs)))
+    return max(1, len(jobs))
+
+
+def _has_any_selector(
+    condition: str | None,
+    domain: str | None,
+    conditions: str | None,
+    domains: str | None,
+) -> bool:
+    return any(
+        selector is not None for selector in (condition, domain, conditions, domains)
+    )
 
 
 def planned_jobs(
@@ -203,15 +279,26 @@ def planned_jobs(
     mode: RunMode,
     condition: str | None = None,
     domain: str | None = None,
+    conditions: str | None = None,
+    domains: str | None = None,
     allow_dev_smoke_domain: bool = False,
 ) -> list[StageGateJob]:
     """Return jobs for the requested mode."""
     if mode == "final":
-        if condition is not None or domain is not None:
+        if _has_any_selector(condition, domain, conditions, domains):
             raise ValueError("final mode does not accept condition/domain subsets")
         return final_matrix()
     if mode == "dev":
-        return dev_jobs(condition, domain)
+        return dev_jobs(
+            condition,
+            domain,
+            conditions=conditions,
+            domains=domains,
+        )
+    if conditions is not None or domains is not None:
+        raise ValueError(
+            f"{mode} mode does not accept plural condition/domain selectors"
+        )
     return smoke_jobs(
         condition,
         domain,
@@ -488,6 +575,8 @@ def write_planned_manifest(
     mode: RunMode,
     condition: str | None = None,
     domain: str | None = None,
+    conditions: str | None = None,
+    domains: str | None = None,
     allow_dev_smoke_domain: bool = False,
     output_path: Path = Path("batch_manifest_planned.json"),
 ) -> dict[str, Any]:
@@ -497,6 +586,8 @@ def write_planned_manifest(
         mode=mode,
         condition=condition,
         domain=domain,
+        conditions=conditions,
+        domains=domains,
         allow_dev_smoke_domain=allow_dev_smoke_domain,
     )
     manifest = planned_manifest(
@@ -728,6 +819,14 @@ def build_arg_parser() -> ArgumentParser:
     plan.add_argument("--condition")
     plan.add_argument("--domain")
     plan.add_argument(
+        "--conditions",
+        help="Comma-separated dev-mode condition selectors, e.g. baseline,stage_only.",
+    )
+    plan.add_argument(
+        "--domains",
+        help="Comma-separated dev-mode domain selectors, e.g. retail,airline,telecom.",
+    )
+    plan.add_argument(
         "--allow-dev-smoke-domain",
         action="store_true",
         help="Allow non-retail smoke jobs for development only.",
@@ -773,6 +872,8 @@ def _run_plan_command(args: Namespace) -> int:
         mode=args.mode,
         condition=args.condition,
         domain=args.domain,
+        conditions=args.conditions,
+        domains=args.domains,
         allow_dev_smoke_domain=args.allow_dev_smoke_domain,
         output_path=args.output,
     )
