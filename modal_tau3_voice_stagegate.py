@@ -305,6 +305,7 @@ def launch(
     allow_dev_smoke_domain: bool = False,
     collect_completed: bool = False,
     verify_secret_keys_only: bool = False,
+    modal_job_concurrency: int = 0,
 ) -> None:
     """Launch final/smoke jobs or collect completed job manifests."""
 
@@ -346,6 +347,10 @@ def launch(
     write_json(planned_path, manifest)
     logger.info("Wrote planned manifest to %s", planned_path)
     logger.info("Prepared %s %s job(s)", len(jobs), mode)
+    job_concurrency = modal_job_concurrency or (3 if mode == "dev" else len(jobs))
+    if job_concurrency < 1:
+        raise ValueError("modal_job_concurrency must be at least 1")
+    logger.info("Modal job concurrency: %s", job_concurrency)
 
     if dry_run:
         logger.info(
@@ -369,34 +374,47 @@ def launch(
             )
         return
 
-    calls: list[SpawnedStageGateCall] = []
-    for job in jobs:
-        call = run_domain.spawn(
-            job.condition,
-            job.domain,
-            repo_ref,
-            batch_id,
-            repo_url,
-            mode,
-        )
-        function_call_id = getattr(call, "object_id", None)
-        calls.append(
-            SpawnedStageGateCall(
-                job=job,
-                function_call_id=function_call_id,
-                call=call,
-            )
-        )
+    completed_jobs = 0
+    for batch_index, start in enumerate(range(0, len(jobs), job_concurrency), start=1):
+        chunk = jobs[start : start + job_concurrency]
+        calls: list[SpawnedStageGateCall] = []
         logger.info(
-            "Spawned %s/%s function_call_id=%s",
-            job.condition,
-            job.domain,
-            function_call_id,
+            "Launching Modal job batch %s with %s job(s)", batch_index, len(chunk)
         )
+        for job in chunk:
+            call = run_domain.spawn(
+                job.condition,
+                job.domain,
+                repo_ref,
+                batch_id,
+                repo_url,
+                mode,
+            )
+            function_call_id = getattr(call, "object_id", None)
+            calls.append(
+                SpawnedStageGateCall(
+                    job=job,
+                    function_call_id=function_call_id,
+                    call=call,
+                )
+            )
+            logger.info(
+                "Spawned %s/%s function_call_id=%s",
+                job.condition,
+                job.domain,
+                function_call_id,
+            )
 
-    logger.info(
-        "Launched %s job(s); blocking until every Modal FunctionCall.get() completes",
-        len(calls),
-    )
-    wait_for_stagegate_calls(calls, log=logger)
-    logger.info("All %s StageGate Modal job(s) completed", len(calls))
+        logger.info(
+            "Launched %s job(s); blocking until this Modal batch completes",
+            len(calls),
+        )
+        wait_for_stagegate_calls(calls, log=logger)
+        completed_jobs += len(calls)
+        logger.info(
+            "Completed Modal job batch %s; %s/%s job(s) done",
+            batch_index,
+            completed_jobs,
+            len(jobs),
+        )
+    logger.info("All %s StageGate Modal job(s) completed", len(jobs))

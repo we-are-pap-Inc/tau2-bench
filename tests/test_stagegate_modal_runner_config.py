@@ -620,6 +620,15 @@ def test_modal_runner_waits_for_spawned_calls_before_entrypoint_exits():
     assert "blocking/waiting mode" in source
 
 
+def test_modal_runner_throttles_dev_job_batches():
+    source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
+
+    assert "modal_job_concurrency" in source
+    assert '3 if mode == "dev" else len(jobs)' in source
+    assert "range(0, len(jobs), job_concurrency)" in source
+    assert "blocking until this Modal batch completes" in source
+
+
 def test_modal_runner_packages_config_helpers_for_remote_import():
     source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
 
