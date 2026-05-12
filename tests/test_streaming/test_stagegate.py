@@ -1121,6 +1121,66 @@ def test_official_not_found_lookup_result_marks_failed_without_verifying_ledger(
     assert "account_id" not in controller.ledger.known_facts()
 
 
+def test_empty_lookup_error_payload_marks_failed_without_verifying_ledger():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_domain_tool_result(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        ToolMessage(
+            id="call_customer",
+            role="tool",
+            content=None,
+            error=True,
+        ),
+        tick_id=4,
+    )
+
+    slot = controller.ledger.slots["account_id"]
+    assert slot.status is LedgerStatus.FAILED_LOOKUP
+    assert slot.normalized_value == "cust_123"
+    assert "account_id" not in controller.ledger.known_facts()
+
+
+def test_empty_structured_lookup_error_payload_marks_failed_lookup():
+    environment = _environment(domain_name="telecom")
+    controller = StageGateController(
+        condition="stagegate",
+        domain_policy=environment.get_policy(),
+        tools=environment.get_tools(),
+        domain_name=environment.get_domain_name(),
+    )
+
+    controller.trace_domain_tool_result(
+        ToolCall(
+            id="call_customer",
+            name="get_customer_by_id",
+            arguments={"customer_id": "cust_123"},
+        ),
+        ToolMessage(
+            id="call_customer",
+            role="tool",
+            content=json.dumps({}),
+            error=True,
+        ),
+        tick_id=4,
+    )
+
+    slot = controller.ledger.slots["account_id"]
+    assert slot.status is LedgerStatus.FAILED_LOOKUP
+    assert slot.normalized_value == "cust_123"
+    assert "account_id" not in controller.ledger.known_facts()
+
+
 def test_ledger_contradiction_surfaces_as_ambiguous_stage_fact():
     environment = _environment(domain_name="telecom")
     controller = StageGateController(

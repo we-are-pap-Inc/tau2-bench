@@ -779,6 +779,26 @@ LOOKUP_TOOL_PREFIXES = (
     "search_",
 )
 
+LOOKUP_FAILURE_CUES = (
+    "not found",
+    "no matching",
+    "no record",
+    "does not exist",
+    "unable to find",
+)
+
+TRANSIENT_ERROR_CUES = (
+    "api",
+    "connection",
+    "not connected",
+    "provider",
+    "rate limit",
+    "temporary",
+    "timeout",
+    "try again",
+    "unavailable",
+)
+
 
 def status_rank(status: LedgerStatus) -> int:
     """Return precedence used to avoid downgrading a slot."""
@@ -839,28 +859,39 @@ def is_lookup_failure_result(
     """Return whether official tool output says a lookup failed."""
     if not tool_name.startswith(LOOKUP_TOOL_PREFIXES):
         return False
-    if not content:
+    text = tool_result_text(content)
+    if text and any(cue in text for cue in LOOKUP_FAILURE_CUES):
+        return True
+    if not error:
         return False
+    if text and any(cue in text for cue in TRANSIENT_ERROR_CUES):
+        return False
+    return text is None
+
+
+def tool_result_text(content: Optional[str]) -> Optional[str]:
+    """Return normalized informative text from a tool result payload."""
+    if not content:
+        return None
     try:
         payload = json.loads(content)
     except json.JSONDecodeError:
         payload = content
     if isinstance(payload, str):
-        text = payload.lower()
-    elif isinstance(payload, dict):
-        text = json.dumps(payload, sort_keys=True, default=str).lower()
-    else:
-        text = str(payload).lower()
-    return any(
-        cue in text
-        for cue in (
-            "not found",
-            "no matching",
-            "no record",
-            "does not exist",
-            "unable to find",
-        )
-    )
+        text = payload.strip().lower()
+        return text or None
+    if isinstance(payload, dict):
+        if not payload:
+            return None
+        return json.dumps(payload, sort_keys=True, default=str).lower()
+    if isinstance(payload, list):
+        if not payload:
+            return None
+        return json.dumps(payload, sort_keys=True, default=str).lower()
+    if payload is None:
+        return None
+    text = str(payload).strip().lower()
+    return text or None
 
 
 def failed_lookup_facts_from_tool_args(
