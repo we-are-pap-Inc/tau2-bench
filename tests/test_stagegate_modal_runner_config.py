@@ -28,6 +28,7 @@ from scripts.stagegate_modal_runner_config import (
     command_metadata,
     final_matrix,
     is_full_commit_sha,
+    is_transient_modal_wait_error,
     job_manifest_base,
     planned_jobs,
     planned_manifest,
@@ -35,6 +36,8 @@ from scripts.stagegate_modal_runner_config import (
     resolve_modal_job_concurrency,
     run_constants,
     save_name,
+    simulation_output_dir,
+    tau2_save_to,
     trace_run_id,
     validate_dev_command,
     validate_final_command,
@@ -48,16 +51,36 @@ COMMIT_SHA = "1910fe2998f230bda6f6ad1b69edef4124275d63"
 
 
 class FakeBlockingCall:
-    def __init__(self, result=None, exc: Exception | None = None):
+    def __init__(
+        self,
+        result=None,
+        exc: Exception | None = None,
+        outcomes: list[object] | None = None,
+    ):
         self.result = result
         self.exc = exc
+        self.outcomes = list(outcomes or [])
         self.get_calls = 0
+        self.timeouts: list[float | None] = []
 
-    def get(self):
+    def get(self, timeout: float | None = None):
         self.get_calls += 1
+        self.timeouts.append(timeout)
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         if self.exc is not None:
             raise self.exc
         return self.result
+
+
+class FakeModalConnectionError(ConnectionError):
+    pass
+
+
+FakeModalConnectionError.__module__ = "modal.exception"
 
 
 def test_final_matrix_is_exact_condition_domain_product():
@@ -237,7 +260,10 @@ def test_build_tau2_command_enforces_final_constants_and_no_task_filters():
     assert argv[argv.index("--audio-native-model") + 1] == FINAL_CONSTANTS["model"]
     assert argv[argv.index("--speech-complexity") + 1] == "regular"
     assert argv[argv.index("--max-steps-seconds") + 1] == "1200"
-    assert argv[argv.index("--save-to") + 1] == "final_batch_stagegate_airline"
+    assert "--auto-resume" in argv
+    assert argv[argv.index("--save-to") + 1] == (
+        "/runs/batch/stagegate/airline/simulation_output"
+    )
 
 
 def test_build_tau2_command_enforces_smoke_constants_and_debug_artifacts():
@@ -272,10 +298,10 @@ def test_build_tau2_command_enforces_dev_replication_constants():
     assert retail_argv[retail_argv.index("--max-steps-seconds") + 1] == "600"
     assert retail_argv[retail_argv.index("--num-tasks") + 1] == "10"
     assert "--audio-taps" not in retail_argv
-    assert "--auto-resume" not in retail_argv
+    assert "--auto-resume" in retail_argv
     assert "--task-ids" not in retail_argv
     assert retail_argv[retail_argv.index("--save-to") + 1] == (
-        "dev_batch_stagegate_retail"
+        "/runs/batch/stagegate/retail/simulation_output"
     )
 
 
@@ -310,7 +336,7 @@ def test_validate_smoke_command_rejects_final_shape_and_task_ids():
         validate_smoke_command(without_audio_taps)
 
 
-def test_validate_dev_command_rejects_task_ids_audio_taps_and_auto_resume():
+def test_validate_dev_command_rejects_task_ids_audio_taps_and_requires_auto_resume():
     job = StageGateJob(condition="baseline", domain="retail", mode="dev")
     argv = build_tau2_command("batch", job)
 
@@ -320,8 +346,9 @@ def test_validate_dev_command_rejects_task_ids_audio_taps_and_auto_resume():
     with pytest.raises(ValueError, match="audio-taps"):
         validate_dev_command([*argv, "--audio-taps"], job=job)
 
+    without_auto_resume = [arg for arg in argv if arg != "--auto-resume"]
     with pytest.raises(ValueError, match="auto-resume"):
-        validate_dev_command([*argv, "--auto-resume"], job=job)
+        validate_dev_command(without_auto_resume, job=job)
 
 
 def test_manifest_shape_passes_final_hygiene_guard():
@@ -422,7 +449,19 @@ def test_dev_manifest_has_mixed_speech_and_ten_task_metadata():
     assert {manifest["num_tasks"] for manifest in manifests} == {"10"}
     assert {manifest["max_steps_seconds"] for manifest in manifests} == {"600"}
     assert all(manifest["audio_taps"] is False for manifest in manifests)
-    assert all(manifest["auto_resume"] is False for manifest in manifests)
+    assert all(manifest["auto_resume"] is True for manifest in manifests)
+    assert all(
+        manifest["save_to"]
+        == simulation_output_dir(
+            "batch",
+            StageGateJob(
+                condition=manifest["condition"],
+                domain=manifest["domain"],
+                mode="dev",
+            ),
+        )
+        for manifest in manifests
+    )
     assert {
         manifest["domain"]: manifest["speech_complexity"] for manifest in manifests
     } == DEV_SPEECH_COMPLEXITY_BY_DOMAIN
@@ -460,6 +499,7 @@ def test_command_metadata_contains_sanitized_argv_only():
     )
 
     assert metadata["sanitized_command_argv"] == build_tau2_command("batch", job)
+    assert metadata["save_to"] == tau2_save_to("batch", job)
     assert metadata["trace_jsonl"] == "/runs/batch/baseline/retail/trace_events.jsonl"
     assert metadata["trace_run_id"] == "batch:baseline:retail"
     assert metadata["run_constants"] == run_constants(job)
@@ -492,6 +532,62 @@ def test_wait_for_stagegate_calls_blocks_on_every_scheduled_job():
         "stagegate",
     ]
     assert [fake_call.get_calls for fake_call in fake_calls] == [1, 1, 1]
+    assert all(fake_call.timeouts == [60.0] for fake_call in fake_calls)
+
+
+def test_wait_for_stagegate_calls_polls_through_pending_timeout():
+    jobs = planned_jobs(mode="smoke")
+    fake_call = FakeBlockingCall(
+        outcomes=[TimeoutError("pending"), {"status": "succeeded"}]
+    )
+    spawned = [
+        SpawnedStageGateCall(
+            job=jobs[0],
+            function_call_id="fc-timeout",
+            call=fake_call,
+        )
+    ]
+
+    results = wait_for_stagegate_calls(
+        spawned,
+        poll_timeout_seconds=0.25,
+        transient_retry_sleep_seconds=0,
+    )
+
+    assert results == [{"status": "succeeded"}]
+    assert fake_call.get_calls == 2
+    assert fake_call.timeouts == [0.25, 0.25]
+
+
+def test_wait_for_stagegate_calls_retries_transient_modal_wait_error():
+    jobs = planned_jobs(mode="smoke")
+    transient = FakeModalConnectionError(
+        "[Errno 8] nodename nor servname provided, or not known"
+    )
+    fake_call = FakeBlockingCall(outcomes=[transient, {"status": "succeeded"}])
+    spawned = [
+        SpawnedStageGateCall(
+            job=jobs[0],
+            function_call_id="fc-transient",
+            call=fake_call,
+        )
+    ]
+
+    results = wait_for_stagegate_calls(
+        spawned,
+        poll_timeout_seconds=0.25,
+        transient_retry_sleep_seconds=0,
+    )
+
+    assert is_transient_modal_wait_error(transient)
+    assert results == [{"status": "succeeded"}]
+    assert fake_call.get_calls == 2
+
+
+def test_plain_connection_errors_are_not_treated_as_modal_wait_errors():
+    plain = ConnectionError("connection refused")
+
+    assert not is_transient_modal_wait_error(plain)
 
 
 def test_wait_for_stagegate_calls_waits_all_jobs_before_raising():
@@ -758,6 +854,15 @@ def test_modal_runner_packages_config_helpers_for_remote_import():
 
     assert '.add_local_python_source("scripts")' in source
     assert "@app.function(\n    image=image,\n    secrets=[" in source
+
+
+def test_modal_runner_uses_persistent_tau2_save_target_and_volume_commits():
+    source = Path("modal_tau3_voice_stagegate.py").read_text(encoding="utf-8")
+
+    assert "tau2_save_to(batch_id, job)" in source
+    assert "_run_logged_with_volume_commits(tau2_argv, cwd=workdir, env=env)" in source
+    assert '_commit_volume_safely("long-running tau2 command")' in source
+    assert "Simulation output persisted directly" in source
 
 
 def test_modal_job_function_does_not_write_shared_batch_manifest():

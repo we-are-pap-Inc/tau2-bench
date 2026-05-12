@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -82,7 +83,7 @@ DEV_CONSTANTS: dict[str, RUN_CONSTANT_VALUE] = {
     "seed": "300",
     "num_tasks": "10",
     "audio_taps": False,
-    "auto_resume": False,
+    "auto_resume": True,
 }
 
 DEV_SPEECH_COMPLEXITY_BY_DOMAIN: dict[Domain, str] = {
@@ -107,7 +108,7 @@ class StageGateJob:
 class BlockingModalCall(Protocol):
     """Minimal Modal FunctionCall surface needed by the local launcher."""
 
-    def get(self) -> Any:
+    def get(self, timeout: float | None = None) -> Any:
         """Block until the remote call finishes and return its result."""
 
 
@@ -342,6 +343,13 @@ def simulation_output_dir(batch_id: str, job: StageGateJob) -> str:
     return f"{artifact_dir(batch_id, job)}/simulation_output"
 
 
+def tau2_save_to(batch_id: str, job: StageGateJob) -> str:
+    """Return the tau2 --save-to target for one Modal job."""
+    if job.mode == "smoke":
+        return save_name(batch_id, job)
+    return simulation_output_dir(batch_id, job)
+
+
 def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
     """Build the fixed, sanitized tau2 command for a job."""
     constants = run_constants(job)
@@ -381,8 +389,10 @@ def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
         if constants.get("audio_taps"):
             argv.append("--audio-taps")
     else:
-        argv.extend(["--verbose-logs", "--auto-resume"])
-    argv.extend(["--save-to", save_name(batch_id, job)])
+        argv.append("--verbose-logs")
+    if job.mode == "final" or constants.get("auto_resume"):
+        argv.append("--auto-resume")
+    argv.extend(["--save-to", tau2_save_to(batch_id, job)])
     return argv
 
 
@@ -395,6 +405,9 @@ def wait_for_stagegate_calls(
     calls: list[SpawnedStageGateCall],
     *,
     log: logging.Logger | None = None,
+    poll_timeout_seconds: float = 60.0,
+    transient_retry_sleep_seconds: float = 15.0,
+    max_transient_wait_errors: int = 20,
 ) -> list[Any]:
     """Wait for every spawned StageGate Modal call before returning."""
     active_logger = log or logger
@@ -415,25 +428,57 @@ def wait_for_stagegate_calls(
             job.domain,
             call_id,
         )
-        try:
-            result = spawned.call.get()
-        except Exception as exc:
-            failures.append((spawned, exc))
-            active_logger.exception(
-                "StageGate Modal job failed condition=%s domain=%s function_call_id=%s",
-                job.condition,
-                job.domain,
-                call_id,
-            )
-        else:
-            results.append(result)
-            active_logger.info(
-                "StageGate Modal job completed condition=%s domain=%s "
-                "function_call_id=%s",
-                job.condition,
-                job.domain,
-                call_id,
-            )
+        transient_wait_errors = 0
+        while True:
+            try:
+                result = spawned.call.get(timeout=poll_timeout_seconds)
+            except TimeoutError:
+                active_logger.info(
+                    "StageGate Modal job still running condition=%s domain=%s "
+                    "function_call_id=%s",
+                    job.condition,
+                    job.domain,
+                    call_id,
+                )
+                continue
+            except Exception as exc:
+                if (
+                    is_transient_modal_wait_error(exc)
+                    and transient_wait_errors < max_transient_wait_errors
+                ):
+                    transient_wait_errors += 1
+                    active_logger.warning(
+                        "Transient Modal wait error for condition=%s domain=%s "
+                        "function_call_id=%s; retrying wait (%s/%s): %s",
+                        job.condition,
+                        job.domain,
+                        call_id,
+                        transient_wait_errors,
+                        max_transient_wait_errors,
+                        exc,
+                    )
+                    if transient_retry_sleep_seconds > 0:
+                        time.sleep(transient_retry_sleep_seconds)
+                    continue
+                failures.append((spawned, exc))
+                active_logger.exception(
+                    "StageGate Modal job failed condition=%s domain=%s "
+                    "function_call_id=%s",
+                    job.condition,
+                    job.domain,
+                    call_id,
+                )
+                break
+            else:
+                results.append(result)
+                active_logger.info(
+                    "StageGate Modal job completed condition=%s domain=%s "
+                    "function_call_id=%s",
+                    job.condition,
+                    job.domain,
+                    call_id,
+                )
+                break
 
     if failures:
         failure_summaries = []
@@ -451,6 +496,26 @@ def wait_for_stagegate_calls(
         ) from failures[0][1]
 
     return results
+
+
+def is_transient_modal_wait_error(exc: BaseException) -> bool:
+    """Return whether a local Modal wait error is worth retrying."""
+    detail = str(exc).lower()
+    transient_fragments = (
+        "nodename nor servname provided",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "failed to connect to all addresses",
+        "connection reset by peer",
+        "connection aborted",
+        "connection refused",
+        "connection timed out",
+        "transport is closing",
+    )
+    if not any(fragment in detail for fragment in transient_fragments):
+        return False
+    module_name = type(exc).__module__.lower()
+    return "modal" in module_name or "grpclib" in module_name or "socket" in module_name
 
 
 def validate_no_task_filters(argv: list[str]) -> None:
@@ -527,8 +592,8 @@ def validate_dev_command(argv: list[str], *, job: StageGateJob) -> None:
             raise ValueError(f"{flag} must be {value!r}")
     if _has_flag(argv, "--audio-taps"):
         raise ValueError("--audio-taps is not allowed in dev mode by default")
-    if _has_flag(argv, "--auto-resume"):
-        raise ValueError("--auto-resume is not allowed in dev mode")
+    if not _has_flag(argv, "--auto-resume"):
+        raise ValueError("--auto-resume is required in dev mode")
 
 
 def planned_manifest(
@@ -654,6 +719,7 @@ def job_manifest_base(
         "command": argv,
         "sanitized_command_argv": argv,
         "save_name": save_name(batch_id, job),
+        "save_to": tau2_save_to(batch_id, job),
         "artifact_dir": artifact_dir(batch_id, job),
         "trace_jsonl": trace_jsonl_path(batch_id, job),
         "trace_run_id": trace_run_id(batch_id, job),
@@ -703,6 +769,7 @@ def command_metadata(
         "mode": job.mode,
         "sanitized_command_argv": argv,
         "sanitized_command": command_to_log(argv),
+        "save_to": tau2_save_to(batch_id, job),
         "final_constants": dict(FINAL_CONSTANTS),
         "run_constants": constants,
         "trace_jsonl": trace_jsonl_path(batch_id, job),

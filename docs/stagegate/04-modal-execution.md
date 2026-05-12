@@ -257,6 +257,7 @@ Dev mode constants:
       seed: 300
       num_tasks: 10
       audio_taps: false
+      auto_resume: true
 
 By default, dev mode runs the full 9-job development matrix. For candidate
 selection, use dev-only plural selectors to run a smaller matrix in one command:
@@ -268,11 +269,31 @@ selection, use dev-only plural selectors to run a smaller matrix in one command:
       --mode dev \
       --conditions baseline,stage_only \
       --domains retail,airline,telecom \
-      --modal-job-concurrency 4
+      --modal-job-concurrency 2
 
 Plural selectors are dev-only. Do not use them for final mode. If a provider
 crash invalidates a job, rerun the full condition/domain job with a new batch
 suffix; do not cherry-pick individual failed tasks.
+
+Dev candidate jobs write their `tau2` checkpoints directly to the mounted Modal
+Volume under `/runs/<batch_id>/<condition>/<domain>/simulation_output` and run
+with `--auto-resume`. The Modal job commits the Volume periodically while `tau2`
+is still running so a worker preemption can resume from committed task
+checkpoints instead of restarting from task 0.
+
+If a local Modal client disconnect or worker preemption makes a candidate batch
+operationally dirty, keep the failed batch for debugging and rerun the full
+condition/domain matrix with a new suffix. After the failed
+`stageonly_candidate_010_001` run, the recommended retry is:
+
+    uv run --with modal modal run modal_tau3_voice_stagegate.py \
+      --batch-id stageonly_candidate_010_002 \
+      --repo-url https://github.com/we-are-pap-Inc/tau2-bench.git \
+      --repo-ref NEW_40_CHAR_COMMIT_SHA \
+      --mode dev \
+      --conditions baseline,stage_only \
+      --domains retail,airline,telecom \
+      --modal-job-concurrency 2
 
 ## Manifest Flow
 
@@ -322,6 +343,9 @@ contents, or secret values.
 - Jobs use CPU and memory only; remote APIs perform model inference.
 - Final `tau2 run` commands use `--auto-resume`, so completed
   non-infrastructure runs are skipped if the same save directory is resumed.
+- Dev candidate `tau2 run` commands also use `--auto-resume` and persist
+  checkpoints directly to `/runs`; this is runner-only resilience against Modal
+  preemption, not a benchmark semantic change.
 - Smoke `tau2 run` commands do not use `--auto-resume`; they use `--num-tasks 1`
   and `--audio-taps` for development evidence.
 - Keep one final commit SHA fixed across all 9 jobs.

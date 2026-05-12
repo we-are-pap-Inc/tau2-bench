@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -28,6 +29,7 @@ from scripts.stagegate_modal_runner_config import (
     resolve_modal_job_concurrency,
     save_name,
     simulation_output_dir,
+    tau2_save_to,
     trace_jsonl_path,
     trace_run_id,
     utc_now_iso,
@@ -86,6 +88,41 @@ def _run_logged(
         text=True,
         capture_output=capture_output,
     )
+
+
+def _commit_volume_safely(context: str) -> None:
+    """Persist Modal Volume changes without masking the subprocess status."""
+    try:
+        volume.commit()
+    except Exception:
+        logger.exception("Modal Volume commit failed during %s", context)
+
+
+def _run_logged_with_volume_commits(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    commit_interval_seconds: float = 60.0,
+) -> None:
+    """Run a long command while periodically committing Modal Volume writes."""
+    logger.info("Running command: %s", command_to_log(argv))
+    process = subprocess.Popen(argv, cwd=cwd, env=env, text=True)
+    last_commit = time.monotonic()
+    try:
+        while True:
+            returncode = process.poll()
+            now = time.monotonic()
+            if now - last_commit >= commit_interval_seconds:
+                _commit_volume_safely("long-running tau2 command")
+                last_commit = now
+            if returncode is not None:
+                if returncode != 0:
+                    raise subprocess.CalledProcessError(returncode, argv)
+                return
+            time.sleep(min(5.0, max(0.5, commit_interval_seconds / 12.0)))
+    finally:
+        _commit_volume_safely("long-running tau2 command exit")
 
 
 def _modal_container_id() -> str | None:
@@ -203,19 +240,36 @@ def run_domain(
             job.domain,
             command_to_log(tau2_argv),
         )
-        _run_logged(tau2_argv, cwd=workdir, env=env)
-
-        source_simulation_dir = (
-            workdir / "data" / "simulations" / save_name(batch_id, job)
+        logger.info(
+            "tau2 save target condition=%s domain=%s save_to=%s",
+            job.condition,
+            job.domain,
+            tau2_save_to(batch_id, job),
         )
-        if not source_simulation_dir.exists():
-            raise FileNotFoundError(
-                f"Expected simulation dir not found: {source_simulation_dir}"
-            )
+        _run_logged_with_volume_commits(tau2_argv, cwd=workdir, env=env)
+
         copied_simulation_dir = Path(simulation_output_dir(batch_id, job))
         if copied_simulation_dir.exists():
-            shutil.rmtree(copied_simulation_dir)
-        shutil.copytree(source_simulation_dir, copied_simulation_dir)
+            logger.info(
+                "Simulation output persisted directly to %s",
+                copied_simulation_dir,
+            )
+        else:
+            source_simulation_dir = (
+                workdir / "data" / "simulations" / save_name(batch_id, job)
+            )
+            if not source_simulation_dir.exists():
+                raise FileNotFoundError(
+                    "Expected simulation dir not found at direct or fallback path: "
+                    f"{copied_simulation_dir} or {source_simulation_dir}"
+                )
+            shutil.copytree(source_simulation_dir, copied_simulation_dir)
+            logger.info(
+                "Copied simulation output from %s to %s",
+                source_simulation_dir,
+                copied_simulation_dir,
+            )
+            volume.commit()
 
         status = "succeeded"
         return {
