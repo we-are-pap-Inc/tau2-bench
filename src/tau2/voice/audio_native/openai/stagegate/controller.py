@@ -11,6 +11,7 @@ from tau2.data_model.message import Message, ToolCall, ToolMessage
 from tau2.environment.tool import Tool
 from tau2.voice.audio_native.openai.stagegate.ledger import EntityLedger
 from tau2.voice.audio_native.openai.stagegate.orchestrator import (
+    STAGES,
     StagePacketOrchestrator,
 )
 from tau2.voice.audio_native.openai.stagegate.stage_schema import (
@@ -160,6 +161,8 @@ class StageGateController:
         self.validator_block_count = 0
         self.validator_allow_count = 0
         self.ledger_update_count = 0
+        self.domain_tool_call_count = 0
+        self.last_domain_tool_call: Optional[dict[str, object]] = None
         self.final_stage: Optional[str] = None
         self.last_stage_packet: Optional[dict[str, object]] = None
         self.last_validator_decision: Optional[dict[str, object]] = None
@@ -309,16 +312,44 @@ class StageGateController:
             ledger=self._active_ledger(),
             forced_stage=forced_stage,
         )
+        repair_snapshot = self._entity_repair_snapshot()
+        if repair_snapshot is not None:
+            packet = self.packet_orchestrator.apply_entity_repair_guidance(
+                packet=packet,
+                repair_snapshot=repair_snapshot,
+            )
+            self._trace_entity_repair_required(
+                repair_snapshot=repair_snapshot,
+                tick_id=tick_id,
+                tool_name=tool_call.name,
+            )
+            if current_stage == "understand_intent" and packet.stage != current_stage:
+                self._trace(
+                    "stage_repaired_from_understand_intent",
+                    tick_index=tick_id,
+                    stage=packet.stage,
+                    source="entity_repair_gate",
+                    tool_name=tool_call.name,
+                    tool_args=tool_call.arguments,
+                    payload=repair_snapshot,
+                )
         packet = self._apply_pending_write_guidance(packet)
         guard_reason = self._record_advance_stage_guard_state(
             packet=packet,
             blocker=blocker_text,
         )
         if guard_reason is not None:
-            packet = self.packet_orchestrator.build_fallback_packet(
-                packet=packet,
-                guard_reason=guard_reason,
-            )
+            repair_snapshot = self._entity_repair_snapshot()
+            if repair_snapshot is not None:
+                packet = self.packet_orchestrator.apply_entity_repair_guidance(
+                    packet=packet,
+                    repair_snapshot=repair_snapshot,
+                )
+            else:
+                packet = self.packet_orchestrator.build_fallback_packet(
+                    packet=packet,
+                    guard_reason=guard_reason,
+                )
             self.loop_guard_triggered = True
             self._remember_stage_packet(packet)
             self.last_corrective_packet = packet.model_dump(mode="json")
@@ -505,6 +536,12 @@ class StageGateController:
         self, tool_call: ToolCall, *, tick_id: Optional[int] = None
     ) -> None:
         """Emit a domain_tool_call event before executing a domain tool."""
+        self.domain_tool_call_count += 1
+        self.last_domain_tool_call = {
+            "tool_name": tool_call.name,
+            "tool_call_id": tool_call.id,
+            "tick_index": tick_id,
+        }
         self._trace(
             "domain_tool_call",
             tick_index=tick_id,
@@ -554,6 +591,23 @@ class StageGateController:
             }
             self.last_blocked_side_effecting_tool = None
         ledger = self._active_ledger()
+        if ledger is not None:
+            failure_deltas = ledger.update_from_failed_tool_result(
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                content=tool_result.content,
+                error=tool_result.error,
+                event_id=tool_result.id,
+                tick_index=tick_id,
+            )
+            self._trace_ledger_updates(
+                failure_deltas,
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                tick_id=tick_id,
+            )
+            if failure_deltas:
+                return
         if ledger is None or tool_result.error:
             return
         deltas = ledger.update_from_tool_result(
@@ -677,6 +731,20 @@ class StageGateController:
                 mode="json"
             )
             self.last_corrective_packet = payload["corrective_packet"]
+        if decision.reason in {
+            "repeated_failed_lookup_blocked",
+            "transfer_blocked_entity_repair",
+        }:
+            self._trace(
+                decision.reason,
+                tick_index=tick_id,
+                source="entity_repair_gate",
+                tool_name=tool_call.name,
+                tool_args=tool_call.arguments,
+                validator_decision=decision.decision,
+                validator_reason=decision.reason,
+                payload=payload,
+            )
 
         if decision.allowed:
             self.validator_allow_count += 1
@@ -843,6 +911,8 @@ class StageGateController:
             "validator_block_count": self.validator_block_count,
             "validator_allow_count": self.validator_allow_count,
             "ledger_update_count": self.ledger_update_count,
+            "domain_tool_call_count": self.domain_tool_call_count,
+            "last_domain_tool_call": self.last_domain_tool_call,
             "stage_sequence": list(self.stage_sequence),
             "final_stage": self.final_stage,
             "last_stage_packet": self.last_stage_packet,
@@ -886,6 +956,43 @@ class StageGateController:
                 ledger_delta={str(delta["field"]): delta},
                 payload={"tool_call_id": tool_call_id},
             )
+            for event in delta.get("events", []):
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("event_type", "ledger_value_event"))
+                tick_index = event.get("tick_index")
+                self._trace(
+                    event_type,
+                    tick_index=tick_index if isinstance(tick_index, int) else tick_id,
+                    source=str(delta.get("source", "ledger")),
+                    tool_name=tool_name,
+                    payload={
+                        "tool_call_id": tool_call_id,
+                        **event,
+                    },
+                )
+
+    def _entity_repair_snapshot(self) -> Optional[dict[str, object]]:
+        ledger = self._active_ledger()
+        if ledger is None:
+            return None
+        return ledger.entity_repair_snapshot()
+
+    def _trace_entity_repair_required(
+        self,
+        *,
+        repair_snapshot: dict[str, object],
+        tick_id: Optional[int],
+        tool_name: str,
+    ) -> None:
+        self._trace(
+            "entity_repair_required",
+            tick_index=tick_id,
+            stage=str(repair_snapshot.get("preferred_stage", "")) or None,
+            source="entity_repair_gate",
+            tool_name=tool_name,
+            payload=repair_snapshot,
+        )
 
     def _trace_pending_write_events(self, events: list[dict[str, object]]) -> None:
         for event in events:
@@ -1109,6 +1216,9 @@ class StageGateController:
     ) -> Optional[str]:
         if self.condition != "stagegate":
             return None
+        repair_snapshot = self._entity_repair_snapshot()
+        if repair_snapshot is not None:
+            return str(repair_snapshot.get("preferred_stage", "")) or None
         if blocker is not None:
             return None
         pending_write = self._active_pending_write_snapshot()
@@ -1121,11 +1231,26 @@ class StageGateController:
                 "mismatched_retry",
             }:
                 return "propose_action_and_confirm"
+        if self.domain_tool_call_count > 0 and current_stage not in {
+            "execute_write_action",
+            "verify_result_and_close",
+        }:
+            return self._stage_after_tool_activity(current_stage=current_stage)
         if current_stage not in {"execute_write_action", "verify_result_and_close"}:
             return None
         if self.last_successful_side_effecting_tool is not None:
             return None
         return "execute_write_action"
+
+    def _stage_after_tool_activity(self, *, current_stage: str) -> Optional[str]:
+        if current_stage in STAGES and current_stage != "understand_intent":
+            return None
+        tool_name = str((self.last_domain_tool_call or {}).get("tool_name", ""))
+        if tool_name.startswith(("find_", "get_user")):
+            return "identify_or_authenticate"
+        if "order" in tool_name or tool_name.startswith("get_"):
+            return "inspect_state_with_read_tools"
+        return "identify_or_authenticate"
 
 
 def _resolve_int_setting(

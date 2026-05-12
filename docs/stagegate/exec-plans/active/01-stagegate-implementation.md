@@ -107,6 +107,11 @@ agent.
   packets from `advance_stage` arguments, public domain name, public tool
   names, and, for StageGate only, the typed entity ledger. Packets expose only
   stage-relevant missing facts rather than every missing domain slot.
+  Retail StageGate packets for replacement/exchange flows also surface
+  action-progress guidance from semantic ledger slots: once official order and
+  product details have been inspected, packets instruct the model to resolve
+  ranked/fallback preferences, summarize the selected replacement set, and
+  attempt the write after confirmation instead of reopening variant discussion.
 - `src/tau2/voice/audio_native/openai/stagegate/ledger.py`
   defines `LedgerStatus`, `LedgerEvidence`, `LedgerSlot`, and `EntityLedger`,
   with domain slots for retail, airline, and telecom.
@@ -253,6 +258,20 @@ remains validator-free; the pre-write validator is active only for
   `Environment.get_response()` executions are serialized into canonical
   `Tick.*_tool_calls` / `Tick.*_tool_results`; blocked writes and StageGate
   internal tools are stored in internal tick fields and remain trace-visible.
+- [x] Harden retail replacement/exchange stage packets after smoke_013:
+  StageGate now gives action-progress-oriented guidance when order/product
+  details and candidate or selected replacement IDs are present in the ledger.
+  The packet explicitly says to treat a valid fallback preference as resolved,
+  avoid enumerating more product variants after a valid candidate is selected,
+  and attempt the exchange write after confirmation instead of calling
+  `advance_stage` again.
+- [x] Add a StageGate-only voice entity repair gate after smoke_014:
+  ledger slots now track per-value candidates so failed, superseded, and
+  correction-invalidated values are not surfaced as equal active ambiguity.
+  Official failed lookup outputs mark exact values as `failed_lookup`, stage
+  packets route repairable lookup failures to concrete spelling/context
+  recovery, repeated failed lookups are blocked, and transfer is blocked while
+  a structural repair path remains available.
 
 ## Tests
 
@@ -321,6 +340,12 @@ Focused tests in `tests/test_streaming/test_stagegate.py` cover:
   retries, StageGate internal tools excluded from domain action replay, the
   successful exchange sequence containing only the final allowed exchange write,
   and trace visibility for the blocked write.
+- entity repair tests cover corrected customer names superseding earlier
+  low-confidence hypotheses, tool-verified identity values dominating
+  hypotheses, official failed order lookup marking an exact ID as
+  `failed_lookup`, repeated failed lookup blocking, `understand_intent` repair
+  after tool activity, loop-guard repair routing, and transfer blocking while
+  entity repair remains structurally available.
 
 Trace/query tests in `tests/test_stagegate_trace_viewer.py` cover:
 
@@ -733,6 +758,33 @@ Focused tests in `tests/test_stagegate_final_run_hygiene.py` cover:
 - 2026-05-11 trajectory/replay compatibility:
   `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
   result: `StageGate prohibited-path guard passed.`
+- 2026-05-11 smoke_013 action-progress packet hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `88 passed, 2 warnings in 0.27s`.
+- 2026-05-11 smoke_013 action-progress packet hardening:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.11s`.
+- 2026-05-11 smoke_013 action-progress packet hardening:
+  `make check-all` result: `All checks passed!` and `329 files left
+  unchanged`.
+- 2026-05-11 smoke_013 action-progress packet hardening:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
+- 2026-05-11 smoke_014 voice entity repair gate:
+  `make format`
+  result: `4 files reformatted, 325 files left unchanged`.
+- 2026-05-11 smoke_014 voice entity repair gate:
+  `uv run --extra voice --extra dev python -m pytest tests/test_streaming/test_stagegate.py -q`
+  result: `96 passed, 2 warnings in 0.49s`.
+- 2026-05-11 smoke_014 voice entity repair gate:
+  `uv run --extra voice --extra dev python -m pytest tests/test_stagegate_trace_viewer.py tests/test_stagegate_prohibited_diff_guard.py tests/test_stagegate_final_run_hygiene.py tests/test_stagegate_modal_runner_config.py -q`
+  result: `39 passed, 2 warnings in 0.12s`.
+- 2026-05-11 smoke_014 voice entity repair gate:
+  `make check-all`
+  result: `All checks passed!` and `329 files left unchanged`.
+- 2026-05-11 smoke_014 voice entity repair gate:
+  `uv run python scripts/stagegate_prohibited_diff_guard.py --base origin/main --head HEAD`
+  result: `StageGate prohibited-path guard passed.`
 
 Warnings observed in the passing focused and voice test commands:
 
@@ -862,6 +914,25 @@ Warnings observed in the passing focused and voice test commands:
   through the normal environment path. Denied and unclear decisions do not
   mutate domain state. The old summary/confirmation tools are not registered in
   StageGate sessions.
+- 2026-05-11 smoke_013 triage: StageGate failed before validator involvement.
+  There were zero validator blocks, zero pending writes, and zero
+  `commit_pending_write` calls. The model authenticated, inspected the order
+  and product details, summarized the exchange, and heard confirmation, but
+  drifted back into mechanical-keyboard replacement clarification instead of
+  attempting the exchange write. The fix is packet-only: do not change the
+  pending-write commit protocol; make retail exchange stage packets more
+  explicit that ranked/fallback preferences resolve the choice and that the
+  next action after confirmation is the write attempt.
+- 2026-05-11 smoke_014 triage: StageGate again failed before validator or
+  pending-write involvement. Early speech/entity hypotheses produced a bad
+  name candidate, a wrong exact order lookup failed, and the ledger preserved
+  those values as durable ambiguity while `advance_stage` stayed in
+  `understand_intent` after tool work had begun. The fix is a narrow
+  StageGate-only voice entity repair gate: use official failed lookup evidence
+  to retire failed exact values, prefer later/verified entity candidates over
+  earlier soft hypotheses, route stage packets to explicit spelling/context
+  recovery, and structurally block transfer while that repair path remains
+  available.
 
 ## Remaining Work
 

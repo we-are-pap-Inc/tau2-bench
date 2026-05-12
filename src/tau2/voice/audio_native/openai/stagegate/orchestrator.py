@@ -309,6 +309,17 @@ class StagePacketOrchestrator:
         allowed_write_tools = (
             list(inventory.write_tools) if stage == "execute_write_action" else []
         )
+        selected_write_tool = self._selected_write_tool(
+            stage=stage,
+            domain=domain,
+            ledger=ledger,
+            inventory=inventory,
+        )
+        if selected_write_tool and stage == "execute_write_action":
+            allowed_write_tools = [
+                selected_write_tool,
+                *[name for name in allowed_write_tools if name != selected_write_tool],
+            ]
         known_facts = self._known_facts(observed_facts)
         missing = self._stage_missing_facts(
             stage=stage,
@@ -326,6 +337,14 @@ class StagePacketOrchestrator:
             ambiguous.extend(self._stage_ambiguous_facts(ledger, stage, domain))
         if blocker:
             missing.insert(0, blocker)
+        if (
+            domain == "retail"
+            and stage == "execute_write_action"
+            and selected_write_tool
+            and missing
+            and self._retail_replacement_progress(ledger) == "selected_exchange_ready"
+        ):
+            allowed_write_tools = []
         ask_next = self._ask_next(
             stage,
             missing,
@@ -335,6 +354,22 @@ class StagePacketOrchestrator:
             allowed_read_tools,
             allowed_write_tools,
             domain,
+            ledger,
+            selected_write_tool,
+        )
+        next_required_steps = self._next_required_steps(
+            stage=stage,
+            domain=domain,
+            ledger=ledger,
+            selected_write_tool=selected_write_tool,
+            missing=missing,
+        )
+        next_tool_call = self._next_tool_call(
+            stage=stage,
+            domain=domain,
+            ledger=ledger,
+            selected_write_tool=selected_write_tool,
+            missing=missing,
         )
         return StagePacket(
             stage=stage,
@@ -345,7 +380,9 @@ class StagePacketOrchestrator:
             ask_next=ask_next,
             allowed_read_tools=allowed_read_tools,
             allowed_write_tools=allowed_write_tools,
-            do_not=self._do_not(stage, domain),
+            next_required_steps=next_required_steps,
+            next_tool_call=next_tool_call,
+            do_not=self._do_not(stage, domain, ledger),
             exit_condition=self._exit_condition(stage, domain),
             when_done="Call advance_stage again with updated visible facts and the last tool result.",
         )
@@ -379,6 +416,50 @@ class StagePacketOrchestrator:
                 "Continue only after the customer answers, an allowed read tool returns, "
                 "or the conversation is safely closed."
             ),
+        )
+
+    def apply_entity_repair_guidance(
+        self,
+        *,
+        packet: StagePacket,
+        repair_snapshot: dict[str, object],
+    ) -> StagePacket:
+        """Return a packet that routes to concrete failed-lookup repair."""
+        value = str(repair_snapshot.get("normalized_value", "the failed value"))
+        source_tool = str(repair_snapshot.get("source_tool") or "the lookup tool")
+        return packet.model_copy(
+            update={
+                "stage": str(
+                    repair_snapshot.get("preferred_stage")
+                    or "collect_required_exact_entities"
+                ),
+                "objective": "Repair the failed exact entity lookup before continuing.",
+                "missing_facts": [
+                    "entity_repair_required",
+                    str(repair_snapshot.get("field", "identifier")),
+                ],
+                "ambiguous_facts": [],
+                "ask_next": entity_repair_ask_next(repair_snapshot),
+                "allowed_write_tools": [],
+                "disallowed_tools": ["transfer_to_human_agents"],
+                "next_required_steps": entity_repair_next_required_steps(
+                    repair_snapshot
+                ),
+                "next_tool_call": None,
+                "do_not": [
+                    f"Do not call {source_tool} again with {value}.",
+                    "Do not guess another exact identifier.",
+                    "Do not transfer to a human agent while this lookup can still be repaired.",
+                ],
+                "exit_condition": (
+                    "The failed identifier is corrected by the user or recovered "
+                    "from official authenticated context."
+                ),
+                "when_done": (
+                    "Use the corrected value or official context in the next "
+                    "read-tool call, then call advance_stage with the result."
+                ),
+            }
         )
 
     def _known_facts(self, observed_facts: list[str]) -> dict[str, dict[str, str]]:
@@ -423,9 +504,56 @@ class StagePacketOrchestrator:
         allowed_read_tools: list[str],
         allowed_write_tools: list[str],
         domain: str,
+        ledger: EntityLedger | None,
+        selected_write_tool: str | None,
     ) -> str:
         if ambiguous:
             return f"Ask one concise clarification question for {ambiguous[0]}."
+        retail_progress = self._retail_replacement_progress(ledger)
+        if domain == "retail" and stage == "propose_action_and_confirm":
+            if selected_write_tool and retail_progress == "selected_exchange_ready":
+                if missing or not self._slot_has_value(ledger, "confirmation"):
+                    return (
+                        "Summarize the selected exchange and payment/refund "
+                        "consequence, ask for explicit confirmation, and do not "
+                        f"attempt {selected_write_tool} until confirmation is "
+                        "recorded. Do not reopen replacement choices."
+                    )
+                return (
+                    "Proceed toward the confirmed write path for the selected "
+                    "exchange. Do not reopen replacement choices or enumerate "
+                    "more product variants."
+                )
+            if retail_progress == "replacement_candidates_inspected":
+                return (
+                    "Choose the valid replacement set from the inspected product "
+                    "details, using any ranked or fallback preference the user "
+                    "already gave. Summarize the selected exchange and consequence, "
+                    "then ask for confirmation."
+                )
+        if domain == "retail" and stage == "execute_write_action":
+            if selected_write_tool and retail_progress == "selected_exchange_ready":
+                if missing or not self._slot_has_value(ledger, "confirmation"):
+                    return (
+                        "Summarize the selected exchange and payment/refund "
+                        "consequence, ask for explicit confirmation, and do not "
+                        f"call {selected_write_tool} until confirmation is "
+                        "recorded."
+                    )
+                return (
+                    f"Call {selected_write_tool} with the selected old item IDs, "
+                    "selected new item IDs, order ID, and payment method. Do not "
+                    "call advance_stage before attempting the write."
+                )
+            if (
+                selected_write_tool
+                and retail_progress == "replacement_candidates_inspected"
+            ):
+                return (
+                    "If the selected replacement set is valid and the user has "
+                    f"confirmed, call {selected_write_tool}. If confirmation is "
+                    "still missing, summarize the selected fallback and ask once."
+                )
         if missing:
             return f"Ask the customer for {missing[0]}."
         if stage == "inspect_state_with_read_tools":
@@ -458,18 +586,35 @@ class StagePacketOrchestrator:
             return "Use the last action result to choose the next policy-required step."
         return "Ask one concise clarification question."
 
-    def _do_not(self, stage: str, domain: str) -> list[str]:
+    def _do_not(
+        self,
+        stage: str,
+        domain: str,
+        ledger: EntityLedger | None = None,
+    ) -> list[str]:
         if stage == "execute_write_action":
-            return [
+            rules = [
                 "Do not invent tool results or hidden benchmark facts.",
                 "Do not call a write/action tool unless the validator prerequisites are satisfied.",
             ]
+            if domain == "retail" and self._retail_replacement_progress(ledger):
+                rules.extend(retail_replacement_progress_do_not_rules())
+            return rules
         if stage == "verify_result_and_close":
             return ["Do not reopen new work unless the customer asks for it."]
         if stage == "identify_or_authenticate":
             return [
                 f"Do not modify {self._domain_record_name(domain)} state yet.",
                 "Do not ask for later-stage action details at this stage unless the user already raised them.",
+            ]
+        if (
+            stage == "propose_action_and_confirm"
+            and domain == "retail"
+            and self._retail_replacement_progress(ledger)
+        ):
+            return [
+                f"Do not modify {self._domain_mutable_object(domain)} state yet.",
+                *retail_replacement_progress_do_not_rules(),
             ]
         return [
             f"Do not modify {self._domain_mutable_object(domain)} state yet.",
@@ -584,7 +729,9 @@ class StagePacketOrchestrator:
         stage: str,
         domain: str,
     ) -> dict[str, dict[str, object]]:
-        stage_slots = set(self._stage_slots(stage, domain))
+        stage_slots = set(
+            self._stage_known_slots(stage=stage, domain=domain, ledger=ledger)
+        )
         if not stage_slots:
             stage_slots = set(ledger.slots)
         return {
@@ -619,6 +766,206 @@ class StagePacketOrchestrator:
         stage_scope = STAGE_SLOT_SCOPE.get(stage, {})
         return stage_scope.get(domain, stage_scope.get("default", ()))
 
+    def _stage_known_slots(
+        self,
+        *,
+        stage: str,
+        domain: str,
+        ledger: EntityLedger,
+    ) -> tuple[str, ...]:
+        slots = list(self._stage_slots(stage, domain))
+        if domain == "retail" and stage in {
+            "propose_action_and_confirm",
+            "execute_write_action",
+        }:
+            for slot_name in (
+                "order_id",
+                "order_item_ids",
+                "selected_old_item_ids",
+                "selected_new_item_ids",
+                "candidate_replacement_item_ids",
+                "payment_method",
+                "refund_or_exchange_intent",
+                "confirmation",
+            ):
+                if slot_name not in slots:
+                    slots.append(slot_name)
+            if self._slot_has_value(ledger, "selected_new_item_ids"):
+                slots = [
+                    slot_name
+                    for slot_name in slots
+                    if slot_name != "candidate_replacement_item_ids"
+                ]
+        return tuple(slots)
+
+    def _retail_replacement_progress(
+        self,
+        ledger: EntityLedger | None,
+    ) -> str | None:
+        if ledger is None or ledger.domain_name != "retail":
+            return None
+        if (
+            self._slot_has_value(ledger, "order_id")
+            and self._slot_has_value(ledger, "payment_method")
+            and self._slot_has_value(ledger, "selected_old_item_ids")
+            and self._slot_has_value(ledger, "selected_new_item_ids")
+        ):
+            return "selected_exchange_ready"
+        if (
+            self._slot_has_value(ledger, "order_id")
+            and self._slot_has_value(ledger, "order_item_ids")
+            and self._slot_has_value(ledger, "candidate_replacement_item_ids")
+        ):
+            return "replacement_candidates_inspected"
+        return None
+
+    def _selected_write_tool(
+        self,
+        *,
+        stage: str,
+        domain: str,
+        ledger: EntityLedger | None,
+        inventory: ToolInventory,
+    ) -> str | None:
+        if domain != "retail" or stage not in {
+            "propose_action_and_confirm",
+            "execute_write_action",
+        }:
+            return None
+        progress = self._retail_replacement_progress(ledger)
+        if progress not in {
+            "selected_exchange_ready",
+            "replacement_candidates_inspected",
+        }:
+            return None
+        if "exchange_delivered_order_items" in inventory.write_tools:
+            return "exchange_delivered_order_items"
+        exchange_tools = [
+            name for name in inventory.write_tools if name.startswith("exchange_")
+        ]
+        return exchange_tools[0] if exchange_tools else None
+
+    def _next_required_steps(
+        self,
+        *,
+        stage: str,
+        domain: str,
+        ledger: EntityLedger | None,
+        selected_write_tool: str | None,
+        missing: list[str],
+    ) -> list[dict[str, object]]:
+        if (
+            domain != "retail"
+            or stage not in {"propose_action_and_confirm", "execute_write_action"}
+            or selected_write_tool is None
+        ):
+            return []
+        progress = self._retail_replacement_progress(ledger)
+        if progress == "selected_exchange_ready" and stage == "execute_write_action":
+            if missing or not self._slot_has_value(ledger, "confirmation"):
+                return [
+                    {
+                        "step": "summarize_selected_replacements",
+                        "instruction": (
+                            "State the selected replacements and payment/refund "
+                            "consequence."
+                        ),
+                    },
+                    {
+                        "step": "ask_user_to_confirm",
+                        "instruction": "Ask for explicit confirmation.",
+                    },
+                    {
+                        "step": "do_not_attempt_write_before_confirmation",
+                        "instruction": (
+                            "Do not call the write tool until confirmation is recorded."
+                        ),
+                    },
+                ]
+            return [
+                {
+                    "step": "attempt_confirmed_write",
+                    "tool_name": selected_write_tool,
+                    "instruction": (
+                        "Call the write tool with the selected old item IDs, "
+                        "selected new item IDs, order ID, and payment method."
+                    ),
+                },
+                {
+                    "step": "do_not_advance_stage_first",
+                    "instruction": "Do not call advance_stage before attempting the write.",
+                },
+            ]
+        if progress in {
+            "selected_exchange_ready",
+            "replacement_candidates_inspected",
+        }:
+            return [
+                {
+                    "step": "resolve_fallback_if_needed",
+                    "instruction": (
+                        "If the top preference is unavailable but the user's "
+                        "fallback preference is available, treat the fallback "
+                        "choice as resolved."
+                    ),
+                },
+                {
+                    "step": "summarize_selected_replacements",
+                    "instruction": (
+                        "State the selected replacements and payment/refund "
+                        "consequence."
+                    ),
+                },
+                {
+                    "step": "ask_user_to_confirm",
+                    "instruction": "Ask for explicit confirmation.",
+                },
+                {
+                    "step": "attempt_write_after_confirmation",
+                    "tool_name": selected_write_tool,
+                    "instruction": (
+                        "After confirmation, attempt the write tool directly "
+                        "with the selected arguments."
+                    ),
+                },
+            ]
+        return []
+
+    def _next_tool_call(
+        self,
+        *,
+        stage: str,
+        domain: str,
+        ledger: EntityLedger | None,
+        selected_write_tool: str | None,
+        missing: list[str],
+    ) -> dict[str, object] | None:
+        if (
+            domain != "retail"
+            or stage != "execute_write_action"
+            or selected_write_tool is None
+            or missing
+            or not self._slot_has_value(ledger, "confirmation")
+            or self._retail_replacement_progress(ledger) != "selected_exchange_ready"
+        ):
+            return None
+        return {
+            "name": selected_write_tool,
+            "arguments_source": "selected ledger values from visible tool outputs and model tool arguments",
+            "when": "now",
+        }
+
+    def _slot_has_value(self, ledger: EntityLedger | None, slot_name: str) -> bool:
+        if ledger is None:
+            return False
+        slot = ledger.slots.get(slot_name)
+        if slot is None:
+            return False
+        return slot.value not in (None, "", []) and slot.status not in {
+            LedgerStatus.MISSING,
+            LedgerStatus.STALE,
+        }
+
     def _observed_fact_mentions(self, observed_facts: list[str], hint: str) -> bool:
         text_tokens = set(self._meaningful_hint_tokens(" ".join(observed_facts)))
         if not text_tokens:
@@ -637,6 +984,8 @@ class StagePacketOrchestrator:
         )
 
     def _fallback_ask_next(self, packet: StagePacket) -> str:
+        if packet.missing_facts and packet.missing_facts[0] == "entity_repair_required":
+            return packet.ask_next
         if packet.ambiguous_facts:
             return f"Ask one concise clarification question for {packet.ambiguous_facts[0]}."
         if packet.missing_facts:
@@ -680,3 +1029,64 @@ def is_retail_item_id_ambiguity(fact: str) -> bool:
         "selected_old_item_ids",
         "selected_new_item_ids",
     }
+
+
+def retail_replacement_progress_do_not_rules() -> list[str]:
+    """Return action-progress guardrails for retail replacement packets."""
+    return [
+        "Do not reopen replacement preference discussion after the user has confirmed a valid selected replacement set.",
+        "Do not enumerate more product variants once a valid candidate has been selected.",
+        "Do not ask another clarification if fallback preference resolved the choice.",
+        "Do not call advance_stage before attempting the write after confirmation.",
+    ]
+
+
+def entity_repair_ask_next(repair_snapshot: dict[str, object]) -> str:
+    """Return concrete model-facing repair guidance for a failed lookup."""
+    field = str(repair_snapshot.get("field", "identifier"))
+    if field in {"customer_name", "passenger_name"}:
+        return (
+            "Ask the user to spell the name one character at a time. Use the "
+            "latest corrected name candidate unless that lookup also fails."
+        )
+    if field == "order_id":
+        return (
+            "Ask the user to spell the order ID one character at a time. If "
+            "authenticated user context is available, inspect that user's orders "
+            "rather than guessing another order ID."
+        )
+    return (
+        f"Ask the user to spell the {field} one character at a time, then retry "
+        "only with the corrected exact value."
+    )
+
+
+def entity_repair_next_required_steps(
+    repair_snapshot: dict[str, object],
+) -> list[dict[str, object]]:
+    """Return structured repair steps for failed lookup state."""
+    field = str(repair_snapshot.get("field", "identifier"))
+    source_tool = str(repair_snapshot.get("source_tool") or "the lookup tool")
+    value = str(repair_snapshot.get("normalized_value", "the failed value"))
+    return [
+        {
+            "step": "do_not_retry_failed_lookup",
+            "tool_name": source_tool,
+            "value": value,
+            "instruction": "Do not retry the same lookup with the same failed value.",
+        },
+        {
+            "step": "repair_exact_entity",
+            "field": field,
+            "instruction": (
+                f"Ask the user to spell the {field} one character at a time."
+            ),
+        },
+        {
+            "step": "use_official_context_if_available",
+            "instruction": (
+                "If authenticated context already exposes the relevant records, "
+                "recover from that official context instead of guessing."
+            ),
+        },
+    ]
