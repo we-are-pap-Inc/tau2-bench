@@ -121,12 +121,12 @@ def run_domain(
     repo_ref: str,
     batch_id: str,
     repo_url: str = DEFAULT_REPO_URL,
-    mode: Literal["final", "smoke"] = "final",
+    mode: Literal["final", "smoke", "dev"] = "final",
 ) -> dict[str, str | None]:
     """Run one condition/domain pair in Modal."""
 
-    if mode not in {"final", "smoke"}:
-        raise ValueError("mode must be 'final' or 'smoke'")
+    if mode not in {"final", "smoke", "dev"}:
+        raise ValueError("mode must be 'final', 'smoke', or 'dev'")
     require_full_commit_sha(repo_ref, mode=mode)
     job = StageGateJob(
         condition=validate_condition(condition),
@@ -298,7 +298,7 @@ def launch(
     batch_id: str,
     repo_ref: str = "",
     repo_url: str = DEFAULT_REPO_URL,
-    mode: Literal["final", "smoke"] = "final",
+    mode: Literal["final", "smoke", "dev"] = "final",
     condition: str | None = None,
     domain: str | None = None,
     dry_run: bool = False,
@@ -324,8 +324,8 @@ def launch(
         logger.info("Collected completed manifest: %s", result)
         return
 
-    if mode not in {"final", "smoke"}:
-        raise ValueError("mode must be 'final' or 'smoke'")
+    if mode not in {"final", "smoke", "dev"}:
+        raise ValueError("mode must be 'final', 'smoke', or 'dev'")
     if not repo_ref:
         raise ValueError("repo_ref is required unless --collect-completed is set")
     require_full_commit_sha(repo_ref, mode=mode)

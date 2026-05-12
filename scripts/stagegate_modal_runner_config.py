@@ -19,7 +19,7 @@ from typing import Any, Literal, Protocol
 
 Condition = Literal["baseline", "stage_only", "stagegate"]
 Domain = Literal["retail", "airline", "telecom"]
-RunMode = Literal["final", "smoke"]
+RunMode = Literal["final", "smoke", "dev"]
 
 CONDITIONS: tuple[Condition, ...] = ("baseline", "stage_only", "stagegate")
 DOMAINS: tuple[Domain, ...] = ("retail", "airline", "telecom")
@@ -72,6 +72,25 @@ SMOKE_CONSTANTS: dict[str, RUN_CONSTANT_VALUE] = {
     "auto_resume": False,
 }
 
+DEV_CONSTANTS: dict[str, RUN_CONSTANT_VALUE] = {
+    "model": "gpt-realtime-2",
+    "provider": "openai",
+    "reasoning_effort": "high",
+    "tick_duration": "0.2",
+    "max_steps_seconds": "600",
+    "max_concurrency": "1",
+    "seed": "300",
+    "num_tasks": "10",
+    "audio_taps": False,
+    "auto_resume": False,
+}
+
+DEV_SPEECH_COMPLEXITY_BY_DOMAIN: dict[Domain, str] = {
+    "retail": "regular",
+    "airline": "control",
+    "telecom": "control",
+}
+
 FORBIDDEN_TASK_FILTER_FLAGS = ("--num-tasks", "--task-ids")
 
 
@@ -112,8 +131,8 @@ def is_full_commit_sha(repo_ref: str) -> bool:
 
 def require_full_commit_sha(repo_ref: str, *, mode: RunMode) -> None:
     """Require a full commit SHA unless this is an explicit smoke run."""
-    if mode == "final" and not is_full_commit_sha(repo_ref):
-        raise ValueError("final mode requires repo_ref to be a full 40-character SHA")
+    if mode in {"final", "dev"} and not is_full_commit_sha(repo_ref):
+        raise ValueError(f"{mode} mode requires repo_ref to be a full 40-character SHA")
 
 
 def validate_condition(condition: str) -> Condition:
@@ -160,6 +179,25 @@ def smoke_jobs(
     ]
 
 
+def dev_jobs(condition: str | None, domain: str | None) -> list[StageGateJob]:
+    """Return the mixed 10-task development replication matrix."""
+    if condition is None and domain is None:
+        return [
+            StageGateJob(condition=condition_name, domain=domain_name, mode="dev")
+            for condition_name in CONDITIONS
+            for domain_name in DOMAINS
+        ]
+    if condition is None or domain is None:
+        raise ValueError("dev mode subsets require both condition and domain")
+    return [
+        StageGateJob(
+            condition=validate_condition(condition),
+            domain=validate_domain(domain),
+            mode="dev",
+        )
+    ]
+
+
 def planned_jobs(
     *,
     mode: RunMode,
@@ -172,6 +210,8 @@ def planned_jobs(
         if condition is not None or domain is not None:
             raise ValueError("final mode does not accept condition/domain subsets")
         return final_matrix()
+    if mode == "dev":
+        return dev_jobs(condition, domain)
     return smoke_jobs(
         condition,
         domain,
@@ -188,6 +228,10 @@ def run_constants(job: StageGateJob) -> dict[str, RUN_CONSTANT_VALUE]:
     """Return mode-specific constants for one StageGate job."""
     if job.mode == "smoke":
         return dict(SMOKE_CONSTANTS)
+    if job.mode == "dev":
+        constants = dict(DEV_CONSTANTS)
+        constants["speech_complexity"] = DEV_SPEECH_COMPLEXITY_BY_DOMAIN[job.domain]
+        return constants
     return dict(FINAL_CONSTANTS)
 
 
@@ -239,15 +283,16 @@ def build_tau2_command(batch_id: str, job: StageGateJob) -> list[str]:
         "--seed",
         str(constants["seed"]),
     ]
-    if job.mode == "smoke":
+    if job.mode in {"smoke", "dev"}:
         argv.extend(
             [
                 "--num-tasks",
                 str(constants["num_tasks"]),
                 "--verbose-logs",
-                "--audio-taps",
             ]
         )
+        if constants.get("audio_taps"):
+            argv.append("--audio-taps")
     else:
         argv.extend(["--verbose-logs", "--auto-resume"])
     argv.extend(["--save-to", save_name(batch_id, job)])
@@ -374,6 +419,31 @@ def validate_smoke_command(argv: list[str]) -> None:
         raise ValueError("--auto-resume is not allowed in smoke mode")
 
 
+def validate_dev_command(argv: list[str], *, job: StageGateJob) -> None:
+    """Validate constants and task filtering for a paid development command."""
+    if _has_flag(argv, "--task-ids"):
+        raise ValueError("--task-ids is not allowed in dev mode")
+    constants = run_constants(job)
+    expected = {
+        "--audio-native-provider": str(constants["provider"]),
+        "--audio-native-model": str(constants["model"]),
+        "--reasoning-effort": str(constants["reasoning_effort"]),
+        "--speech-complexity": str(constants["speech_complexity"]),
+        "--tick-duration": str(constants["tick_duration"]),
+        "--max-steps-seconds": str(constants["max_steps_seconds"]),
+        "--max-concurrency": str(constants["max_concurrency"]),
+        "--seed": str(constants["seed"]),
+        "--num-tasks": str(constants["num_tasks"]),
+    }
+    for flag, value in expected.items():
+        if _flag_value(argv, flag) != value:
+            raise ValueError(f"{flag} must be {value!r}")
+    if _has_flag(argv, "--audio-taps"):
+        raise ValueError("--audio-taps is not allowed in dev mode by default")
+    if _has_flag(argv, "--auto-resume"):
+        raise ValueError("--auto-resume is not allowed in dev mode")
+
+
 def planned_manifest(
     *,
     batch_id: str,
@@ -475,8 +545,10 @@ def job_manifest_base(
     constants = run_constants(job)
     if job.mode == "final":
         validate_final_command(argv)
-    else:
+    elif job.mode == "smoke":
         validate_smoke_command(argv)
+    else:
+        validate_dev_command(argv, job=job)
     return {
         "schema_version": "stagegate.modal.job_manifest.v1",
         "batch_id": batch_id,
@@ -652,7 +724,7 @@ def build_arg_parser() -> ArgumentParser:
     plan.add_argument("--batch-id", required=True)
     plan.add_argument("--repo-url", default=DEFAULT_REPO_URL)
     plan.add_argument("--repo-ref", required=True)
-    plan.add_argument("--mode", choices=("final", "smoke"), default="final")
+    plan.add_argument("--mode", choices=("final", "smoke", "dev"), default="final")
     plan.add_argument("--condition")
     plan.add_argument("--domain")
     plan.add_argument(
